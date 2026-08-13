@@ -64,6 +64,28 @@ async function request(events: FakeEvents, requestId: string, method: string, pa
 }
 
 describe("subagent extension RPC bridge", () => {
+	it("gates all requests while passive and permits only ping while prepared", async () => {
+		const events = new FakeEvents();
+		let executeCalls = 0;
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => { executeCalls++; return {} as any; } });
+		let passiveReplies = 0;
+		events.on(subagentRpcReplyEvent("passive"), () => { passiveReplies++; });
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "passive", method: "ping" });
+		assert.equal(passiveReplies, 0);
+		bridge.prepare();
+		let preparedPing = 0;
+		events.on(subagentRpcReplyEvent("prepared-ping"), () => { preparedPing++; });
+		const preparedStatus = once(events, subagentRpcReplyEvent("prepared-status")) as Promise<SubagentRpcReplyEnvelope>;
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "prepared-status", method: "status" });
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "prepared-ping", method: "ping" });
+		assert.equal(preparedPing, 1);
+		const statusReply = await preparedStatus;
+		assert.equal(statusReply.success, false);
+		assert.equal(statusReply.error?.code, "no_active_session");
+		assert.equal(executeCalls, 0);
+		bridge.dispose();
+	});
+
 	it("emits ready and answers ping synchronously with immutable identity metadata", async () => {
 		const events = new FakeEvents();
 		const sourceIdentity = {
@@ -80,6 +102,8 @@ describe("subagent extension RPC bridge", () => {
 			serverInstanceId: "11111111-1111-4111-8111-111111111111",
 			sourceIdentityResolution: { available: true, sourceIdentity },
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const readyPromise = once(events, SUBAGENT_RPC_READY_EVENT);
 		bridge.emitReady(ctx());
@@ -135,6 +159,8 @@ describe("subagent extension RPC bridge", () => {
 		});
 		events.on(channel, () => { throw new Error("listener failed"); });
 		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail(), sourceIdentityResolution: { available: true, sourceIdentity } });
+		bridge.prepare();
+		bridge.activate();
 		assert.throws(() => events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "throw-ping", method: "ping" }), /listener failed/);
 		assert.equal(replies.length, 1);
 		const next = request(events, "fresh-ping", "ping");
@@ -144,7 +170,32 @@ describe("subagent extension RPC bridge", () => {
 		});
 	});
 
-	it("completes a non-ping request accepted before dispose", async () => {
+	it("same requestId across generations observes only the replacement reply", async () => {
+		const events = new FakeEvents();
+		let settleOld!: () => void;
+		const oldBridge = registerSubagentRpcBridge({
+			events, getContext: () => ctx(), serverInstanceId: "old",
+			execute: async () => await new Promise((resolve) => { settleOld = () => resolve({ content: [{ type: "text", text: "old" }], details: { mode: "management", results: [] } } as any); }),
+		});
+		oldBridge.prepare(); oldBridge.activate();
+		const replies: SubagentRpcReplyEnvelope[] = [];
+		events.on(subagentRpcReplyEvent("reused"), (payload) => replies.push(payload as SubagentRpcReplyEnvelope));
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "reused", method: "status" });
+		oldBridge.stop();
+		const replacement = registerSubagentRpcBridge({
+			events, getContext: () => ctx(), serverInstanceId: "new",
+			execute: async () => ({ content: [{ type: "text", text: "new" }], details: { mode: "management", results: [] } } as any),
+		});
+		replacement.prepare(); replacement.activate();
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "reused", method: "status" });
+		settleOld();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(replies.length, 1);
+		assert.equal((replies[0] as { data?: { text?: string } }).data?.text, "new");
+		oldBridge.dispose(); replacement.dispose();
+	});
+
+	it("suppresses a non-ping completion accepted before stop", async () => {
 		const events = new FakeEvents();
 		let settle!: () => void;
 		const bridge = registerSubagentRpcBridge({
@@ -152,11 +203,16 @@ describe("subagent extension RPC bridge", () => {
 			getContext: () => ctx(),
 			execute: async () => await new Promise((resolve) => { settle = () => resolve({ content: [{ type: "text", text: "late" }], details: { mode: "management", results: [] } } as any); }),
 		});
-		const reply = once(events, subagentRpcReplyEvent("late-status")) as Promise<SubagentRpcReplyEnvelope>;
+		bridge.prepare();
+		bridge.activate();
+		let replies = 0;
+		events.on(subagentRpcReplyEvent("late-status"), () => { replies++; });
 		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "late-status", method: "status" });
-		bridge.dispose();
+		bridge.stop();
 		settle();
-		assert.equal((await reply).success, true);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(replies, 0);
+		bridge.dispose();
 	});
 
 	it("replies to malformed request ids on the safe unknown channel", async () => {
@@ -166,6 +222,8 @@ describe("subagent extension RPC bridge", () => {
 			getContext: () => ctx(),
 			execute: async () => assert.fail("malformed request should not call executor"),
 		});
+		bridge.prepare();
+		bridge.activate();
 		const unsafeRequestId = "bad\nchannel";
 		const replyPromise = once(events, subagentRpcReplyEvent("unknown")) as Promise<SubagentRpcReplyEnvelope>;
 
@@ -195,6 +253,8 @@ describe("subagent extension RPC bridge", () => {
 				return { content: [{ type: "text", text: "Run: abc123" }], details: { mode: "management", results: [] } } as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "status-1", "status", { id: "abc123" });
 
@@ -223,6 +283,8 @@ describe("subagent extension RPC bridge", () => {
 			events, getContext: () => ctx("runtime-session-id", "/sessions/parent.jsonl"), state,
 			execute: async () => ({ content: [{ type: "text", text: "Active async runs: 1" }], details: { mode: "management", results: [] } } as any),
 		});
+		bridge.prepare();
+		bridge.activate();
 		const reply = await request(events, "fleet-status", "status");
 		const fleet = (reply as { data: { fleet: { entries: Array<Record<string, unknown>> } } }).data.fleet;
 		assert.equal(fleet.entries.length, 1);
@@ -274,6 +336,8 @@ describe("subagent extension RPC bridge", () => {
 			state,
 			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
 		});
+		bridge.prepare();
+		bridge.activate();
 		const reply = await request(events, "foreground-fleet", "status");
 		assert.deepEqual((reply as any).data.fleet, {
 			version: 1,
@@ -303,6 +367,8 @@ describe("subagent extension RPC bridge", () => {
 		const state = { currentSessionId: "A", foregroundControls: new Map(), asyncJobs: jobs } as any;
 		let activeSession = "A";
 		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(activeSession, activeSession), state, execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any) });
+		bridge.prepare();
+		bridge.activate();
 		const keys = async (id: string) => ((await request(events, id, "status")) as any).data.fleet.entries.map((entry: { key: string }) => entry.key);
 		assert.deepEqual(await keys("keys-a"), ["fleet-1", "fleet-2"]);
 		jobs.delete("private-b"); jobs.set("private-c", { asyncId: "private-c", sessionId: "A", status: "running", mode: "single", startedAt: 3, agents: ["gamma"] });
@@ -337,6 +403,8 @@ describe("subagent extension RPC bridge", () => {
 			state,
 			execute: async () => ({ content: [], details: { mode: "management", results: [] } } as any),
 		});
+		bridge.prepare();
+		bridge.activate();
 		const reply = await request(events, "fleet-overflow", "status");
 		const fleet = (reply as any).data.fleet;
 		assert.equal(fleet.entries.length, 16);
@@ -361,6 +429,8 @@ describe("subagent extension RPC bridge", () => {
 				} as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "spawn-1", "spawn", { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Do work' })" });
 
@@ -384,6 +454,8 @@ describe("subagent extension RPC bridge", () => {
 				return { content: [{ type: "text", text: "Async: worker [run-1]" }], details: { mode: "single", results: [] } } as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "spawn-worktree", "spawn", { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Do work' })", worktree: true });
 
@@ -401,6 +473,8 @@ describe("subagent extension RPC bridge", () => {
 			getContext: () => ctx(),
 			execute: async () => { executeCalls++; throw new Error("unreachable"); },
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const chainReply = await request(events, "spawn-chain", "spawn", { chain: [{ agent: "worker" }] });
 		const parallelReply = await request(events, "spawn-parallel", "spawn", { tasks: [{ agent: "worker", task: "work" }] });
@@ -425,6 +499,8 @@ describe("subagent extension RPC bridge", () => {
 				return { content: [{ type: "text", text: "unexpected" }], details: { mode: "single", results: [] } } as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const direct = await request(events, "spawn-direct", "spawn", { agent: "worker", task: "Do work" });
 		const foreground = await request(events, "spawn-foreground", "spawn", { workflowScript: "return runs.run('main', { agent: 'worker' })", async: false });
@@ -457,6 +533,8 @@ describe("subagent extension RPC bridge", () => {
 				} as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "steer-1", "steer", {
 			id: "abc123",
@@ -490,6 +568,8 @@ describe("subagent extension RPC bridge", () => {
 				return { content: [], details: { mode: "management", results: [] } } as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "steer-no-target", "steer", {
 			message: "keep going",
@@ -513,6 +593,8 @@ describe("subagent extension RPC bridge", () => {
 				return { content: [], details: { mode: "management", results: [] } } as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "steer-empty", "steer", {
 			id: "abc123",
@@ -539,6 +621,8 @@ describe("subagent extension RPC bridge", () => {
 				} as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "resume-1", "resume", {
 			id: "run-1",
@@ -573,6 +657,8 @@ describe("subagent extension RPC bridge", () => {
 				return { content: [], details: { mode: "management", results: [] } } as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const targetless = await request(events, "resume-no-target", "resume", { message: "continue" });
 		const empty = await request(events, "resume-empty", "resume", { id: "run-1", message: "   " });
@@ -605,6 +691,8 @@ describe("subagent extension RPC bridge", () => {
 				return { content: [{ type: "text", text: "Interrupt requested for async run abc123." }], details: { mode: "management", results: [] } } as any;
 			},
 		});
+		bridge.prepare();
+		bridge.activate();
 
 		const reply = await request(events, "interrupt-1", "interrupt", { id: "abc123" });
 
@@ -641,6 +729,8 @@ describe("subagent extension RPC bridge", () => {
 				kill: () => true,
 				now: () => 150,
 			});
+		bridge.prepare();
+		bridge.activate();
 
 			const reply = await request(events, "stop-1", "stop", { id: "run-stop" });
 
@@ -686,6 +776,8 @@ describe("subagent extension RPC bridge", () => {
 				},
 				now: () => 150,
 			});
+		bridge.prepare();
+		bridge.activate();
 
 			const reply = await request(events, "stop-other-session", "stop", { id: "run-other-session" });
 

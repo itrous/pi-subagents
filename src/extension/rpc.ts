@@ -632,6 +632,9 @@ function errorReply(raw: unknown, error: unknown): SubagentRpcReplyEnvelope {
 }
 
 export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOptions): {
+	prepare: () => void;
+	activate: () => void;
+	stop: () => void;
 	emitReady: (ctx?: ExtensionContext | null) => void;
 	dispose: () => void;
 } {
@@ -646,7 +649,8 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 			? { available: true as const, sourceIdentity: { ...source.sourceIdentity } }
 			: { available: false as const, sourceIdentityUnavailable: { ...source.sourceIdentityUnavailable } },
 	};
-	let disposed = false;
+	let lifecycle: "passive" | "prepared" | "active" | "stopped" = "passive";
+	let unsubscribed = false;
 	const emitSuccess = (request: SubagentRpcRequestEnvelope, data: unknown): void => {
 		options.events.emit(subagentRpcReplyEvent(request.requestId), {
 			version: SUBAGENT_RPC_PROTOCOL_VERSION,
@@ -657,11 +661,12 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 		} satisfies SubagentRpcReplyEnvelope);
 	};
 	const unsubscribe = options.events.on(SUBAGENT_RPC_REQUEST_EVENT, (raw) => {
-		if (disposed) return;
+		if (lifecycle === "passive" || lifecycle === "stopped") return;
 		let request: SubagentRpcRequestEnvelope;
 		try {
 			request = parseRequest(raw);
 		} catch (error) {
+			if (lifecycle !== "active") return;
 			const reply = errorReply(raw, error);
 			options.events.emit(subagentRpcReplyEvent(reply.requestId), reply);
 			return;
@@ -672,19 +677,42 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 			emitSuccess(request, pingData(options.getContext(), identity));
 			return;
 		}
+		if (lifecycle === "prepared") {
+			void Promise.resolve().then(() => {
+				if (lifecycle === "stopped") return;
+				try {
+					options.events.emit(subagentRpcReplyEvent(request.requestId), errorReply(
+						request,
+						new SubagentRpcError("no_active_session", "No active extension context for subagent RPC."),
+					));
+				} catch { /* isolate reply listener failures */ }
+			});
+			return;
+		}
 		void handleRequest(request, options, fleetKeys).then(
-			(data) => { try { emitSuccess(request, data); } catch { /* isolate reply listener failures */ } },
-			(error) => { try { options.events.emit(subagentRpcReplyEvent(request.requestId), errorReply(request, error)); } catch { /* isolate reply listener failures */ } },
+			(data) => {
+				if (lifecycle !== "active") return;
+				try { emitSuccess(request, data); } catch { /* isolate reply listener failures */ }
+			},
+			(error) => {
+				if (lifecycle !== "active") return;
+				try { options.events.emit(subagentRpcReplyEvent(request.requestId), errorReply(request, error)); } catch { /* isolate reply listener failures */ }
+			},
 		);
 	});
 
+	const stop = (): void => { lifecycle = "stopped"; };
 	return {
+		prepare: () => { if (lifecycle === "passive") lifecycle = "prepared"; },
+		activate: () => { if (lifecycle === "prepared") lifecycle = "active"; },
+		stop,
 		emitReady: (ctx) => {
-			if (!disposed) options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext(), identity));
+			if (lifecycle === "active") options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext(), identity));
 		},
 		dispose: () => {
-			if (disposed) return;
-			disposed = true;
+			stop();
+			if (unsubscribed) return;
+			unsubscribed = true;
 			if (typeof unsubscribe === "function") unsubscribe();
 		},
 	};

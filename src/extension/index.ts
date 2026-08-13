@@ -345,6 +345,9 @@ export default function registerSubagentExtension(
 	dependencies: {
 		resolveSourceIdentity?: typeof resolveActiveRuntimeSourceIdentity;
 		createServerInstanceId?: () => string;
+		registerSlashBridge?: typeof registerSlashSubagentBridge;
+		registerPromptTemplateBridge?: typeof registerPromptTemplateDelegationBridge;
+		registerRpcBridge?: typeof registerSubagentRpcBridge;
 	} = {},
 ): void {
 	if (process.env[SUBAGENT_CHILD_ENV] === "1") {
@@ -352,14 +355,10 @@ export default function registerSubagentExtension(
 	}
 	const globalStore = globalThis as Record<string, unknown>;
 	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
+	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
+	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";
 	const previousRuntimeCleanup = globalStore[runtimeCleanupStoreKey];
-	if (typeof previousRuntimeCleanup === "function") {
-		try {
-			previousRuntimeCleanup();
-		} catch {
-			// Best effort cleanup for stale timers from an older reload.
-		}
-	}
+	const previousEventUnsubscribes = globalStore[eventUnsubscribeStoreKey];
 
 	DIRS.results = ensureAccessibleDir(DIRS.results);
 	DIRS.async = ensureAccessibleDir(DIRS.async);
@@ -409,10 +408,24 @@ export default function registerSubagentExtension(
 		},
 	};
 
+	const candidateCleanups: Array<() => void> = [];
+	let eventUnsubscribes: Array<() => void> = [];
+	let runtimeCleaned = false;
+	const rollbackCandidate = (): void => {
+		for (const cleanup of candidateCleanups.splice(0).reverse()) {
+			try { cleanup(); } catch { /* continue cleaning the candidate */ }
+		}
+	};
+
+	try {
 	const supervisorChannel = createNativeSupervisorChannel(pi, state);
+	candidateCleanups.push(() => supervisorChannel.dispose());
 	const waitSubscriptionManager = createWaitSubscriptionManager(pi, state);
+	candidateCleanups.push(() => waitSubscriptionManager.dispose());
 	const mainWatchdog = registerMainWatchdog(pi);
+	candidateCleanups.push(() => mainWatchdog.dispose());
 	const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch });
+	candidateCleanups.push(() => completionNotifier.dispose());
 	const fleetStatus = fleetViewEnabled
 		? new SubagentFleetStatus(state, async (itemKey) => {
 			const ctx = state.lastUiContext;
@@ -420,6 +433,7 @@ export default function registerSubagentExtension(
 			await openSubagentFleet(ctx, state, { initialKey: itemKey, asyncDirRoot: DIRS.async, resultsDir: DIRS.results, fleetKeybindings: config.fleetKeybindings });
 		}, { placement: fleetViewPlacement })
 		: undefined;
+	if (fleetStatus) candidateCleanups.push(() => fleetStatus.dispose());
 	let executorScheduled: ((id: string, params: SubagentParamsLike, signal: AbortSignal, ctx: ExtensionContext) => Promise<AgentToolResult<Details>>) | undefined;
 	let goalTurnId = 0;
 	const scheduledStoreRoot = config.scheduledRuns?.storeRoot === undefined ? undefined : resolveScheduledStoreRoot(config.scheduledRuns.storeRoot);
@@ -438,6 +452,7 @@ export default function registerSubagentExtension(
 		},
 		resolveCapabilityCeiling: (sessionId) => resolveCurrentSubagentCapabilityCeiling(sessionId),
 	});
+	candidateCleanups.push(() => scheduledRunManager.stop());
 	const { startResultWatcher, primeExistingResults, stopResultWatcher } = createResultWatcher(
 		pi,
 		state,
@@ -449,22 +464,20 @@ export default function registerSubagentExtension(
 			deliverIntercomResults: config.intercomBridge?.resultDelivery === true,
 		},
 	);
+	candidateCleanups.push(stopResultWatcher);
 
 	const runtimeCleanup = () => {
-		stopResultWatcher();
+		if (runtimeCleaned) return;
+		runtimeCleaned = true;
+		rollbackCandidate();
 		state.currentSessionId = null;
-		completionNotifier.dispose();
-		mainWatchdog.dispose();
-		scheduledRunManager.stop();
-		supervisorChannel.dispose();
-		waitSubscriptionManager.dispose();
-		fleetStatus?.dispose();
+		for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
+		state.cleanupTimers.clear();
 		if (state.poller) {
 			clearInterval(state.poller);
 			state.poller = null;
 		}
 	};
-	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
 
 	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs } = createAsyncJobTracker(pi, state, DIRS.async, {
 		widgetEnabled: asyncWidgetEnabled,
@@ -549,33 +562,34 @@ export default function registerSubagentExtension(
 		return executor.executePublic(id, params, signal, onUpdate, ctx);
 	};
 
-	const slashBridge = registerSlashSubagentBridge({
-		events: pi.events,
-		getContext: () => state.lastUiContext,
-		execute: (id, params, signal, onUpdate, ctx) =>
-			executeSubagentCollapsed(id, params, signal, onUpdate, ctx),
-	});
-
-	const promptTemplateBridge = registerPromptTemplateDelegationBridge({
-		events: pi.events,
-		getContext: () => state.lastUiContext,
-		execute: (requestId, params, signal, ctx, onUpdate) =>
-			executeSubagentCollapsed(requestId, params, signal, onUpdate, ctx),
-		executeStructured: (requestId, params, signal, ctx, onUpdate) => {
-			if (ctx.hasUI) ctx.ui.setToolsExpanded(false);
-			return executor.executeDelegated(requestId, params, signal, onUpdate, ctx);
-		},
-	});
-
-	const rpcBridge = registerSubagentRpcBridge({
-		events: pi.events,
-		getContext: () => state.lastUiContext,
-		execute: (id, params, signal, onUpdate, ctx) => executor.executePublic(id, params, signal, onUpdate, ctx),
-		state,
-		serverInstanceId,
-		sourceIdentityResolution,
-	});
-
+	let slashBridge: ReturnType<typeof registerSlashSubagentBridge>;
+	let promptTemplateBridge: ReturnType<typeof registerPromptTemplateDelegationBridge>;
+	let rpcBridge: ReturnType<typeof registerSubagentRpcBridge>;
+	slashBridge = (dependencies.registerSlashBridge ?? registerSlashSubagentBridge)({
+			events: pi.events,
+			getContext: () => state.lastUiContext,
+			execute: (id, params, signal, onUpdate, ctx) => executeSubagentCollapsed(id, params, signal, onUpdate, ctx),
+		});
+		candidateCleanups.push(slashBridge.dispose);
+		promptTemplateBridge = (dependencies.registerPromptTemplateBridge ?? registerPromptTemplateDelegationBridge)({
+			events: pi.events,
+			getContext: () => state.lastUiContext,
+			execute: (requestId, params, signal, ctx, onUpdate) => executeSubagentCollapsed(requestId, params, signal, onUpdate, ctx),
+			executeStructured: (requestId, params, signal, ctx, onUpdate) => {
+				if (ctx.hasUI) ctx.ui.setToolsExpanded(false);
+				return executor.executeDelegated(requestId, params, signal, onUpdate, ctx);
+			},
+		});
+		candidateCleanups.push(promptTemplateBridge.dispose);
+		rpcBridge = (dependencies.registerRpcBridge ?? registerSubagentRpcBridge)({
+			events: pi.events,
+			getContext: () => state.lastUiContext,
+			execute: (id, params, signal, onUpdate, ctx) => executor.executePublic(id, params, signal, onUpdate, ctx),
+			state,
+			serverInstanceId,
+			sourceIdentityResolution,
+		});
+	candidateCleanups.push(rpcBridge.dispose);
 
 	const tool: ToolDefinition<typeof SubagentParams, Details> = {
 		name: "subagent",
@@ -646,19 +660,6 @@ export default function registerSubagentExtension(
 
 	registerSlashCommands(pi, state, { fleetKeybindings: config.fleetKeybindings });
 
-	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
-	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";
-	const previousEventUnsubscribes = globalStore[eventUnsubscribeStoreKey];
-	if (Array.isArray(previousEventUnsubscribes)) {
-		for (const unsubscribe of previousEventUnsubscribes) {
-			if (typeof unsubscribe !== "function") continue;
-			try {
-				unsubscribe();
-			} catch {
-				// Best effort cleanup for stale handlers from an older reload.
-			}
-		}
-	}
 	const existingVisibleControlNotices = globalStore[controlNoticeSeenStoreKey];
 	const visibleControlNotices = existingVisibleControlNotices instanceof Set ? existingVisibleControlNotices as Set<string> : new Set<string>();
 	globalStore[controlNoticeSeenStoreKey] = visibleControlNotices;
@@ -670,6 +671,7 @@ export default function registerSubagentExtension(
 			await pi.exec(process.env.HERDR_BIN || "herdr", [...args], { timeout: 5_000 });
 		},
 	});
+	candidateCleanups.push(herdrStatusBridge.dispose);
 	const controlEventHandler = (payload: unknown) => {
 		handleSubagentControlNotice({
 			pi,
@@ -690,15 +692,20 @@ export default function registerSubagentExtension(
 		scheduledRunManager.handleAsyncCompletion(payload);
 		fleetStatus?.refresh();
 	};
-	const eventUnsubscribes = [
-		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, asyncStartedHandler),
-		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, asyncCompleteHandler),
-		pi.events.on(SUBAGENT_CONTROL_EVENT, controlEventHandler),
-		pi.events.on(SUBAGENT_STEERING_NOTICE_EVENT, steeringNoticeHandler),
-		herdrStatusBridge.dispose,
-		rpcBridge.dispose,
-	];
-	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
+	candidateCleanups.push(() => {
+		for (const unsubscribe of eventUnsubscribes.splice(0)) {
+			try { unsubscribe(); } catch { /* continue cleaning candidate subscriptions */ }
+		}
+	});
+	for (const [event, handler] of [
+		[SUBAGENT_ASYNC_STARTED_EVENT, asyncStartedHandler],
+		[SUBAGENT_ASYNC_COMPLETE_EVENT, asyncCompleteHandler],
+		[SUBAGENT_CONTROL_EVENT, controlEventHandler],
+		[SUBAGENT_STEERING_NOTICE_EVENT, steeringNoticeHandler],
+	] as const) {
+		const unsubscribe = pi.events.on(event, handler);
+		if (typeof unsubscribe === "function") eventUnsubscribes.push(unsubscribe);
+	}
 
 	pi.on("tool_result", (event, ctx) => {
 		if (event.toolName !== "subagent") return;
@@ -782,6 +789,10 @@ export default function registerSubagentExtension(
 	pi.on("session_start", (event, ctx) => {
 		const recovering = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";
 		resetSessionState(ctx, recovering);
+		rpcBridge.activate();
+		slashBridge.activate();
+		promptTemplateBridge.activate();
+		promptTemplateBridge.activateTerminalSink();
 		herdrStatusBridge.sessionStarted({
 			hasUI: ctx.hasUI === true,
 			runs: activeHerdrRuns(),
@@ -790,12 +801,32 @@ export default function registerSubagentExtension(
 		supervisorChannel.start();
 	});
 
-	pi.on("session_shutdown", async () => {
-		stopResultWatcher();
+	pi.on("session_shutdown", async (event) => {
+		const quitting = event?.reason !== "reload";
+		rpcBridge.stop();
+		slashBridge.stop();
+		promptTemplateBridge.stop({ preserveSink: quitting });
+		if (quitting && promptTemplateBridge.hasDraining()) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([
+					promptTemplateBridge.drain(),
+					new Promise<void>((resolve) => {
+						timer = setTimeout(resolve, 2_000);
+						timer.unref?.();
+					}),
+				]);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+		}
+		const ownsPublishedRuntime = globalStore[runtimeCleanupStoreKey] === runtimeCleanup;
+		runtimeCleanup();
 		state.currentSessionId = null;
 		state.parentSessionFile = null;
-		completionNotifier.dispose();
-		delete process.env[SUBAGENT_PARENT_SESSION_ENV];
+		if (ownsPublishedRuntime) {
+			delete process.env[SUBAGENT_PARENT_SESSION_ENV];
+		}
 		for (const unsubscribe of eventUnsubscribes) {
 			try {
 				unsubscribe();
@@ -814,18 +845,10 @@ export default function registerSubagentExtension(
 		}
 		state.cleanupTimers.clear();
 		state.asyncJobs.clear();
-		clearSlashSnapshots();
-		slashBridge.cancelAll();
-		slashBridge.dispose();
-		promptTemplateBridge.cancelAll();
-		promptTemplateBridge.dispose();
-		supervisorChannel.dispose();
-		fleetStatus?.dispose();
-		if (globalStore[runtimeCleanupStoreKey] === runtimeCleanup) {
-			delete globalStore[runtimeCleanupStoreKey];
-		}
+		if (ownsPublishedRuntime) clearSlashSnapshots();
+		if (ownsPublishedRuntime) delete globalStore[runtimeCleanupStoreKey];
 		try {
-			if (state.lastUiContext?.hasUI) {
+			if (ownsPublishedRuntime && state.lastUiContext?.hasUI) {
 				state.lastUiContext.ui.setWidget(WIDGET_KEY, undefined);
 			}
 		} catch (error) {
@@ -833,4 +856,23 @@ export default function registerSubagentExtension(
 		}
 		await herdrStatusBridge.flush();
 	});
+
+	// Publish only after every synchronous registration step succeeded. Until this
+	// point the candidate transport listeners are passive and rollback-owned.
+	if (typeof previousRuntimeCleanup === "function") {
+		try { previousRuntimeCleanup(); } catch { /* stale cleanup is best effort */ }
+	}
+	if (Array.isArray(previousEventUnsubscribes)) {
+		for (const unsubscribe of previousEventUnsubscribes) {
+			if (typeof unsubscribe !== "function") continue;
+			try { unsubscribe(); } catch { /* stale cleanup is best effort */ }
+		}
+	}
+	rpcBridge.prepare();
+	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
+	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
+	} catch (error) {
+		rollbackCandidate();
+		throw error;
+	}
 }

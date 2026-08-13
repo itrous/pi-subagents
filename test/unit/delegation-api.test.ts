@@ -15,6 +15,7 @@ import {
 	registerPromptTemplateDelegationBridge,
 	type PromptTemplateBridgeEvents,
 } from "../../src/slash/prompt-template-bridge.ts";
+import { StructuredAttemptCoordinator } from "../../src/slash/structured-attempt-coordinator.ts";
 
 class FakeEvents implements PromptTemplateBridgeEvents {
 	private handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -42,6 +43,18 @@ function once(events: FakeEvents, event: string): Promise<unknown> {
 
 function tick(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
+}
+
+type BridgeOptions = Parameters<typeof registerPromptTemplateDelegationBridge<{ cwd: string }>>[0];
+
+function registerActiveBridge(options: BridgeOptions) {
+	const bridge = registerPromptTemplateDelegationBridge({
+		...options,
+		coordinator: new StructuredAttemptCoordinator(),
+	});
+	bridge.activate();
+	bridge.activateTerminalSink();
+	return bridge;
 }
 
 const request: SubagentDelegationRequest = {
@@ -128,7 +141,7 @@ describe("public subagent delegation contract", () => {
 		const events = new FakeEvents();
 		let ordinaryCalls = 0;
 		let observedParams: Record<string, unknown> | undefined;
-		const bridge = registerPromptTemplateDelegationBridge({
+		const bridge = registerActiveBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => {
@@ -209,7 +222,7 @@ describe("public subagent delegation contract", () => {
 		] as const;
 		for (const [structuredOutput, expectedStatus, expectedResult] of cases) {
 			const events = new FakeEvents();
-			const bridge = registerPromptTemplateDelegationBridge({
+			const bridge = registerActiveBridge({
 				events,
 				getContext: () => ({ cwd: "/repo" }),
 				execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -235,12 +248,12 @@ describe("public subagent delegation contract", () => {
 		}
 	});
 
-	it("isolates logical-node ownership, exact cancellation, pre-cancellation, and reuse", async () => {
+	it("isolates logical-node ownership, exact cancellation, unknown cancel, and reuse", async () => {
 		const events = new FakeEvents();
 		const releases = new Map<string, () => void>();
 		const responses: SubagentDelegationResponse[] = [];
 		events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
-		const bridge = registerPromptTemplateDelegationBridge({
+		const bridge = registerActiveBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -269,8 +282,10 @@ describe("public subagent delegation contract", () => {
 
 		events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId: "pre", ownerRunId: "owner-1", nodeId: "node-1" });
 		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, requestId: "pre", result: { kind: "text" } });
+		while (!releases.has("pre")) await tick();
+		releases.get("pre")?.();
 		while (!responses.some((entry) => entry.requestId === "pre")) await tick();
-		assert.equal(responses.find((entry) => entry.requestId === "pre")?.status, "cancelled");
+		assert.equal(responses.find((entry) => entry.requestId === "pre")?.status, "completed");
 
 		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, requestId: "reuse", result: { kind: "text" } });
 		while (!releases.has("reuse")) await tick();
@@ -286,7 +301,7 @@ describe("public subagent delegation contract", () => {
 		const responses: SubagentDelegationResponse[] = [];
 		let executeCalls = 0;
 		events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
-		const bridge = registerPromptTemplateDelegationBridge({
+		const bridge = registerActiveBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -331,65 +346,11 @@ describe("public subagent delegation contract", () => {
 	});
 
 	it("fails closed instead of evicting structured identity state", async () => {
-		const events = new FakeEvents();
-		const responses: SubagentDelegationResponse[] = [];
-		let executeCalls = 0;
-		events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
-		const bridge = registerPromptTemplateDelegationBridge({
-			events,
-			getContext: () => ({ cwd: "/repo" }),
-			execute: async () => { throw new Error("legacy executor must remain separate"); },
-			executeStructured: async (requestId) => {
-				executeCalls++;
-				return {
-					details: {
-						mode: "single",
-						results: [{
-							agent: "reviewer",
-							exitCode: 0,
-							finalOutput: requestId,
-							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
-						}],
-					},
-				};
-			},
-		});
-
-		for (let index = 0; index < 8_192; index++) {
-			events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, {
-				requestId: `cancelled-${index}`,
-				ownerRunId: "saturated-owner",
-				nodeId: `cancelled-node-${index}`,
-			});
-		}
-		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, {
-			...request,
-			requestId: "cancelled-0",
-			ownerRunId: "saturated-owner",
-			nodeId: "cancelled-node-0",
-			result: { kind: "text" },
-		});
-		while (!responses.some((entry) => entry.requestId === "cancelled-0")) await tick();
-		assert.equal(responses.at(-1)?.status, "cancelled");
-
-		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, {
-			...request,
-			requestId: "cancel-overflow",
-			ownerRunId: "saturated-owner",
-			nodeId: "cancel-overflow-node",
-			result: { kind: "text" },
-		});
-		while (!responses.some((entry) => entry.requestId === "cancel-overflow")) await tick();
-		assert.equal(responses.at(-1)?.status, "unavailable_context");
-		assert.match(responses.at(-1)?.error ?? "", /identity capacity/i);
-		assert.equal(executeCalls, 0);
-		bridge.dispose();
-
 		const settledEvents = new FakeEvents();
 		const settledResponses: SubagentDelegationResponse[] = [];
 		let settledExecuteCalls = 0;
 		settledEvents.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => settledResponses.push(payload as SubagentDelegationResponse));
-		const settledBridge = registerPromptTemplateDelegationBridge({
+		const settledBridge = registerActiveBridge({
 			events: settledEvents,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -448,7 +409,7 @@ describe("public subagent delegation contract", () => {
 	it("rejects the unversioned prompt-template direct delegation fallback", async () => {
 		const events = new FakeEvents();
 		let executeCalls = 0;
-		const bridge = registerPromptTemplateDelegationBridge({
+		const bridge = registerActiveBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => {

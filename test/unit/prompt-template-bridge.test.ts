@@ -10,6 +10,8 @@ import {
 	registerPromptTemplateDelegationBridge,
 	type PromptTemplateBridgeEvents,
 } from "../../src/slash/prompt-template-bridge.ts";
+import type { PromptTemplateBridgeResult } from "../../src/slash/delegation-adapters.ts";
+import { StructuredAttemptCoordinator } from "../../src/slash/structured-attempt-coordinator.ts";
 
 class FakeEvents implements PromptTemplateBridgeEvents {
 	private handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -54,6 +56,24 @@ function structuredRequest(overrides: Record<string, unknown> = {}): Record<stri
 }
 
 describe("prompt-template delegation bridge", () => {
+	it("is passive before activation and emits nothing", async () => {
+		const events = new FakeEvents();
+		let executeCalls = 0;
+		let observable = 0;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { executeCalls++; return {}; },
+		});
+		events.on(PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT, () => { observable++; });
+		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, () => { observable++; });
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "passive" }));
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(executeCalls, 0);
+		assert.equal(observable, 0);
+		bridge.dispose();
+	});
+
 	it("emits started/update/response on successful structured request", async () => {
 		const events = new FakeEvents();
 		let executeCalls = 0;
@@ -86,6 +106,8 @@ describe("prompt-template delegation bridge", () => {
 			},
 			execute: async () => { throw new Error("structured request should use executeStructured"); },
 		});
+		bridge.activate();
+		bridge.activateTerminalSink();
 
 		const startedPromise = once(events, PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT);
 		const updatePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT);
@@ -133,6 +155,8 @@ describe("prompt-template delegation bridge", () => {
 			getContext: () => null,
 			execute: async () => ({ details: { results: [{ messages: [] }] } }),
 		});
+		bridge.activate();
+		bridge.activateTerminalSink();
 
 		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "r2" }));
@@ -144,7 +168,7 @@ describe("prompt-template delegation bridge", () => {
 		bridge.dispose();
 	});
 
-	it("applies pending cancel when cancel arrives before structured request", async () => {
+	it("ignores cancel when no structured attempt owns the tuple", async () => {
 		const events = new FakeEvents();
 		let executeCalls = 0;
 		const bridge = registerPromptTemplateDelegationBridge({
@@ -152,18 +176,158 @@ describe("prompt-template delegation bridge", () => {
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => {
 				executeCalls++;
-				return { details: { results: [{ messages: [] }] } };
+				return { details: { results: [{ agent: "worker", exitCode: 0, finalOutput: "done" }] } };
 			},
 		});
+		bridge.activate();
+		bridge.activateTerminalSink();
 
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r4", ownerRunId: "owner-1", nodeId: "node-1" });
 		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "r4" }));
 
 		const response = await responsePromise as { status: string };
-		assert.equal(response.status, "cancelled");
-		assert.equal(executeCalls, 0);
+		assert.equal(response.status, "completed");
+		assert.equal(executeCalls, 1);
 
+		bridge.dispose();
+	});
+
+	it("does not dispatch after a reentrant stop from the started listener", async () => {
+		const events = new FakeEvents();
+		const coordinator = new StructuredAttemptCoordinator();
+		let executeCalls = 0;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events, coordinator, getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { executeCalls++; return {}; },
+		});
+		bridge.activate(); bridge.activateTerminalSink();
+		events.on(PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT, () => bridge.stop({ preserveSink: true }));
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "reentrant-stop" }));
+		assert.equal((await responsePromise as { status: string }).status, "cancelled");
+		assert.equal(executeCalls, 0);
+		assert.equal(coordinator.snapshot().attempts, 0);
+		bridge.dispose();
+	});
+
+	it("settles admission when a started listener throws", async () => {
+		const events = new FakeEvents();
+		const coordinator = new StructuredAttemptCoordinator();
+		const bridge = registerPromptTemplateDelegationBridge({
+			events, coordinator, getContext: () => ({ cwd: "/repo" }), execute: async () => assert.fail(),
+		});
+		bridge.activate(); bridge.activateTerminalSink();
+		events.on(PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT, () => { throw new Error("started failed"); });
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "started-throws" }));
+		const response = await responsePromise as { status: string; error?: string };
+		assert.equal(response.status, "failed");
+		assert.match(response.error ?? "", /started failed/);
+		assert.equal(coordinator.snapshot().attempts, 0);
+		bridge.dispose();
+	});
+
+	it("stop suppresses updates and waits for settlement before cancelled terminal", async () => {
+		const events = new FakeEvents();
+		let settle!: (value: PromptTemplateBridgeResult) => void;
+		let pushUpdate!: (value: PromptTemplateBridgeResult) => void;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async (_id, _params, _signal, _ctx, onUpdate) => {
+				pushUpdate = onUpdate;
+				return await new Promise((resolve) => { settle = resolve; });
+			},
+		});
+		bridge.activate(); bridge.activateTerminalSink();
+		let updates = 0;
+		const terminals: Array<{ status: string }> = [];
+		events.on(PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT, () => { updates++; });
+		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, (value) => terminals.push(value as { status: string }));
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "drain" }));
+		await new Promise((resolve) => setImmediate(resolve));
+		bridge.stop({ preserveSink: true });
+		pushUpdate({ details: { progress: [{ agent: "worker", currentTool: "read" }] } });
+		assert.equal(updates, 0);
+		assert.equal(terminals.length, 0);
+		settle({ details: { results: [{ finalOutput: "late" }] } });
+		await bridge.drain();
+		assert.deepEqual(terminals.map((entry) => entry.status), ["cancelled"]);
+		bridge.dispose();
+	});
+
+	it("suppresses executor updates after terminal settlement", async () => {
+		const events = new FakeEvents();
+		let lateUpdate!: (value: PromptTemplateBridgeResult) => void;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events, coordinator: new StructuredAttemptCoordinator(), getContext: () => ({ cwd: "/repo" }),
+			execute: async (_id, _params, _signal, _ctx, onUpdate) => {
+				lateUpdate = onUpdate;
+				return { details: { results: [{ agent: "worker", exitCode: 0, finalOutput: "done" }] } };
+			},
+		});
+		bridge.activate(); bridge.activateTerminalSink();
+		let updates = 0;
+		events.on(PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT, () => { updates++; });
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "late-update" }));
+		await responsePromise;
+		lateUpdate({ details: { progress: [{ agent: "worker", currentTool: "read" }] } });
+		assert.equal(updates, 0);
+		bridge.dispose();
+	});
+
+	it("routes an old owner through a replacement and drains a gap through the next active sink", async () => {
+		const events = new FakeEvents();
+		const coordinator = new StructuredAttemptCoordinator();
+		let settle!: (value: PromptTemplateBridgeResult) => void;
+		const runtimeA = registerPromptTemplateDelegationBridge({
+			events, coordinator, runtimeId: "A", getContext: () => ({ cwd: "/repo" }),
+			execute: async () => await new Promise((resolve) => { settle = resolve; }),
+		});
+		runtimeA.activate(); runtimeA.activateTerminalSink();
+		const terminals: Array<{ status: string }> = [];
+		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, (value) => terminals.push(value as { status: string }));
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "from-a" }));
+		await new Promise((resolve) => setImmediate(resolve));
+		runtimeA.stop();
+
+		const runtimeB = registerPromptTemplateDelegationBridge({
+			events, coordinator, runtimeId: "B", getContext: () => ({ cwd: "/repo" }), execute: async () => assert.fail(),
+		});
+		// B was constructed but never received session_start. Its cancel handler and
+		// terminal sink must remain passive during this gap.
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "from-a", ownerRunId: "owner-1", nodeId: "node-1" });
+		settle({ details: { results: [{ finalOutput: "late" }] } });
+		await runtimeA.drain();
+		assert.equal(terminals.length, 0);
+
+		const runtimeC = registerPromptTemplateDelegationBridge({
+			events, coordinator, runtimeId: "C", getContext: () => ({ cwd: "/repo" }), execute: async () => assert.fail(),
+		});
+		runtimeC.activate(); runtimeC.activateTerminalSink();
+		assert.deepEqual(terminals.map((entry) => entry.status), ["cancelled"]);
+		runtimeA.dispose(); runtimeB.dispose(); runtimeC.dispose();
+	});
+
+	it("commits a fully identified invalid tuple once", async () => {
+		const events = new FakeEvents();
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			coordinator: new StructuredAttemptCoordinator(),
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => assert.fail(),
+		});
+		bridge.activate(); bridge.activateTerminalSink();
+		const terminals: unknown[] = [];
+		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, (value) => terminals.push(value));
+		const invalid = structuredRequest({ task: "", requestId: "invalid-once" });
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, invalid);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, invalid);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(terminals.length, 1);
+		assert.equal((terminals[0] as { status: string }).status, "invalid_request");
 		bridge.dispose();
 	});
 
@@ -177,6 +341,8 @@ describe("prompt-template delegation bridge", () => {
 					signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
 				}),
 		});
+		bridge.activate();
+		bridge.activateTerminalSink();
 
 		const startedPromise = once(events, PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT);
 		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
@@ -200,6 +366,8 @@ describe("prompt-template delegation bridge", () => {
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { executeCalls++; return {}; },
 		});
+		bridge.activate();
+		bridge.activateTerminalSink();
 
 		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, {
@@ -226,6 +394,8 @@ describe("prompt-template delegation bridge", () => {
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { executeCalls++; return {}; },
 		});
+		bridge.activate();
+		bridge.activateTerminalSink();
 
 		const tasksResponse = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, {
@@ -238,6 +408,11 @@ describe("prompt-template delegation bridge", () => {
 		const response = await tasksResponse as { isError: boolean; errorText?: string };
 		assert.equal(response.isError, true);
 		assert.match(response.errorText ?? "", /removed.*workflowScript/i);
+		const longIdResponse = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, {
+			requestId: "x".repeat(257), tasks: [{ agent: "worker-a", task: "A" }], context: "fresh", cwd: "/repo",
+		});
+		assert.equal((await longIdResponse as { isError: boolean }).isError, true);
 		assert.equal(executeCalls, 0);
 		bridge.dispose();
 	});
