@@ -64,24 +64,40 @@ async function request(events: FakeEvents, requestId: string, method: string, pa
 }
 
 describe("subagent extension RPC bridge", () => {
-	it("emits ready and answers ping with versioned capability metadata", async () => {
+	it("emits ready and answers ping synchronously with immutable identity metadata", async () => {
 		const events = new FakeEvents();
+		const sourceIdentity = {
+			version: 1 as const,
+			kind: "git" as const,
+			repository: "https://github.com/itrous/pi-subagents.git" as const,
+			commit: "0123456789abcdef0123456789abcdef01234567",
+			digest: "a".repeat(64),
+		};
 		const bridge = registerSubagentRpcBridge({
 			events,
 			getContext: () => ctx(),
 			execute: async () => assert.fail("ping should not call executor"),
+			serverInstanceId: "11111111-1111-4111-8111-111111111111",
+			sourceIdentityResolution: { available: true, sourceIdentity },
 		});
 
 		const readyPromise = once(events, SUBAGENT_RPC_READY_EVENT);
 		bridge.emitReady(ctx());
-		const ready = await readyPromise as { version?: number; events?: { request?: string }; session?: { cwd?: string } };
+		const ready = await readyPromise as { version?: number; serverInstanceId?: string; sourceIdentity?: unknown; events?: { request?: string }; session?: { cwd?: string } };
 		assert.equal(ready.version, SUBAGENT_RPC_PROTOCOL_VERSION);
 		assert.equal(ready.events?.request, SUBAGENT_RPC_REQUEST_EVENT);
 		assert.equal(ready.session?.cwd, "/repo");
 
-		const reply = await request(events, "ping-1", "ping");
-		assert.equal(reply.success, true);
-		assert.equal(reply.method, "ping");
+		let reply: SubagentRpcReplyEnvelope | undefined;
+		events.on(subagentRpcReplyEvent("ping-1"), (payload) => { reply = payload as SubagentRpcReplyEnvelope; });
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "ping-1", method: "ping" });
+		assert.ok(reply, "ping reply must be emitted before request emit returns");
+		assert.equal(reply!.success, true);
+		assert.equal(reply!.method, "ping");
+		assert.equal(ready.serverInstanceId, "11111111-1111-4111-8111-111111111111");
+		assert.deepEqual(ready.sourceIdentity, sourceIdentity);
+		assert.equal((reply as { data: { serverInstanceId?: string } }).data.serverInstanceId, ready.serverInstanceId);
+		assert.deepEqual((reply as { data: { sourceIdentity?: unknown } }).data.sourceIdentity, sourceIdentity);
 		assert.equal((reply as { data: { version?: number } }).data.version, SUBAGENT_RPC_PROTOCOL_VERSION);
 		assert.equal(
 			(reply as { data: { events?: { asyncComplete?: string } } }).data.events?.asyncComplete,
@@ -101,6 +117,46 @@ describe("subagent extension RPC bridge", () => {
 		);
 
 		bridge.dispose();
+	});
+
+	it("publishes fresh identity copies and does not duplicate ping after a reply listener throws", () => {
+		const events = new FakeEvents();
+		const sourceIdentity = {
+			version: 1 as const, kind: "git" as const,
+			repository: "https://github.com/itrous/pi-subagents.git" as const,
+			commit: "0123456789abcdef0123456789abcdef01234567", digest: "b".repeat(64),
+		};
+		const replies: SubagentRpcReplyEnvelope[] = [];
+		const channel = subagentRpcReplyEvent("throw-ping");
+		events.on(channel, (payload) => {
+			replies.push(payload as SubagentRpcReplyEnvelope);
+			const identity = (payload as { data?: { sourceIdentity?: { commit: string } } }).data?.sourceIdentity;
+			if (identity) identity.commit = "mutated";
+		});
+		events.on(channel, () => { throw new Error("listener failed"); });
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail(), sourceIdentityResolution: { available: true, sourceIdentity } });
+		assert.throws(() => events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "throw-ping", method: "ping" }), /listener failed/);
+		assert.equal(replies.length, 1);
+		const next = request(events, "fresh-ping", "ping");
+		return next.then((reply) => {
+			assert.equal((reply as { data: { sourceIdentity: { commit: string } } }).data.sourceIdentity.commit, sourceIdentity.commit);
+			bridge.dispose();
+		});
+	});
+
+	it("completes a non-ping request accepted before dispose", async () => {
+		const events = new FakeEvents();
+		let settle!: () => void;
+		const bridge = registerSubagentRpcBridge({
+			events,
+			getContext: () => ctx(),
+			execute: async () => await new Promise((resolve) => { settle = () => resolve({ content: [{ type: "text", text: "late" }], details: { mode: "management", results: [] } } as any); }),
+		});
+		const reply = once(events, subagentRpcReplyEvent("late-status")) as Promise<SubagentRpcReplyEnvelope>;
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "late-status", method: "status" });
+		bridge.dispose();
+		settle();
+		assert.equal((await reply).success, true);
 	});
 
 	it("replies to malformed request ids on the safe unknown channel", async () => {

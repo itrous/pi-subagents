@@ -19,6 +19,41 @@ function parentToolEnv(): NodeJS.ProcessEnv {
 }
 
 describe("subagent extension child mode", () => {
+	it("wires one resolved source identity and server instance into ready and ping", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const handlers = new Map();
+			const eventHandlers = new Map();
+			const emitted = [];
+			const events = {
+				on(channel, handler) { const list = eventHandlers.get(channel) ?? []; list.push(handler); eventHandlers.set(channel, list); return () => {}; },
+				emit(channel, data) { emitted.push({ channel, data }); for (const handler of eventHandlers.get(channel) ?? []) handler(data); },
+			};
+			const fakePi = new Proxy({
+				events,
+				on(channel, handler) { handlers.set(channel, handler); },
+				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const sourceIdentity = { version:1, kind:"git", repository:"https://github.com/itrous/pi-subagents.git", commit:"0123456789abcdef0123456789abcdef01234567", digest:"a".repeat(64) };
+			let resolutions = 0;
+			registerSubagentExtension(fakePi, {
+				resolveSourceIdentity() { resolutions++; return { available:true, sourceIdentity }; },
+				createServerInstanceId() { return "11111111-1111-4111-8111-111111111111"; },
+			});
+			const ctx = { cwd:process.cwd(), hasUI:false, sessionManager:{ getSessionId(){return "identity-session";}, getSessionFile(){return null;}, getEntries(){return [];} }, modelRegistry:{getAvailable(){return[];}}, ui:{setWidget(){},requestRender(){},theme:{fg(_n,t){return t;},bg(_n,t){return t;},bold(t){return t;}}} };
+			handlers.get("session_start")({reason:"startup"}, ctx);
+			events.emit("subagents:rpc:v1:request", {version:1,requestId:"p",method:"ping"});
+			const ready = emitted.find(x => x.channel === "subagents:rpc:v1:ready")?.data;
+			const reply = emitted.find(x => x.channel === "subagents:rpc:v1:reply:p")?.data;
+			if (resolutions !== 1) throw new Error("identity resolved " + resolutions + " times");
+			if (ready?.serverInstanceId !== "11111111-1111-4111-8111-111111111111") throw new Error("ready instance mismatch");
+			if (reply?.data?.serverInstanceId !== ready.serverInstanceId) throw new Error("ping instance mismatch");
+			if (JSON.stringify(reply?.data?.sourceIdentity) !== JSON.stringify(sourceIdentity)) throw new Error("source identity mismatch");
+			process.stdout.write("ok");
+		`;
+		const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), encoding: "utf8" });
+		assert.equal(output, "ok");
+	});
 	it("collapses tool detail before direct subagent tool execution", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";

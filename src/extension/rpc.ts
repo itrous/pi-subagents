@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
@@ -20,6 +21,7 @@ import { readStatus } from "../shared/utils.ts";
 import { SubagentParams } from "./schemas.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
+import type { ActiveRuntimeSourceIdentityResolution } from "./source-identity.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
@@ -293,6 +295,8 @@ interface RegisterSubagentRpcBridgeOptions {
 	now?: () => number;
 	/** Native live state, projected into the optional public fleet-status capability. */
 	state?: SubagentState;
+	serverInstanceId?: string;
+	sourceIdentityResolution?: ActiveRuntimeSourceIdentityResolution;
 }
 
 class SubagentRpcError extends Error {
@@ -377,12 +381,21 @@ function sessionData(ctx: ExtensionContext | null): { cwd?: string; sessionId?: 
 	};
 }
 
-function pingData(ctx: ExtensionContext | null) {
+function pingData(ctx: ExtensionContext | null, identity: {
+	serverInstanceId: string;
+	sourceIdentityResolution: ActiveRuntimeSourceIdentityResolution;
+}) {
+	const source = identity.sourceIdentityResolution;
 	return {
+		serverInstanceId: identity.serverInstanceId,
+		...(source.available
+			? { sourceIdentity: { ...source.sourceIdentity } }
+			: { sourceIdentityUnavailable: { ...source.sourceIdentityUnavailable } }),
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
 		methods: [...SUBAGENT_RPC_METHODS],
 		capabilities: {
 			status: true,
+			...(source.available ? { activeRuntimeIdentity: { version: 1 } } : {}),
 			fleetStatus: { version: 1 },
 			asyncSpawn: true,
 			steer: true,
@@ -535,7 +548,6 @@ async function handleRequest(
 	fleetKeys: FleetKeyState,
 ): Promise<unknown> {
 	const ctx = options.getContext();
-	if (request.method === "ping") return pingData(ctx);
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
 
 	if (request.method === "spawn") {
@@ -624,29 +636,55 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 	dispose: () => void;
 } {
 	const fleetKeys: FleetKeyState = { sessionId: null, next: 0, keys: new Map() };
-	const unsubscribe = options.events.on(SUBAGENT_RPC_REQUEST_EVENT, async (raw) => {
-		let request: SubagentRpcRequestEnvelope | undefined;
+	const source = options.sourceIdentityResolution ?? {
+		available: false as const,
+		sourceIdentityUnavailable: { version: 1 as const, reasonCode: "unverified_source" as const },
+	};
+	const identity = {
+		serverInstanceId: options.serverInstanceId ?? randomUUID(),
+		sourceIdentityResolution: source.available
+			? { available: true as const, sourceIdentity: { ...source.sourceIdentity } }
+			: { available: false as const, sourceIdentityUnavailable: { ...source.sourceIdentityUnavailable } },
+	};
+	let disposed = false;
+	const emitSuccess = (request: SubagentRpcRequestEnvelope, data: unknown): void => {
+		options.events.emit(subagentRpcReplyEvent(request.requestId), {
+			version: SUBAGENT_RPC_PROTOCOL_VERSION,
+			requestId: request.requestId,
+			method: request.method,
+			success: true,
+			data,
+		} satisfies SubagentRpcReplyEnvelope);
+	};
+	const unsubscribe = options.events.on(SUBAGENT_RPC_REQUEST_EVENT, (raw) => {
+		if (disposed) return;
+		let request: SubagentRpcRequestEnvelope;
 		try {
 			request = parseRequest(raw);
-			const data = await handleRequest(request, options, fleetKeys);
-			options.events.emit(subagentRpcReplyEvent(request.requestId), {
-				version: SUBAGENT_RPC_PROTOCOL_VERSION,
-				requestId: request.requestId,
-				method: request.method,
-				success: true,
-				data,
-			} satisfies SubagentRpcReplyEnvelope);
 		} catch (error) {
-			const reply = errorReply(request ?? raw, error);
+			const reply = errorReply(raw, error);
 			options.events.emit(subagentRpcReplyEvent(reply.requestId), reply);
+			return;
 		}
+		if (request.method === "ping") {
+			// Reply-listener failures propagate as delivery failures. They must never
+			// be reinterpreted as a second error reply for the same ping.
+			emitSuccess(request, pingData(options.getContext(), identity));
+			return;
+		}
+		void handleRequest(request, options, fleetKeys).then(
+			(data) => { try { emitSuccess(request, data); } catch { /* isolate reply listener failures */ } },
+			(error) => { try { options.events.emit(subagentRpcReplyEvent(request.requestId), errorReply(request, error)); } catch { /* isolate reply listener failures */ } },
+		);
 	});
 
 	return {
 		emitReady: (ctx) => {
-			options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext()));
+			if (!disposed) options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext(), identity));
 		},
 		dispose: () => {
+			if (disposed) return;
+			disposed = true;
 			if (typeof unsubscribe === "function") unsubscribe();
 		},
 	};

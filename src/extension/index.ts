@@ -39,6 +39,7 @@ import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
 import { registerHerdrStatusBridge, type HerdrStatusRun } from "../integrations/herdr-status.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
+import { resolveActiveRuntimeSourceIdentity } from "./source-identity.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import { resolveWaitToolConfig } from "../runs/background/subagent-wait.ts";
@@ -339,7 +340,13 @@ export function projectActiveHerdrRuns(state: SubagentState): HerdrStatusRun[] {
 		});
 }
 
-export default function registerSubagentExtension(pi: ExtensionAPI): void {
+export default function registerSubagentExtension(
+	pi: ExtensionAPI,
+	dependencies: {
+		resolveSourceIdentity?: typeof resolveActiveRuntimeSourceIdentity;
+		createServerInstanceId?: () => string;
+	} = {},
+): void {
 	if (process.env[SUBAGENT_CHILD_ENV] === "1") {
 		return;
 	}
@@ -358,6 +365,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	DIRS.async = ensureAccessibleDir(DIRS.async);
 	cleanupOldChainDirs();
 
+	const serverInstanceId = (dependencies.createServerInstanceId ?? randomUUID)();
+	const sourceIdentityResolution = (dependencies.resolveSourceIdentity ?? resolveActiveRuntimeSourceIdentity)();
 	const config = loadConfig();
 	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
 	const asyncByDefault = resolveAsyncByDefault(config);
@@ -563,6 +572,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		getContext: () => state.lastUiContext,
 		execute: (id, params, signal, onUpdate, ctx) => executor.executePublic(id, params, signal, onUpdate, ctx),
 		state,
+		serverInstanceId,
+		sourceIdentityResolution,
 	});
 
 
