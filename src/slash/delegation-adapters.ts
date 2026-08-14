@@ -6,6 +6,7 @@ import {
 	type SubagentDelegationUpdate,
 	type SubagentDelegationValue,
 } from "../api/delegation.ts";
+import type { ActiveBoundExecutionProofV1 } from "../api/active-bound-runtime.ts";
 import type { AcceptanceInput, AgentContract, EffectsProjection, ExecutionProjection, JsonSchemaObject, ReviewProjection, ToolBudgetConfig, TurnBudgetConfig, Usage } from "../shared/types.ts";
 import { cloneJsonWithinByteLimit } from "./delegation-json.ts";
 
@@ -131,10 +132,14 @@ export interface DelegatedSubagentExecutionParams {
 	agentContract?: AgentContract;
 	acceptance?: AcceptanceInput;
 	artifacts?: boolean;
+	share?: false;
+	mission?: false;
 	/** Internal-only thinking override accepted by executeDelegated. */
 	delegatedThinkingOverride?: SubagentDelegationThinking;
 	/** Internal-only capability accepted and stripped by executeDelegated. */
 	delegatedAllowZeroToolBudget?: true;
+	/** Private admitted proof; never accepted from a public tool surface. */
+	activeBoundProof?: ActiveBoundExecutionProofV1;
 	async: false;
 	foregroundOnly: true;
 	clarify: false;

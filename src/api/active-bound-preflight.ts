@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { types as utilTypes } from "node:util";
 import { cloneJsonWithinByteLimit } from "../slash/delegation-json.ts";
 import { canonicalSha256 } from "../shared/canonical-json.ts";
 import type {
@@ -14,6 +15,7 @@ const MODEL = /^[^\s/:]+\/[^\s:]+$/u;
 const THINKING = new Set<SubagentDelegationThinking>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const FIELDS = new Set(["version", "targetServerInstanceId", "requestId", "ownerRunId", "nodeId", "prospectiveRunId", "agent", "task", "cwd", "context", "model", "thinking", "timeoutMs", "turnBudget", "toolBudget", "skill", "artifacts", "result"]);
 const MAX_SCHEMA_BYTES = 64 * 1024;
+const MAX_REQUEST_CLONE_BYTES = 8 * 1024 * 1024;
 const MAX_TASK_BYTES = 1024 * 1024;
 const MAX_CWD_BYTES = 32 * 1024;
 const MAX_SHORT_BYTES = 1024;
@@ -96,9 +98,53 @@ function parseToolBudget(value: unknown): SubagentDelegationToolBudget | undefin
 	return { ...(value.soft !== undefined ? { soft: value.soft as number } : {}), hard: value.hard as number, ...(block !== undefined ? { block } : {}) };
 }
 
+/** Descriptor-safe target extraction used to keep multi-responder routing unambiguous. */
+export function activeBoundPreflightTarget(input: unknown): string | undefined {
+	if (!input || typeof input !== "object" || Array.isArray(input) || utilTypes.isProxy(input)) return undefined;
+	const prototype = Object.getPrototypeOf(input);
+	if (prototype !== Object.prototype && prototype !== null) return undefined;
+	const descriptor = Object.getOwnPropertyDescriptor(input, "targetServerInstanceId");
+	return descriptor && "value" in descriptor && typeof descriptor.value === "string" && RFC4122_UUID.test(descriptor.value)
+		? descriptor.value
+		: undefined;
+}
+
+function omitActiveOptionalUndefined(value: unknown, allowed: ReadonlySet<string>): unknown {
+	if (!value || typeof value !== "object" || Array.isArray(value) || utilTypes.isProxy(value)) return value;
+	const prototype = Object.getPrototypeOf(value); const keys = Reflect.ownKeys(value);
+	if ((prototype !== Object.prototype && prototype !== null) || !keys.every((key): key is string => typeof key === "string" && allowed.has(key))) return value;
+	const output: Record<string, unknown> = Object.create(null);
+	for (const key of keys) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+		if (!("value" in descriptor) || !descriptor.enumerable) return value;
+		if (descriptor.value !== undefined) output[key] = descriptor.value;
+	}
+	return output;
+}
+
 /** Descriptor-safe closed parser. It clones before inspecting any caller property. */
 export function parseActiveBoundPreflightRequest(input: unknown): ActiveBoundPreflightParseResult {
-	const cloned = cloneJsonWithinByteLimit(input, 2 * 1024 * 1024);
+	let cloneInput = input;
+	if (input && typeof input === "object" && !Array.isArray(input) && !utilTypes.isProxy(input)) {
+		const prototype = Object.getPrototypeOf(input);
+		const keys = Reflect.ownKeys(input);
+		if ((prototype === Object.prototype || prototype === null) && keys.every((key): key is string => typeof key === "string" && FIELDS.has(key))) {
+			const prepared: Record<string, unknown> = Object.create(null); let safe = true;
+			for (const key of keys) {
+				const descriptor = Object.getOwnPropertyDescriptor(input, key)!;
+				if (!("value" in descriptor) || !descriptor.enumerable) { safe = false; break; }
+				if (descriptor.value !== undefined) {
+					prepared[key] = key === "turnBudget"
+						? omitActiveOptionalUndefined(descriptor.value, new Set(["maxTurns", "graceTurns"]))
+						: key === "toolBudget"
+							? omitActiveOptionalUndefined(descriptor.value, new Set(["soft", "hard", "block"]))
+							: descriptor.value;
+				}
+			}
+			if (safe) cloneInput = prepared;
+		}
+	}
+	const cloned = cloneJsonWithinByteLimit(cloneInput, MAX_REQUEST_CLONE_BYTES);
 	if (!cloned.ok || !plainRecord(cloned.value)) return fail();
 	const value = cloned.value;
 	if (!exactFields(value, FIELDS) || value.version !== 1) return fail();

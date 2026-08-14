@@ -123,6 +123,11 @@ describe("public subagent delegation contract", () => {
 		}
 	});
 
+	it("treats explicit undefined optional fields as absent", () => {
+		const parsed = parseSubagentDelegationRequest({ requestId: "r", ownerRunId: "o", nodeId: "n", agent: "worker", task: "task", context: "fresh", cwd: "/repo", model: undefined, result: { kind: "text" } });
+		assert.equal(parsed.ok, true, parsed.ok ? undefined : parsed.error);
+	});
+
 	it("rejects non-JSON schemas without executing toJSON hooks", () => {
 		let calls = 0;
 		const parsed = parseSubagentDelegationRequest({
@@ -133,7 +138,7 @@ describe("public subagent delegation contract", () => {
 			},
 		});
 		assert.equal(parsed.ok, false);
-		if (!parsed.ok) assert.match(parsed.error, /result.schema must be plain JSON data/);
+		if (!parsed.ok) assert.equal(parsed.error, "Delegation request must be closed plain data.");
 		assert.equal(calls, 0);
 	});
 

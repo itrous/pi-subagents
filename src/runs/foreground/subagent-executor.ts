@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resolveAgentName, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
+import { discoverProjectAgentsRestricted, resolveAgentName, type AgentConfig, type AgentScope } from "../../agents/agents.ts";
 import { getArtifactsDir, getChainRunsDir, getProjectArtifactPackagingWarning } from "../../shared/artifacts.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { ChainClarifyComponent, type ChainClarifyResult } from "./chain-clarify.ts";
@@ -25,6 +25,7 @@ import { buildDoctorReport } from "../../extension/doctor.ts";
 import { readSubagentGuide } from "../../extension/subagent-guide.ts";
 import { normalizePublicSubagentExecution } from "../../extension/public-execution.ts";
 import { runSync } from "./execution.ts";
+import type { ActiveBoundExecutionProofV1, ActiveBoundRootIdentityV1, ActiveBoundRuntimeService } from "../../api/active-bound-runtime.ts";
 import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/tool-actions.ts";
 import type { MainWatchdogRuntime } from "../../watchdog/runtime.ts";
 import { buildModelCandidates, normalizeParentModel, resolveEffectiveSubagentModel, resolveModelCandidate, type ParentModel } from "../shared/model-fallback.ts";
@@ -61,7 +62,7 @@ import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
-import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
+import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget, reserveTransactionalSpawnBudget, type TransactionalSpawnBudgetReservation } from "../shared/spawn-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -353,6 +354,7 @@ interface ExecutorDeps {
 	getSubagentSessionRoot: (parentSessionFile: string | null) => string;
 	expandTilde: (p: string) => string;
 	discoverAgents: (cwd: string, scope: AgentScope) => { agents: AgentConfig[]; modelScope?: ModelScopeConfig };
+	activeBoundRuntime?: ActiveBoundRuntimeService;
 	allowMutatingManagementActions?: boolean;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 }
@@ -394,6 +396,11 @@ interface ExecutionContextData {
 	parentSessionId: string | null;
 	parentPiSessionId?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	activeBoundProof?: ActiveBoundExecutionProofV1;
+	boundSpawnBudget?: { commit(): void; rollback(): void };
+	boundBaseRootIdentity?: ActiveBoundRootIdentityV1;
+	boundRootIdentity?: ActiveBoundRootIdentityV1;
+	boundSessionDirIdentity?: ActiveBoundRootIdentityV1;
 }
 
 function resolveRequestedCwd(runtimeCwd: string, requestedCwd: string | undefined): string {
@@ -3716,8 +3723,11 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const rawOutput = params.output !== undefined ? params.output : agentConfig.output;
 	let effectiveOutput = normalizeSingleOutputOverride(rawOutput, agentConfig.output);
 	const effectiveOutputMode = params.outputMode ?? "inline";
-	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
-	const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, agentConfig.maxSubagentDepth);
+	const currentMaxSubagentDepth = data.activeBoundProof?.contract.policy.maxSubagentDepth
+		?? resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
+	const maxSubagentDepth = data.activeBoundProof
+		? currentMaxSubagentDepth
+		: resolveChildMaxSubagentDepth(currentMaxSubagentDepth, agentConfig.maxSubagentDepth);
 
 	if (params.clarify === true && ctx.hasUI) {
 		const behavior = resolveStepBehavior(agentConfig, omitUndefinedProperties({ output: effectiveOutput, skills: skillOverride }));
@@ -3879,7 +3889,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			cwd: effectiveCwd,
 			signal,
 			interruptSignal: interruptController.signal,
-			allowIntercomDetach: agentConfig.systemPrompt?.includes(INTERCOM_BRIDGE_MARKER) === true,
+			allowIntercomDetach: !data.activeBoundProof && agentConfig.systemPrompt?.includes(INTERCOM_BRIDGE_MARKER) === true,
 			intercomEvents: deps.pi.events,
 			runId,
 			sessionDir: sessionDirForIndex(0),
@@ -3904,7 +3914,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			availableModels,
 			preferredModelProvider: currentProvider,
 			modelScope: data.modelScope,
-			skills: effectiveSkills,
+			skills: data.activeBoundProof?.contract.skills ? data.activeBoundProof.contract.skills.map((skill) => skill.name) : effectiveSkills,
 			structuredOutput: structuredRuntime,
 			agentContract: params.agentContract,
 			acceptance: params.acceptance,
@@ -3939,6 +3949,21 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			toolBudget: effectiveToolBudget.toolBudget,
 			capabilityCeiling: data.capabilityCeiling,
 			allowZeroToolBudget: data.allowZeroToolBudget && effectiveToolBudget.toolBudget === data.toolBudget,
+			...(data.activeBoundProof ? {
+				beforeSpawn: (materializedLaunchDigest) => {
+					if (data.activeBoundProof!.contract.launchInputsDigest && materializedLaunchDigest !== data.activeBoundProof!.contract.launchInputsDigest) throw new Error("Active-bound materialized launch differs from its proof.");
+					const sessionDirStat = fs.lstatSync(sessionDirForIndex(0));
+					if (sessionDirStat.isSymbolicLink() || !sessionDirStat.isDirectory() || !data.boundBaseRootIdentity || !data.boundRootIdentity || !data.boundSessionDirIdentity
+						|| sessionDirStat.dev !== data.boundSessionDirIdentity.dev || sessionDirStat.ino !== data.boundSessionDirIdentity.ino
+						|| !deps.activeBoundRuntime?.recheck(data.activeBoundProof!, { ownedBaseRootIdentity: data.boundBaseRootIdentity, ownedRootIdentity: data.boundRootIdentity, ownedSessionDirIdentity: data.boundSessionDirIdentity })) throw new Error("Active-bound launch contract changed before spawn.");
+				},
+				onSpawn: () => data.boundSpawnBudget?.commit(),
+				singleModelAttempt: true,
+				disableWatchdog: true,
+				activeBoundProjectSkills: true,
+				parentDepthOverride: data.activeBoundProof.contract.policy.parentDepth,
+				launchToolsOverride: [...(data.activeBoundProof.contract.tools?.effectiveAllowlist ?? agentConfig.tools ?? [])],
+			} : {}),
 		}));
 	} finally {
 		// An attached runSync rejection still owns its child and structured runtime.
@@ -4320,6 +4345,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 } {
 	const delegatedThinkingOverrides = new WeakMap<object, AgentConfig["thinking"]>();
 	const delegatedZeroToolBudgets = new WeakSet<object>();
+	const activeBoundProofs = new WeakMap<object, ActiveBoundExecutionProofV1>();
 	const warnedArtifactPackageDirs = new Set<string>();
 	const scheduledOwnerExecutors = new Map<string, ReturnType<typeof createSubagentExecutor>>();
 	const execute = async (
@@ -4333,6 +4359,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const workflowLaunchObserver = workflowLaunchObservers.get(params);
 		const delegatedThinkingOverride = delegatedThinkingOverrides.get(params);
 		const allowZeroToolBudget = delegatedZeroToolBudgets.has(params);
+		const activeBoundProof = activeBoundProofs.get(params);
+		if (activeBoundProof && (!deps.activeBoundRuntime || !deps.activeBoundRuntime.recheck(activeBoundProof))) {
+			return { content: [{ type: "text", text: "Active-bound launch contract changed before execution." }], isError: true, details: { mode: "single", results: [] } };
+		}
 		if (!preserveActiveSession) deps.state.baseCwd = ctx.cwd;
 		deps.state.foregroundRuns ??= new Map();
 		deps.state.foregroundControls ??= new Map();
@@ -5289,7 +5319,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 
 		const { blocked, depth, maxDepth } = checkSubagentDepth(deps.config.maxSubagentDepth);
-		if (blocked) {
+		if (blocked && !activeBoundProof) {
 			return {
 				content: [
 					{
@@ -5322,13 +5352,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (runToolBudget.error) return buildRequestedModeError(effectiveParams, runToolBudget.error);
 		const configToolBudget = resolveToolBudget(deps.config.toolBudget, "config.toolBudget");
 		if (configToolBudget.error) return buildRequestedModeError(effectiveParams, configToolBudget.error);
-		const usageBudget = validateUsageBudgetConfig(effectiveParams.usageBudget ?? deps.config.usageBudget, effectiveParams.usageBudget ? "usageBudget" : "config.usageBudget");
+		const usageBudget = activeBoundProof
+			? validateUsageBudgetConfig(undefined)
+			: validateUsageBudgetConfig(effectiveParams.usageBudget ?? deps.config.usageBudget, effectiveParams.usageBudget ? "usageBudget" : "config.usageBudget");
 		if (usageBudget.error) return buildRequestedModeError(effectiveParams, usageBudget.error);
 
-		const scope: AgentScope = resolveExecutionAgentScope(effectiveParams.agentScope);
+		if (activeBoundProof?.contract.canonicalCwd) effectiveParams = { ...effectiveParams, cwd: activeBoundProof.contract.canonicalCwd };
+		const scope: AgentScope = activeBoundProof ? "project" : resolveExecutionAgentScope(effectiveParams.agentScope);
 		const effectiveCwd = effectiveParams.cwd ?? ctx.cwd;
 		const parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
-		const discovered = deps.discoverAgents(effectiveCwd, scope);
+		const discovered = activeBoundProof ? discoverProjectAgentsRestricted(effectiveCwd) : deps.discoverAgents(effectiveCwd, scope);
 		const discoveredAgents = discovered.agents;
 		const canonicalParams = canonicalizeExecutionParams(effectiveParams, discoveredAgents);
 		if (canonicalParams.error) return buildRequestedModeError(effectiveParams, canonicalParams.error);
@@ -5341,17 +5374,17 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		effectiveParams = contextPolicy.params;
 		const sessionName = resolveIntercomSessionTarget(deps.pi.getSessionName(), ctx.sessionManager.getSessionId());
 		const intercomBridge = resolveIntercomBridge({
-			config: deps.config.intercomBridge,
+			config: activeBoundProof ? { mode: "off" } : deps.config.intercomBridge,
 			context: effectiveParams.context ?? (contextPolicy.usesFork ? "fork" : undefined),
 			orchestratorTarget: sessionName,
 		});
 		const agents = intercomBridge.active
 			? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))
 			: discoveredAgents;
-		const runId = randomUUID().slice(0, 8);
+		const runId = activeBoundProof?.request.prospectiveRunId ?? randomUUID().slice(0, 8);
 		const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
 		const nestedParentAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
-		const nestedRoute = inheritedNestedRoute ?? createNestedRoute(runId);
+		const nestedRoute = activeBoundProof ? inheritedNestedRoute : inheritedNestedRoute ?? createNestedRoute(runId);
 		const shareEnabled = effectiveParams.share === true;
 		const hasChain = (effectiveParams.chain?.length ?? 0) > 0;
 		const hasTasks = (effectiveParams.tasks?.length ?? 0) > 0;
@@ -5437,7 +5470,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			effectiveAsync ? undefined : DEFAULT_FOREGROUND_TIMEOUT_MS,
 		);
 		if (foregroundTimeout.error) return buildRequestedModeError(effectiveParams, foregroundTimeout.error);
-		const controlConfig = resolveControlConfig(deps.config.control, effectiveParams.control);
+		const controlConfig = activeBoundProof
+			? resolveControlConfig(undefined, { enabled: false })
+			: resolveControlConfig(deps.config.control, effectiveParams.control);
 
 		const artifactConfig: ArtifactConfig = omitUndefinedProperties({
 			...DEFAULT_ARTIFACT_CONFIG,
@@ -5460,15 +5495,17 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				: deps.getSubagentSessionRoot(parentSessionFile);
 			sessionRoot = path.join(baseSessionRoot, runId);
 		}
-		try {
-			fs.mkdirSync(sessionRoot, { recursive: true });
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			return toExecutionErrorResult(
-				effectiveParams,
-				new Error(`Failed to create session directory '${sessionRoot}': ${message}`),
-				contextPolicy.contextSummary,
-			);
+		if (!activeBoundProof) {
+			try {
+				fs.mkdirSync(sessionRoot, { recursive: true });
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return toExecutionErrorResult(
+					effectiveParams,
+					new Error(`Failed to create session directory '${sessionRoot}': ${message}`),
+					contextPolicy.contextSummary,
+				);
+			}
 		}
 		const sessionDirForIndex = (idx?: number) =>
 			path.join(sessionRoot, `run-${idx ?? 0}`);
@@ -5538,13 +5575,50 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 		};
 
-		const reservation = reserveSpawnBudget(
-			deps.state,
-			deps.config,
-			requestSessionId,
-			requestedSpawns,
-		);
-		if (reservation.error) return attachMission(spawnBudgetErrorResult(reservation.error, foregroundMode));
+		let boundSpawnBudget: TransactionalSpawnBudgetReservation | undefined;
+		let boundBaseRootIdentity: ActiveBoundRootIdentityV1 | undefined;
+		let boundRootIdentity: ActiveBoundRootIdentityV1 | undefined;
+		let boundSessionDirIdentity: ActiveBoundRootIdentityV1 | undefined;
+		if (activeBoundProof) {
+			const reservation = reserveTransactionalSpawnBudget(deps.state, deps.config, requestSessionId, requestedSpawns);
+			if (reservation.error) return attachMission(spawnBudgetErrorResult(reservation.error, foregroundMode));
+			boundSpawnBudget = reservation.reservation;
+			try {
+				const baseRoot = path.dirname(sessionRoot);
+				let createdBase = false;
+				if (activeBoundProof.contract.roots.baseRootIdentityDigest === undefined) {
+					fs.mkdirSync(path.dirname(baseRoot), { recursive: true });
+					try { fs.mkdirSync(baseRoot, { recursive: false }); createdBase = true; }
+					catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+				} else {
+					fs.mkdirSync(baseRoot, { recursive: true });
+				}
+				const base = fs.lstatSync(baseRoot);
+				if (base.isSymbolicLink() || !base.isDirectory()) throw new Error("bound base root is not a regular directory");
+				boundBaseRootIdentity = { dev: base.dev, ino: base.ino };
+				if (!deps.activeBoundRuntime?.claimBase(activeBoundProof, boundBaseRootIdentity, createdBase)) throw new Error("bound base root is not owned by this runtime");
+				fs.mkdirSync(sessionRoot, { recursive: false });
+				const created = fs.lstatSync(sessionRoot);
+				if (created.isSymbolicLink() || !created.isDirectory()) throw new Error("bound session root is not a regular directory");
+				boundRootIdentity = { dev: created.dev, ino: created.ino };
+				const runDirectory = path.join(sessionRoot, "run-0");
+				fs.mkdirSync(runDirectory, { recursive: false });
+				const createdRunDirectory = fs.lstatSync(runDirectory);
+				if (createdRunDirectory.isSymbolicLink() || !createdRunDirectory.isDirectory()) throw new Error("bound session directory is not a regular directory");
+				boundSessionDirIdentity = { dev: createdRunDirectory.dev, ino: createdRunDirectory.ino };
+			} catch (error) {
+				boundSpawnBudget?.rollback();
+				const message = error instanceof Error ? error.message : String(error);
+				return attachMission(toExecutionErrorResult(
+					effectiveParams,
+					new Error(`Failed to create bound session directory '${sessionRoot}': ${message}`),
+					contextPolicy.contextSummary,
+				));
+			}
+		} else {
+			const reservation = reserveSpawnBudget(deps.state, deps.config, requestSessionId, requestedSpawns);
+			if (reservation.error) return attachMission(spawnBudgetErrorResult(reservation.error, foregroundMode));
+		}
 
 		const execData: ExecutionContextData = omitUndefinedProperties({
 			params: effectiveParams,
@@ -5578,7 +5652,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			parentModel: requestParentModel,
 			parentSessionId: requestSessionId,
 			parentPiSessionId: requestPiSessionId,
-			capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(requestSessionId),
+			capabilityCeiling: activeBoundProof?.contract.tools?.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(requestSessionId),
+			activeBoundProof,
+			boundSpawnBudget,
+			boundBaseRootIdentity,
+			boundRootIdentity,
+			boundSessionDirIdentity,
 		});
 
 		const foregroundDescription = effectiveParams.task?.trim()
@@ -5735,6 +5814,21 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (nestedForegroundStarted) writeNestedForegroundEvent("subagent.nested.completed", errorResult);
 			return attachMission(errorResult);
 		} finally {
+			boundSpawnBudget?.rollback();
+			if (activeBoundProof && !boundSpawnBudget?.committed()) {
+				// Empty-only cleanup is data-safe: a replacement containing any sentinel
+				// survives. Identity checks prevent removing an already-observed replacement.
+				for (const owned of [
+					{ directory: path.join(sessionRoot, "run-0"), identity: boundSessionDirIdentity },
+					{ directory: sessionRoot, identity: boundRootIdentity },
+				]) {
+					if (!owned.identity) continue;
+					try {
+						const current = fs.lstatSync(owned.directory);
+						if (!current.isSymbolicLink() && current.isDirectory() && current.dev === owned.identity.dev && current.ino === owned.identity.ino) fs.rmdirSync(owned.directory);
+					} catch { /* best-effort empty-only rollback */ }
+				}
+			}
 			if (foregroundControl) {
 				settleForegroundSchedulingOwner(foregroundControl);
 				removeForegroundControlIfIdle(deps.state, runId);
@@ -5796,13 +5890,17 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const privateParams = delegatedParams as SubagentParamsLike & {
 			delegatedThinkingOverride?: AgentConfig["thinking"];
 			delegatedAllowZeroToolBudget?: true;
+			activeBoundProof?: ActiveBoundExecutionProofV1;
 		};
 		const thinkingOverride = privateParams.delegatedThinkingOverride;
 		const allowZeroToolBudget = privateParams.delegatedAllowZeroToolBudget === true;
+		const activeBoundProof = privateParams.activeBoundProof;
 		delete privateParams.delegatedThinkingOverride;
 		delete privateParams.delegatedAllowZeroToolBudget;
+		delete privateParams.activeBoundProof;
 		if (thinkingOverride !== undefined) delegatedThinkingOverrides.set(delegatedParams, thinkingOverride);
 		if (allowZeroToolBudget) delegatedZeroToolBudgets.add(delegatedParams);
+		if (activeBoundProof) activeBoundProofs.set(delegatedParams, activeBoundProof);
 		return execute(id, delegatedParams, signal, onUpdate, ctx);
 	};
 

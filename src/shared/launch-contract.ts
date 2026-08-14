@@ -89,6 +89,7 @@ export interface LaunchBindingInput {
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
+	permissionRules?: unknown;
 	outputPath?: string;
 	outputMode?: string;
 	structuredOutputSchema?: unknown;
@@ -113,6 +114,7 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		extensions: input.extensions,
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		mcpDirectTools: input.mcpDirectTools,
+		permissionRules: input.permissionRules,
 		outputPath: input.outputPath,
 		outputMode: input.outputMode,
 		structuredOutputSchema: input.structuredOutputSchema,

@@ -26,6 +26,17 @@ export type SubagentDelegationResultRequest =
 	| { kind: "text" }
 	| { kind: "structured"; schema: SubagentDelegationJsonSchemaObject };
 
+export interface SubagentDelegationBindingV1 {
+	version: 1;
+	targetServerInstanceId: string;
+	prospectiveRunId: string;
+	expectedSourceIdentityDigest: string;
+	expectedActiveSessionDigest: string;
+	requestDigest: string;
+	expectedLaunchContractDigest: string;
+	receipt: import("./launch-receipt.ts").LaunchReceiptV1;
+}
+
 export interface SubagentDelegationRequest {
 	requestId: string;
 	ownerRunId: string;
@@ -42,6 +53,7 @@ export interface SubagentDelegationRequest {
 	skill?: string | string[] | boolean;
 	artifacts?: boolean;
 	result: SubagentDelegationResultRequest;
+	binding?: SubagentDelegationBindingV1;
 }
 
 export interface SubagentDelegationStarted {

@@ -65,7 +65,7 @@ describe("restricted active-bound resolver", () => {
 		assert.equal(first.ok, true); assert.equal(second.ok, true);
 		assert.equal(first.contract.digest, second.contract.digest);
 		assert.equal(first.contract.canonicalCwd, fs.realpathSync(cwd));
-		assert.deepEqual(first.contract.modelCandidates, ["test/exact"]);
+		assert.deepEqual(first.contract.modelCandidates, ["test/exact:high"]);
 		assert.equal(first.contract.policy.artifacts, false);
 		assert.equal(first.contract.tools.disableAmbientExtensions, true);
 		assert.equal(first.contract.timeoutMs, 30 * 60 * 1000);
@@ -137,6 +137,14 @@ describe("restricted active-bound resolver", () => {
 		}
 	});
 
+	it("rejects supervisor tools while fixed intercom policy is off", () => {
+		for (const tool of ["intercom", "contact_supervisor"]) {
+			const cwd = path.join(root, `no-${tool}`); setup(cwd);
+			fs.writeFileSync(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: bound-worker\ndescription: Worker\ntools: ${tool}\n---\nPrompt.\n`);
+			assert.deepEqual(resolveActiveBoundLaunchContract(input(cwd, request(cwd, { skill: false }))), { ok: false, code: "unsupported_mode" });
+		}
+	});
+
 	it("rejects an empty tool list, denied read and zero read budget when a skill requires read", () => {
 		const cwd = path.join(root, "empty-tools-with-skill"); setup(cwd);
 		fs.writeFileSync(path.join(cwd, ".pi", "agents", "worker.md"), "---\nname: bound-worker\ndescription: Bound worker\ntools:\n---\nPrompt.\n");
@@ -183,7 +191,7 @@ describe("restricted active-bound resolver", () => {
 		fs.writeFileSync(agent, "---\nname: bound-worker\ndescription: Bound worker\ntools: read\ntimeoutMs: 10\nturnBudget: {\"maxTurns\":4}\ntoolBudget: {\"hard\":2}\n---\nPrompt.\n");
 		const result = resolveActiveBoundLaunchContract({
 			...input(cwd, request(cwd, { skill: false })),
-			runtimePolicy: { foregroundTimeoutMs: 99, waitToolEnabled: false, maxSubagentDepth: 0, permissions: { read: "allow" } as never },
+			runtimePolicy: { foregroundTimeoutMs: 99, waitToolEnabled: false, maxSubagentDepth: 1, permissions: { read: "allow" } as never },
 		});
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.timeoutMs, 10);
@@ -203,8 +211,9 @@ describe("restricted active-bound resolver", () => {
 			runtimePolicy: { foregroundTimeoutMs: 99, waitToolEnabled: false, maxSubagentDepth: 5, permissions: { rules: { read: "ask" } } },
 		});
 		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_MAX_DEPTH; else process.env.PI_SUBAGENT_MAX_DEPTH = previousDepth;
-		assert.equal(result.ok, true);
+		assert.equal(result.ok, true, JSON.stringify(result));
 		assert.equal(result.contract.policy.maxSubagentDepth, 0);
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd, request(cwd, { skill: false })), runtimePolicy: { foregroundTimeoutMs: 99, waitToolEnabled: false, maxSubagentDepth: 0 } }), { ok: false, code: "restricted_agent" });
 		assert.equal(result.contract.policy.permissionsDigest, canonicalSha256({ read: "deny" }));
 	});
 

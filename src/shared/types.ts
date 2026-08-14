@@ -1701,6 +1701,20 @@ export interface RunSyncOptions {
 	onDetachReady?: (detach: (reason?: string) => boolean) => void;
 	/** Internal foreground receipt proposal; returns true only when the outer waiter accepted it. */
 	onDetachReceipt?: (result: SingleResult) => boolean;
+	/** Immediate pre-spawn barrier. Throwing prevents child creation. */
+	beforeSpawn?: (materializedLaunchDigest: string) => void;
+	/** Private active-bound path: resolve only uncached nearest-project skills. */
+	activeBoundProjectSkills?: boolean;
+	/** Private active-bound snapshot; avoids rereading mutable ambient depth. */
+	parentDepthOverride?: number;
+	/** Private active-bound materialized tool plan without mutating source definition. */
+	launchToolsOverride?: string[];
+	/** Observes the first successful child spawn event. */
+	onSpawn?: () => void;
+	/** Bound launches disable startup/model retry after the first attempt. */
+	singleModelAttempt?: boolean;
+	/** Bound launches fix watchdog policy off regardless of ambient settings. */
+	disableWatchdog?: boolean;
 	/** Authoritative terminal result, emitted only after the full detached run finalizes. */
 	onDetachedExit?: (result: SingleResult) => void;
 	controlConfig?: ResolvedControlConfig;
@@ -2023,8 +2037,8 @@ export function checkSubagentDepth(configMaxDepth?: number): { blocked: boolean;
 	return { blocked, depth, maxDepth };
 }
 
-export function getSubagentDepthEnv(maxDepth?: number): Record<string, string> {
-	const parentDepth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
+export function getSubagentDepthEnv(maxDepth?: number, parentDepthOverride?: number): Record<string, string> {
+	const parentDepth = parentDepthOverride ?? Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
 	const nextDepth = Number.isFinite(parentDepth) ? parentDepth + 1 : 1;
 	return {
 		PI_SUBAGENT_DEPTH: String(nextDepth),

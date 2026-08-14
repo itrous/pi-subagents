@@ -13,6 +13,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { createActiveBoundRuntimeService } from "../api/active-bound-runtime.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -70,6 +71,7 @@ import {
 	SUBAGENT_STEERING_NOTICE_EVENT,
 	WIDGET_KEY,
 	resolveMaxSubagentSpawnsPerSession,
+	resolveCurrentMaxSubagentDepth,
 } from "../shared/types.ts";
 import {
 	formatSubagentControlNotice,
@@ -482,6 +484,24 @@ export default function registerSubagentExtension(
 	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs } = createAsyncJobTracker(pi, state, DIRS.async, {
 		widgetEnabled: asyncWidgetEnabled,
 	});
+	const activeBoundRuntime = sourceIdentityResolution.available
+		? createActiveBoundRuntimeService({
+			serverInstanceId,
+			sourceIdentityDigest: sourceIdentityResolution.sourceIdentity.digest,
+			getContext: () => state.lastUiContext,
+			config,
+			waitToolEnabled: waitToolConfig.enabled,
+			resolveCapabilityCeiling: (sessionId) => resolveCurrentSubagentCapabilityCeiling(sessionId),
+			currentDepth: process.env.PI_SUBAGENT_DEPTH === undefined ? 0 : Number(process.env.PI_SUBAGENT_DEPTH),
+			maxSubagentDepth: resolveCurrentMaxSubagentDepth(config.maxSubagentDepth),
+			verifySourceIdentity: () => {
+				const current = (dependencies.resolveSourceIdentity ?? resolveActiveRuntimeSourceIdentity)();
+				return current.available && current.sourceIdentity.digest === sourceIdentityResolution.sourceIdentity.digest;
+			},
+			expandTilde,
+		})
+		: undefined;
+	if (activeBoundRuntime) candidateCleanups.push(() => activeBoundRuntime.dispose());
 	const executor = createSubagentExecutor({
 		pi,
 		state,
@@ -494,6 +514,7 @@ export default function registerSubagentExtension(
 		getSubagentSessionRoot,
 		expandTilde,
 		discoverAgents,
+		activeBoundRuntime,
 	});
 	executorScheduled = executor.executeScheduled;
 
@@ -579,6 +600,8 @@ export default function registerSubagentExtension(
 				if (ctx.hasUI) ctx.ui.setToolsExpanded(false);
 				return executor.executeDelegated(requestId, params, signal, onUpdate, ctx);
 			},
+			activeBoundRuntime,
+			serverInstanceId,
 		});
 		candidateCleanups.push(promptTemplateBridge.dispose);
 		rpcBridge = (dependencies.registerRpcBridge ?? registerSubagentRpcBridge)({
@@ -588,6 +611,7 @@ export default function registerSubagentExtension(
 			state,
 			serverInstanceId,
 			sourceIdentityResolution,
+			activeBoundRuntime,
 		});
 	candidateCleanups.push(rpcBridge.dispose);
 

@@ -756,6 +756,21 @@ export function resolveSkillsWithFallback(
 	};
 }
 
+export function buildBoundSkillInjection(skills: ResolvedSkill[]): string {
+	if (skills.length === 0) return "";
+	const lines = ["The following project skills are materialized for this bound launch.", "<bound_skills>"];
+	for (const skill of skills) {
+		lines.push("  <skill>");
+		lines.push(`    <name>${escapeXmlText(skill.name)}</name>`);
+		lines.push(`    <description>${escapeXmlText(skill.description ?? "")}</description>`);
+		lines.push(`    <location>${escapeXmlText(skill.path)}</location>`);
+		lines.push(`    <content>${escapeXmlText(skill.content)}</content>`);
+		lines.push("  </skill>");
+	}
+	lines.push("</bound_skills>");
+	return lines.join("\n");
+}
+
 export function buildSkillInjection(skills: ResolvedSkill[]): string {
 	if (skills.length === 0) return "";
 

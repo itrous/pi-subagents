@@ -2,7 +2,8 @@
  * Core execution logic for running subagents
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
 import { existsSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
@@ -51,7 +52,7 @@ import {
 	boundStreamedRecentOutput,
 	boundStreamedToolCalls,
 } from "../../shared/utils.ts";
-import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
+import { buildBoundSkillInjection, buildSkillInjection, resolveProjectSkillsUncached, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
@@ -296,7 +297,7 @@ async function runSingleAttempt(
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
-	const watchdogConfig = resolveWatchdogConfig(options.cwd ?? runtimeCwd);
+	const watchdogConfig = options.disableWatchdog ? { ok: false as const } : resolveWatchdogConfig(options.cwd ?? runtimeCwd);
 	const childWatchdog = watchdogConfig.ok
 		? resolveChildWatchdogConfig({
 			config: watchdogConfig.config,
@@ -306,6 +307,7 @@ async function runSingleAttempt(
 		})
 		: undefined;
 	const permissionRules = resolvePermissionRules(options.permissions, agent.permissions);
+	const launchTools = options.launchToolsOverride ?? agent.tools;
 	const permissionAuditPath = permissionRules && options.artifactsDir
 		? path.join(options.artifactsDir, "permission-audit", `${options.runId}-${options.index ?? 0}.jsonl`)
 		: undefined;
@@ -321,7 +323,7 @@ async function runSingleAttempt(
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
-		tools: agent.tools,
+		tools: launchTools,
 		extensions: agent.extensions,
 		subagentOnlyExtensions: agent.subagentOnlyExtensions,
 		systemPrompt: appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget),
@@ -350,7 +352,7 @@ async function runSingleAttempt(
 
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
-		tools: agent.tools,
+		tools: launchTools,
 		extensions: agent.extensions,
 		subagentOnlyExtensions: agent.subagentOnlyExtensions,
 		mcpDirectTools: agent.mcpDirectTools,
@@ -375,7 +377,9 @@ async function runSingleAttempt(
 		skills: shared.resolvedSkillNames ?? [],
 		tools: toolPlan.effectiveToolAllowlist,
 		extensions: toolPlan.extensionArgs,
+		subagentOnlyExtensions: options.activeBoundProjectSkills ? agent.subagentOnlyExtensions ?? [] : undefined,
 		mcpDirectTools: toolPlan.effectiveMcpTools,
+		permissionRules: options.activeBoundProjectSkills ? permissionRules : undefined,
 		...(options.outputPath ? { outputPath: options.outputPath } : {}),
 		outputMode: options.outputMode ?? "inline",
 		...(options.structuredOutput ? { structuredOutputSchema: options.structuredOutput.schema } : {}),
@@ -441,7 +445,7 @@ async function runSingleAttempt(
 		lastActivityAt: startTime,
 	};
 	result.progress = progress;
-	const attemptTimeout = resolveAttemptTimeout(options);
+	let attemptTimeout = resolveAttemptTimeout(options);
 	if (attemptTimeout?.remainingMs === 0) {
 		cleanupTempDir(tempDir);
 		result.exitCode = 1;
@@ -457,20 +461,44 @@ async function runSingleAttempt(
 		};
 		return result;
 	}
-	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
+	const inheritedSpawnEnv = { ...process.env };
+	if (options.disableWatchdog) {
+		for (const key of Object.keys(inheritedSpawnEnv)) {
+			if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INTERCOM_")) delete inheritedSpawnEnv[key];
+		}
+	}
+	const spawnEnv = { ...inheritedSpawnEnv, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride) };
+	for (const [key, value] of Object.entries(spawnEnv)) if (value === undefined) delete spawnEnv[key];
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
 
-	const exitCode = await new Promise<number>((resolve) => {
+	const exitCode = await new Promise<number>((resolve, reject) => {
 		const spawnSpec = getPiSpawnCommand(args);
-		const proc = spawn(spawnSpec.command, spawnSpec.args, {
-			cwd: options.cwd ?? runtimeCwd,
-			env: spawnEnv,
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-		});
+		try { options.beforeSpawn?.(launchContractDigest); } catch (error) { cleanupTempDir(tempDir); reject(error); return; }
+		attemptTimeout = resolveAttemptTimeout(options);
+		if (attemptTimeout?.remainingMs === 0) {
+			cleanupTempDir(tempDir);
+			result.timedOut = true; result.error = attemptTimeout.message; result.finalOutput = attemptTimeout.message;
+			progress.status = "failed"; progress.error = attemptTimeout.message; progress.durationMs = Date.now() - startTime;
+			resolve(1); return;
+		}
+		let proc: ChildProcessByStdio<null, Readable, Readable>;
+		try {
+			proc = spawn(spawnSpec.command, spawnSpec.args, {
+				cwd: options.cwd ?? runtimeCwd,
+				env: spawnEnv,
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+			});
+		} catch (error) {
+			cleanupTempDir(tempDir);
+			reject(error);
+			return;
+		}
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
+		let spawnObserved = false;
+		proc.once("spawn", () => { if (!spawnObserved) { spawnObserved = true; options.onSpawn?.(); } });
 		let processClosed = false;
 		let lifecycleFinished = false;
 		let detached = false;
@@ -1002,14 +1030,15 @@ async function runSingleAttempt(
 			activityTimer.unref?.();
 		}
 
-		if (attemptTimeout) {
+		const activeAttemptTimeout = attemptTimeout;
+		if (activeAttemptTimeout) {
 			timeoutTimer = setTimeout(() => {
 				if (processClosed || lifecycleFinished || interruptedByControl) return;
 				result.timedOut = true;
-				result.error = attemptTimeout.message;
-				result.finalOutput = attemptTimeout.message;
+				result.error = activeAttemptTimeout.message;
+				result.finalOutput = activeAttemptTimeout.message;
 				progress.status = "failed";
-				progress.error = attemptTimeout.message;
+				progress.error = activeAttemptTimeout.message;
 				progress.durationMs = Date.now() - startTime;
 				fireUpdate();
 				trySignalChild(proc, "SIGINT");
@@ -1023,7 +1052,7 @@ async function runSingleAttempt(
 					trySignalChild(proc, "SIGKILL");
 				}, 4000);
 				timeoutHardKillTimer.unref?.();
-			}, attemptTimeout.remainingMs);
+			}, activeAttemptTimeout.remainingMs);
 			timeoutTimer.unref?.();
 		}
 
@@ -1270,7 +1299,7 @@ async function runSingleAttempt(
 			agent: agent.name,
 			task: shared.originalTask ?? task,
 			messages: result.messages ?? [],
-			tools: agent.tools,
+			tools: launchTools,
 			mcpDirectTools: agent.mcpDirectTools,
 		})
 		: undefined;
@@ -1422,13 +1451,15 @@ async function runSyncCompletion(
 	}
 	const skillNames = options.skills ?? agent.skills ?? [];
 	const skillCwd = options.cwd ?? runtimeCwd;
-	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
-		skillNames,
-		skillCwd,
-		runtimeCwd,
-		agent.skillPath,
-		agent.filePath ? path.dirname(agent.filePath) : skillCwd,
-	);
+	const { resolved: resolvedSkills, missing: missingSkills } = options.activeBoundProjectSkills
+		? resolveProjectSkillsUncached(skillNames, skillCwd)
+		: resolveSkillsWithFallback(
+			skillNames,
+			skillCwd,
+			runtimeCwd,
+			agent.skillPath,
+			agent.filePath ? path.dirname(agent.filePath) : skillCwd,
+		);
 	if (skillNames.some((skill) => skill.trim() === "pi-subagents") && missingSkills.includes("pi-subagents")) {
 		return withRunContext({
 			index: options.index ?? 0,
@@ -1442,7 +1473,7 @@ async function runSyncCompletion(
 	}
 	let systemPrompt = agent.systemPrompt?.trim() || "";
 	if (resolvedSkills.length > 0) {
-		const skillInjection = buildSkillInjection(resolvedSkills);
+		const skillInjection = options.activeBoundProjectSkills ? buildBoundSkillInjection(resolvedSkills) : buildSkillInjection(resolvedSkills);
 		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${skillInjection}` : skillInjection;
 	}
 	const memoryInjection = buildAgentMemoryInjection(agent, skillCwd);
@@ -1563,7 +1594,7 @@ async function runSyncCompletion(
 			// been handed to a supervisor, terminating that attempt must not launch a
 			// startup retry or model fallback. Explicit user detach retains fallback.
 			if (intercomDetached || result.timedOut || result.turnBudgetExceeded) break modelAttemptsLoop;
-			if (attemptSucceeded) break modelAttemptsLoop;
+			if (attemptSucceeded || options.singleModelAttempt) break modelAttemptsLoop;
 
 			const startupFailure = isRetryableSubagentStartupFailure({
 				exitCode: result.exitCode,

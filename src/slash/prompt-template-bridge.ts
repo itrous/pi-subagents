@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { types as utilTypes } from "node:util";
+import { activeBoundRequestFromDelegation, type ActiveBoundRuntimeService } from "../api/active-bound-runtime.ts";
 import {
 	SUBAGENT_DELEGATION_CANCEL_EVENT,
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
@@ -9,7 +11,7 @@ import {
 	type SubagentDelegationRequest,
 	type SubagentDelegationResponse,
 } from "../api/delegation.ts";
-import { parseSubagentDelegationRequest } from "./delegation-request.ts";
+import { parseSubagentDelegationRequest, subagentDelegationBindingTarget } from "./delegation-request.ts";
 import {
 	parsePromptTemplateRequest,
 	toSubagentDelegationExecutionParams,
@@ -19,6 +21,7 @@ import {
 	type PromptTemplateBridgeResult,
 	type PromptTemplateDelegationResponse,
 } from "./delegation-adapters.ts";
+import { getBoundIdentityRegistry, type BoundIdentityRegistryV1 } from "./bound-identity-registry.ts";
 import { getStructuredAttemptCoordinator, type StructuredAttemptCoordinator } from "./structured-attempt-coordinator.ts";
 
 export const PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT = SUBAGENT_DELEGATION_REQUEST_EVENT;
@@ -51,13 +54,22 @@ interface PromptTemplateBridgeOptions<Ctx extends { cwd?: string }> {
 	) => Promise<PromptTemplateBridgeResult>;
 	runtimeId?: string;
 	coordinator?: StructuredAttemptCoordinator;
+	activeBoundRuntime?: ActiveBoundRuntimeService;
+	serverInstanceId?: string;
+	boundIdentityRegistry?: BoundIdentityRegistryV1;
 }
 
 function hasStructuredDelegationMarker(data: unknown): boolean {
 	if (!data || typeof data !== "object" || Array.isArray(data)) return false;
-	const value = data as Record<string, unknown>;
-	return Object.hasOwn(value, "ownerRunId") || Object.hasOwn(value, "nodeId")
-		|| Object.hasOwn(value, "result") || Object.hasOwn(value, "version");
+	if (utilTypes.isProxy(data)) return true;
+	const descriptors = Object.getOwnPropertyDescriptors(data);
+	return ["ownerRunId", "nodeId", "result", "version"].some((key) => key in descriptors);
+}
+
+function hasBindingMarker(data: unknown): boolean {
+	if (!data || typeof data !== "object" || Array.isArray(data) || utilTypes.isProxy(data)) return false;
+	const descriptor = Object.getOwnPropertyDescriptor(data, "binding");
+	return Boolean(descriptor && "value" in descriptor && descriptor.value !== undefined);
 }
 
 function validId(value: unknown): value is string {
@@ -77,6 +89,7 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 	runtimeId: string;
 } {
 	const coordinator = options.coordinator ?? getStructuredAttemptCoordinator();
+	const boundRegistry = options.activeBoundRuntime ? options.boundIdentityRegistry ?? getBoundIdentityRegistry() : undefined;
 	const runtimeId = options.runtimeId ?? randomUUID();
 	const subscriptions: Array<() => void> = [];
 	let active = false;
@@ -117,6 +130,11 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 			return;
 		}
 
+		const boundMarker = hasBindingMarker(data);
+		const bindingTarget = subagentDelegationBindingTarget(data);
+		const targetServerInstanceId = options.activeBoundRuntime?.serverInstanceId ?? options.serverInstanceId;
+		if (boundMarker && !bindingTarget) return;
+		if (bindingTarget && targetServerInstanceId && bindingTarget !== targetServerInstanceId) return;
 		const parsed = parseSubagentDelegationRequest(data);
 		if (parsed.ok === false) {
 			if (!parsed.requestId) return;
@@ -126,7 +144,9 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 				...(parsed.nodeId ? { nodeId: parsed.nodeId } : {}),
 				status: "invalid_request", error: parsed.error,
 			} satisfies SubagentDelegationInvalidResponse;
-			if (parsed.ownerRunId && parsed.nodeId) {
+			if (bindingTarget && parsed.ownerRunId && parsed.nodeId) {
+				try { options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, terminal); } catch { /* rejected bound proof owns no coordinator state */ }
+			} else if (parsed.ownerRunId && parsed.nodeId) {
 				const committed = coordinator.commitRejected({
 					requestId: parsed.requestId,
 					ownerRunId: parsed.ownerRunId,
@@ -141,13 +161,54 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 			}
 			return;
 		}
-		void executeStructured(parsed.request);
+		executeStructured(parsed.request);
 	});
 
-	async function executeStructured(request: SubagentDelegationRequest): Promise<void> {
+	function rejectBound(request: SubagentDelegationRequest, status: "invalid_request" | "unavailable_context" | "duplicate_node", error?: string): void {
+		// A rejected bound request never owns coordinator node state. Emitting its
+		// terminal directly avoids replacing an already-running node owner.
+		try {
+			options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, {
+				requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status,
+				...(error ? { error } : {}),
+			} satisfies SubagentDelegationResponse);
+		} catch { /* direct rejected terminal is one-shot even when a listener throws */ }
+	}
+
+	function executeStructured(request: SubagentDelegationRequest): void {
 		if (!active || stopped) return;
+		let prospectiveReservation: { serverInstanceId: string; prospectiveRunId: string } | undefined;
+		let boundProof;
+		if (request.binding) {
+			const runtime = options.activeBoundRuntime;
+			if (!runtime) {
+				if (request.binding.targetServerInstanceId === options.serverInstanceId) rejectBound(request, "unavailable_context", "Active-bound runtime is unavailable.");
+				return;
+			}
+			if (request.binding.targetServerInstanceId !== runtime.serverInstanceId) return;
+			if (!boundRegistry) { rejectBound(request, "unavailable_context", "Active-bound identity registry is unavailable."); return; }
+			const reserve = boundRegistry.reserve(runtime.serverInstanceId, request.binding.prospectiveRunId);
+			if (reserve === "duplicate") { rejectBound(request, "duplicate_node"); return; }
+			if (reserve === "capacity") { rejectBound(request, "unavailable_context", "Active-bound identity capacity is exhausted for this process."); return; }
+			prospectiveReservation = { serverInstanceId: runtime.serverInstanceId, prospectiveRunId: request.binding.prospectiveRunId };
+			const boundRequest = activeBoundRequestFromDelegation(request as Parameters<typeof activeBoundRequestFromDelegation>[0], request.binding);
+			const verified = runtime.admit(boundRequest, request.binding);
+			if (!verified.ok) {
+				boundRegistry.release(runtime.serverInstanceId, request.binding.prospectiveRunId);
+				prospectiveReservation = undefined;
+				rejectBound(request, verified.code);
+				return;
+			}
+			boundProof = verified.proof;
+		}
 		const admission = coordinator.admit(request, runtimeId);
 		if (!admission.accepted) {
+			if (prospectiveReservation) boundRegistry!.release(prospectiveReservation.serverInstanceId, prospectiveReservation.prospectiveRunId);
+			if (request.binding) {
+				rejectBound(request, admission.reason === "capacity" ? "unavailable_context" : "duplicate_node",
+					admission.reason === "capacity" ? "Delegation identity capacity is exhausted for this process." : undefined);
+				return;
+			}
 			if (admission.reason === "duplicate_node") {
 				const committed = coordinator.commitRejected(request, runtimeId, {
 					requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: "duplicate_node",
@@ -162,6 +223,11 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 			} satisfies SubagentDelegationResponse);
 			return;
 		}
+		if (prospectiveReservation && !boundRegistry!.commit(prospectiveReservation.serverInstanceId, prospectiveReservation.prospectiveRunId)) {
+			admission.settle({ requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: "duplicate_node" });
+			return;
+		}
+		void (async () => {
 		try {
 			if (admission.signal.aborted) {
 				admission.settle({ requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: "cancelled" });
@@ -183,9 +249,15 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 				return;
 			}
 			const executor = options.executeStructured ?? options.execute;
+			const executionParams = toSubagentDelegationExecutionParams(request);
+			if (boundProof) {
+				executionParams.activeBoundProof = boundProof;
+				executionParams.share = false;
+				executionParams.mission = false;
+			}
 			const result = await executor(
 				request.requestId,
-				toSubagentDelegationExecutionParams(request),
+				executionParams,
 				admission.signal,
 				ctx,
 				(update) => {
@@ -202,6 +274,7 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 				...(admission.signal.aborted ? {} : { error: error instanceof Error ? error.message : String(error) }),
 			});
 		}
+		})();
 	}
 
 	const stop = (stopOptions: { preserveSink?: boolean } = {}): void => {

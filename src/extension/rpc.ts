@@ -21,6 +21,8 @@ import { readStatus } from "../shared/utils.ts";
 import { SubagentParams } from "./schemas.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
+import { activeBoundPreflightTarget } from "../api/active-bound-preflight.ts";
+import type { ActiveBoundRuntimeService } from "../api/active-bound-runtime.ts";
 import type { ActiveRuntimeSourceIdentityResolution } from "./source-identity.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
@@ -28,7 +30,7 @@ export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 export const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready";
 export const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
 
-export const SUBAGENT_RPC_METHODS = ["ping", "status", "spawn", "steer", "interrupt", "stop", "resume"] as const;
+export const SUBAGENT_RPC_METHODS = ["ping", "preflight", "status", "spawn", "steer", "interrupt", "stop", "resume"] as const;
 export type SubagentRpcMethod = typeof SUBAGENT_RPC_METHODS[number];
 
 export interface SubagentRpcRequestEnvelope {
@@ -297,6 +299,7 @@ interface RegisterSubagentRpcBridgeOptions {
 	state?: SubagentState;
 	serverInstanceId?: string;
 	sourceIdentityResolution?: ActiveRuntimeSourceIdentityResolution;
+	activeBoundRuntime?: ActiveBoundRuntimeService;
 }
 
 class SubagentRpcError extends Error {
@@ -384,6 +387,7 @@ function sessionData(ctx: ExtensionContext | null): { cwd?: string; sessionId?: 
 function pingData(ctx: ExtensionContext | null, identity: {
 	serverInstanceId: string;
 	sourceIdentityResolution: ActiveRuntimeSourceIdentityResolution;
+	activeBoundRuntime?: ActiveBoundRuntimeService;
 }) {
 	const source = identity.sourceIdentityResolution;
 	return {
@@ -396,6 +400,7 @@ function pingData(ctx: ExtensionContext | null, identity: {
 		capabilities: {
 			status: true,
 			...(source.available ? { activeRuntimeIdentity: { version: 1 } } : {}),
+			...(source.available && identity.activeBoundRuntime ? { boundForegroundLeaf: { version: 1 } } : {}),
 			fleetStatus: { version: 1 },
 			asyncSpawn: true,
 			steer: true,
@@ -550,6 +555,12 @@ async function handleRequest(
 	const ctx = options.getContext();
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
 
+	if (request.method === "preflight") {
+		if (!options.activeBoundRuntime) throw new SubagentRpcError("unsupported_method", "Active-bound preflight is unavailable.");
+		const response = options.activeBoundRuntime.preflight(request.params);
+		if ("code" in response) throw new SubagentRpcError(response.code === "no_active_session" ? "no_active_session" : "invalid_params", response.code);
+		return response;
+	}
 	if (request.method === "spawn") {
 		return executeChecked(options, ctx, request.requestId, request.method, spawnParams(request.params));
 	}
@@ -645,6 +656,7 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 	};
 	const identity = {
 		serverInstanceId: options.serverInstanceId ?? randomUUID(),
+		...(options.activeBoundRuntime ? { activeBoundRuntime: options.activeBoundRuntime } : {}),
 		sourceIdentityResolution: source.available
 			? { available: true as const, sourceIdentity: { ...source.sourceIdentity } }
 			: { available: false as const, sourceIdentityUnavailable: { ...source.sourceIdentityUnavailable } },
@@ -669,6 +681,13 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 			if (lifecycle !== "active") return;
 			const reply = errorReply(raw, error);
 			options.events.emit(subagentRpcReplyEvent(reply.requestId), reply);
+			return;
+		}
+		if (request.method === "preflight" && activeBoundPreflightTarget(request.params) !== identity.serverInstanceId) return;
+		if (request.method === "preflight" && lifecycle === "active") {
+			// Active preflight is a closed synchronous DTO. Domain failures remain
+			// data-only and never expose diagnostics or receipt authority state.
+			emitSuccess(request, options.activeBoundRuntime?.preflight(request.params) ?? { version: 1, code: "unverified_source" });
 			return;
 		}
 		if (request.method === "ping") {
