@@ -3835,7 +3835,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		return { content: [{ type: "text", text: validationError }], isError: true, details: { mode: "single", results: [] } };
 	}
 	const structuredRuntime = params.outputSchema
-		? createStructuredOutputRuntime(params.outputSchema, artifactConfig.enabled ? path.join(artifactsDir, "structured-output", runId) : undefined)
+		? createStructuredOutputRuntime(params.outputSchema, !data.activeBoundProof && artifactConfig.enabled ? path.join(artifactsDir, "structured-output", runId) : undefined)
 		: undefined;
 	// Reads: caller override > agent defaultReads > none. `~`/`~/` expand to home;
 	// absolute paths pass through; relative paths resolve against the child cwd.
@@ -3931,7 +3931,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 					}
 				} finally {
 					try {
-						if (!artifactConfig.enabled) cleanupStructuredOutputRuntime(structuredRuntime);
+						if (data.activeBoundProof || !artifactConfig.enabled) cleanupStructuredOutputRuntime(structuredRuntime);
 					} finally {
 						try {
 							if (foregroundControl) finishForegroundChild(foregroundControl, 0);
@@ -3962,6 +3962,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				disableWatchdog: true,
 				activeBoundProjectSkills: true,
 				activeBoundEnvironment: Object.assign(Object.create(null), data.activeBoundProof.request.environment ?? {}),
+				deferArtifactsUntilSpawn: data.activeBoundProof.request.artifacts,
 				parentDepthOverride: data.activeBoundProof.contract.policy.parentDepth,
 				launchToolsOverride: [...(data.activeBoundProof.contract.tools?.effectiveAllowlist ?? agentConfig.tools ?? [])],
 			} : {}),
@@ -3971,7 +3972,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		// A successful detached receipt transfers both to onDetachedExit while the
 		// authoritative completion remains live.
 		if (!r?.detached) {
-			if (!artifactConfig.enabled) cleanupStructuredOutputRuntime(structuredRuntime);
+			if (data.activeBoundProof || !artifactConfig.enabled) cleanupStructuredOutputRuntime(structuredRuntime);
 			if (foregroundControl) finishForegroundChild(foregroundControl, 0);
 		}
 	}
@@ -5477,11 +5478,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 
 		const artifactConfig: ArtifactConfig = omitUndefinedProperties({
 			...DEFAULT_ARTIFACT_CONFIG,
-			enabled: effectiveParams.artifacts !== false,
-			dir: deps.config.artifactDir ?? DEFAULT_ARTIFACT_CONFIG.dir,
+			enabled: activeBoundProof ? activeBoundProof.request.artifacts : effectiveParams.artifacts !== false,
+			dir: activeBoundProof ? "session" : deps.config.artifactDir ?? DEFAULT_ARTIFACT_CONFIG.dir,
+			...(activeBoundProof?.request.artifacts ? { includeJsonl: true } : {}),
 		});
-		const artifactsDir = getArtifactsDir(parentSessionFile, effectiveCwd, artifactConfig.dir);
-		if (artifactConfig.dir === "project" && !warnedArtifactPackageDirs.has(effectiveCwd)) {
+		let artifactsDir = getArtifactsDir(parentSessionFile, effectiveCwd, artifactConfig.dir);
+		if (!activeBoundProof && artifactConfig.dir === "project" && !warnedArtifactPackageDirs.has(effectiveCwd)) {
 			warnedArtifactPackageDirs.add(effectiveCwd);
 			const warning = getProjectArtifactPackagingWarning(effectiveCwd);
 			if (warning) console.warn(`[pi-subagents] ${warning}`);
@@ -5496,6 +5498,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				: deps.getSubagentSessionRoot(parentSessionFile);
 			sessionRoot = path.join(baseSessionRoot, runId);
 		}
+		if (activeBoundProof && activeBoundProof.request.artifacts) artifactsDir = path.join(sessionRoot, "artifacts");
 		if (!activeBoundProof) {
 			try {
 				fs.mkdirSync(sessionRoot, { recursive: true });
@@ -5602,6 +5605,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const created = fs.lstatSync(sessionRoot);
 				if (created.isSymbolicLink() || !created.isDirectory()) throw new Error("bound session root is not a regular directory");
 				boundRootIdentity = { dev: created.dev, ino: created.ino };
+				if (activeBoundProof.request.artifacts) artifactsDir = path.join(fs.realpathSync(sessionRoot), "artifacts");
 				const runDirectory = path.join(sessionRoot, "run-0");
 				fs.mkdirSync(runDirectory, { recursive: false });
 				const createdRunDirectory = fs.lstatSync(runDirectory);

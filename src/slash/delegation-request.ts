@@ -29,6 +29,7 @@ const supportedFields = new Set([
 	"skill",
 	"environment",
 	"artifacts",
+	"artifactDir",
 	"result",
 	"binding",
 ]);
@@ -211,13 +212,16 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 	if (value.artifacts !== undefined && typeof value.artifacts !== "boolean") {
 		return { ok: false, ...identity, error: "artifacts must be a boolean." };
 	}
+	if (value.artifactDir !== undefined && value.artifactDir !== "session") return { ok: false, ...identity, error: "artifactDir must be session when provided." };
 	const binding = value.binding === undefined ? undefined : parseBinding(value.binding);
 	if (value.binding !== undefined && !binding) return { ok: false, ...identity, error: "binding must be a closed active-bound v1 proof." };
 	if (!binding && value.environment !== undefined) return { ok: false, ...identity, error: "environment is supported only for bound delegation." };
+	if (!binding && value.artifactDir !== undefined) return { ok: false, ...identity, error: "artifactDir is supported only for bound delegation." };
 	const parsedEnvironment = parseActiveBoundEnvironment(value.environment);
 	if (!parsedEnvironment.ok) return { ok: false, ...identity, error: "environment must contain only bounded active-bound keys." };
-	if (binding && (value.context !== "fresh" || typeof value.model !== "string" || typeof value.thinking !== "string" || value.artifacts !== false || value.skill === true)) {
-		return { ok: false, ...identity, error: "bound delegation requires fresh context, explicit model/thinking, artifacts:false, and explicit project skills." };
+	if (binding && (value.context !== "fresh" || typeof value.model !== "string" || typeof value.thinking !== "string" || value.skill === true
+		|| ((value.artifacts !== false || value.artifactDir !== undefined) && (value.artifacts !== true || value.artifactDir !== "session")))) {
+		return { ok: false, ...identity, error: "bound delegation requires fresh context, explicit model/thinking, a closed artifact policy, and explicit project skills." };
 	}
 	if (Buffer.byteLength(value.task as string, "utf8") > MAX_TASK_BYTES) {
 		return { ok: false, ...identity, error: "Delegation task exceeds 1 MiB when UTF-8 encoded." };

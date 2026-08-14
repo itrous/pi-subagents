@@ -54,6 +54,8 @@ export interface SubagentDelegationRequest {
 	/** Bound-only per-request environment. Public unbound delegation rejects it. */
 	environment?: import("./active-bound-environment.ts").ActiveBoundEnvironmentV1;
 	artifacts?: boolean;
+	/** Bound-only artifact placement. */
+	artifactDir?: "session";
 	result: SubagentDelegationResultRequest;
 	binding?: SubagentDelegationBindingV1;
 }

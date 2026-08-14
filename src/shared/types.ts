@@ -909,6 +909,8 @@ export interface SingleResult {
 	outputSaveError?: string;
 	/** Best-effort metadata persistence failure; execution and receipt publication continue. */
 	metadataSaveError?: string;
+	/** Critical post-spawn bound artifact activation failed; terminal failure outranks later cancellation. */
+	artifactInitializationFailed?: boolean;
 	structuredOutput?: unknown;
 	structuredOutputFailed?: boolean;
 	structuredOutputPath?: string;
@@ -1707,6 +1709,8 @@ export interface RunSyncOptions {
 	activeBoundProjectSkills?: boolean;
 	/** Private active-bound per-spawn values; empty object still selects isolated mode. */
 	activeBoundEnvironment?: import("../api/active-bound-environment.ts").ActiveBoundEnvironmentV1;
+	/** Private active-bound mode: artifact writers activate only after child spawn. */
+	deferArtifactsUntilSpawn?: boolean;
 	/** Private active-bound snapshot; avoids rereading mutable ambient depth. */
 	parentDepthOverride?: number;
 	/** Private active-bound materialized tool plan without mutating source definition. */

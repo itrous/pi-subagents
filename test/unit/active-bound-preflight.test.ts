@@ -69,6 +69,8 @@ describe("active-bound preflight DTO", () => {
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, model: "openrouter/openai/gpt-5" }).ok, true);
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, task: "\u0001".repeat(1024 * 1024) }).ok, true);
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, task: "x".repeat(1024 * 1024 + 1) }).ok, false);
+		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, artifacts: true, artifactDir: "session" }).ok, true);
+		for (const artifactMutation of [{ artifacts: true }, { artifacts: false, artifactDir: "session" }, { artifacts: true, artifactDir: "project" }, { artifacts: false, artifactDir: null }]) assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, ...artifactMutation }).ok, false);
 		for (const environment of [{ UNKNOWN: "x" }, { onecpi_review_root: "/root" }, { ONECPI_REVIEW_ROOT: "" }, { ONECPI_REVIEW_ROOT: "x\0y" }, { ONECPI_REVIEW_ROOT: "\ud800" }, { ONECPI_REVIEW_ROOT: "x".repeat(4097) }]) {
 			assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, environment }).ok, false);
 		}

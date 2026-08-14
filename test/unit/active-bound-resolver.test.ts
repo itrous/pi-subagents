@@ -81,10 +81,15 @@ describe("restricted active-bound resolver", () => {
 		assert.doesNotMatch(JSON.stringify(withEnvironment.contract), /private\/root/);
 		assert.notEqual(withEnvironment.contract.launchInputsDigest, first.contract.launchInputsDigest);
 		assert.notEqual(withEnvironment.contract.digest, first.contract.digest);
+		const withArtifacts = resolveActiveBoundLaunchContract(input(alias, request(alias, { artifacts: true, artifactDir: "session" })));
+		assert.equal(withArtifacts.ok, true); if (!withArtifacts.ok) return;
+		assert.equal(withArtifacts.contract.policy.artifacts, true); assert.equal(withArtifacts.contract.policy.artifactDir, "session"); assert.match(withArtifacts.contract.roots.artifactRootDigest ?? "", /^[0-9a-f]{64}$/);
+		assert.notEqual(withArtifacts.contract.launchInputsDigest, first.contract.launchInputsDigest); assert.equal(fs.existsSync(path.join(root, "child-sessions")), false);
 	});
 
 	it("fails exact model, cwd, session and deterministic-root restrictions closed", () => {
 		const cwd = path.join(root, "repo"); setup(cwd);
+		assert.deepEqual(resolveActiveBoundLaunchContract(input(cwd, { ...request(cwd), artifacts: true } as ActiveBoundPreflightRequestV1)), { ok: false, code: "unsupported_mode" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), sourceIdentityDigest: "" }), { ok: false, code: "unverified_source" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), serverInstanceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), { ok: false, code: "unverified_source" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), availableModels: [{ provider: "test", id: "other", fullId: "test/other" }] }), { ok: false, code: "unavailable_model" });

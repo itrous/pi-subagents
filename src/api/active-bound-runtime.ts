@@ -91,7 +91,7 @@ export function activeBoundRequestFromDelegation(
 		cwd: string; model: string; thinking: ActiveBoundPreflightRequestV1["thinking"]; timeoutMs?: number;
 		turnBudget?: ActiveBoundPreflightRequestV1["turnBudget"]; toolBudget?: ActiveBoundPreflightRequestV1["toolBudget"];
 		skill?: ActiveBoundPreflightRequestV1["skill"]; environment?: ActiveBoundPreflightRequestV1["environment"];
-		artifacts: false; result: ActiveBoundPreflightRequestV1["result"];
+		artifacts: boolean; artifactDir?: "session"; result: ActiveBoundPreflightRequestV1["result"];
 	},
 	binding: ActiveBoundBindingV1,
 ): ActiveBoundPreflightRequestV1 {
@@ -113,7 +113,8 @@ export function activeBoundRequestFromDelegation(
 		...(request.toolBudget !== undefined ? { toolBudget: request.toolBudget } : {}),
 		...(request.skill !== undefined ? { skill: request.skill } : {}),
 		...(request.environment && Object.keys(request.environment).length ? { environment: Object.assign(Object.create(null), request.environment) as ActiveBoundPreflightRequestV1["environment"] } : {}),
-		artifacts: false,
+		artifacts: request.artifacts,
+		...(request.artifactDir ? { artifactDir: request.artifactDir } : {}),
 		result: request.result,
 	};
 }

@@ -77,8 +77,8 @@ export interface ActiveBoundLaunchContractV1 {
 	skills: Array<{ name: string; source: string; contentDigest: string }>;
 	environment: ActiveBoundEnvironmentProjectionV1;
 	tools: { effectiveAllowlist: string[]; requiredChildTools: string[]; disableAmbientExtensions: boolean; capabilityCeiling?: ResolvedSubagentCapabilityCeiling };
-	roots: { baseRootPathDigest: string; baseRootIdentityDigest?: string; sessionRootDigest: string; sessionDirDigest: string; sessionFileDigest: string };
-	policy: { foregroundOnly: true; async: false; clarify: false; share: false; acceptance: false; mission: false; output: false; outputMode: "inline"; artifacts: false; watchdog: false; control: false; intercom: false; usageBudget: false; waitToolEnabled: boolean; parentDepth: number; maxSubagentDepth?: number; permissionsDigest?: string; modelScopeDigest: string };
+	roots: { baseRootPathDigest: string; baseRootIdentityDigest?: string; sessionRootDigest: string; sessionDirDigest: string; sessionFileDigest: string; artifactRootDigest?: string };
+	policy: { foregroundOnly: true; async: false; clarify: false; share: false; acceptance: false; mission: false; output: false; outputMode: "inline"; artifacts: boolean; artifactDir?: "session"; watchdog: false; control: false; intercom: false; usageBudget: false; waitToolEnabled: boolean; parentDepth: number; maxSubagentDepth?: number; permissionsDigest?: string; modelScopeDigest: string };
 	result: ActiveBoundPreflightRequestV1["result"];
 	timeoutMs?: number;
 	turnBudget?: ActiveBoundPreflightRequestV1["turnBudget"];
@@ -145,7 +145,7 @@ function forbiddenAgentMode(agent: AgentConfig): boolean {
 	return agent.source !== "project" || agent.runner?.type === "external-cli" || Boolean(agent.fallbackModels?.length)
 		|| !Array.isArray(agent.tools) || Boolean(agent.extensions?.length) || Boolean(agent.subagentOnlyExtensions?.length)
 		|| Boolean(agent.skillPath?.length) || agent.inheritProjectContext || agent.inheritSkills || Boolean(agent.memory)
-		|| Boolean(agent.defaultReads?.length) || agent.defaultAsync === true || agent.defaultAcceptance !== undefined
+		|| Boolean(agent.defaultReads?.length) || agent.defaultAsync === true || agent.defaultAcceptance !== undefined || agent.output !== undefined
 		|| Boolean(agent.tools.some((tool) => tool === "subagent" || tool.startsWith("mcp:") || tool.includes("/") || /\.(?:ts|js)$/u.test(tool)))
 		|| Boolean(agent.mcpDirectTools?.length);
 }
@@ -157,7 +157,9 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const requestCwd = canonicalDirectory(input.request.cwd);
 	const activeCwd = canonicalDirectory(input.activeCwd);
 	if (!requestCwd || !activeCwd || requestCwd !== activeCwd) return failure("invalid_cwd");
-	if (input.request.context !== "fresh" || input.request.artifacts !== false) return failure("unsupported_mode");
+	if (input.request.context !== "fresh"
+		|| ((input.request.artifacts !== false || input.request.artifactDir !== undefined)
+			&& (input.request.artifacts !== true || input.request.artifactDir !== "session"))) return failure("unsupported_mode");
 	let parentSessionFile: string | null | undefined;
 	let piSessionId: string | null | undefined;
 	let currentSessionId: string;
@@ -210,6 +212,12 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	catch (error) {
 		const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
 		if (code !== "ENOENT") return failure("host_required");
+	}
+	const artifactRoot = input.request.artifacts ? canonicalFutureDirectory(path.join(sessionRoot, "artifacts")) : undefined;
+	if (input.request.artifacts && (!artifactRoot || artifactRoot !== path.join(sessionRoot, "artifacts"))) return failure("host_required");
+	if (artifactRoot) {
+		try { fs.lstatSync(artifactRoot); return failure("host_required"); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return failure("host_required"); }
 	}
 	let discovered: ReturnType<typeof discoverAgents>;
 	try { discovered = (input.discover ?? discoverProjectAgentsRestricted)(requestCwd, "project"); }
@@ -294,7 +302,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		definitionDigest, task: input.request.task,
 		modelCandidates: [materializedModel], thinking: input.request.thinking, systemPrompt,
 		systemPromptMode: agent.systemPromptMode, inheritProjectContext: agent.inheritProjectContext, inheritSkills: agent.inheritSkills,
-		skills: skillNames, environment, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: agent.subagentOnlyExtensions ?? [], mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
+		skills: skillNames, environment, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: agent.subagentOnlyExtensions ?? [], mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
 		outputMode: "inline" as const, ...(input.request.result.kind === "structured" ? { structuredOutputSchema: input.request.result.schema } : {}),
 	};
 	const base: Omit<ActiveBoundLaunchContractV1, "digest"> = {
@@ -309,12 +317,13 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 			baseRootPathDigest: canonicalSha256(baseRoot),
 			...(baseRootIdentityDigest ? { baseRootIdentityDigest } : {}),
 			sessionRootDigest: canonicalSha256(sessionRoot),
+			...(artifactRoot ? { artifactRootDigest: canonicalSha256(artifactRoot) } : {}),
 			sessionDirDigest: canonicalSha256(sessionDir),
 			sessionFileDigest: canonicalSha256(sessionFile),
 		},
 		policy: {
 			foregroundOnly: true, async: false, clarify: false, share: false, acceptance: false, mission: false,
-			output: false, outputMode: "inline", artifacts: false, watchdog: false, control: false, intercom: false, usageBudget: false,
+			output: false, outputMode: "inline", artifacts: input.request.artifacts, ...(input.request.artifactDir ? { artifactDir: input.request.artifactDir } : {}), watchdog: false, control: false, intercom: false, usageBudget: false,
 			waitToolEnabled: input.runtimePolicy.waitToolEnabled,
 			parentDepth,
 			maxSubagentDepth: effectiveMaxSubagentDepth,
@@ -381,6 +390,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" || input.ownedSessionDirIdentity) return failure("host_required"); }
 		try { fs.lstatSync(path.join(rawSessionRoot, "run-0", "session.jsonl")); return failure("host_required"); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return failure("host_required"); }
+		if (artifactRoot) { try { fs.lstatSync(artifactRoot); return failure("host_required"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return failure("host_required"); } }
 	} catch { return failure("unsupported_mode"); }
 	return { ok: true, contract: { ...base, digest }, requestDigest, launchContractDigest: digest, activeSessionDigest, canonicalCwd: requestCwd };
 }

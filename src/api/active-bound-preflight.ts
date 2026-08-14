@@ -14,7 +14,7 @@ export const ACTIVE_BOUND_PREFLIGHT_VERSION = 1 as const;
 const RFC4122_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MODEL = /^[^\s/:]+\/[^\s:]+$/u;
 const THINKING = new Set<SubagentDelegationThinking>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const FIELDS = new Set(["version", "targetServerInstanceId", "requestId", "ownerRunId", "nodeId", "prospectiveRunId", "agent", "task", "cwd", "context", "model", "thinking", "timeoutMs", "turnBudget", "toolBudget", "skill", "artifacts", "environment", "result"]);
+const FIELDS = new Set(["version", "targetServerInstanceId", "requestId", "ownerRunId", "nodeId", "prospectiveRunId", "agent", "task", "cwd", "context", "model", "thinking", "timeoutMs", "turnBudget", "toolBudget", "skill", "artifacts", "artifactDir", "environment", "result"]);
 const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_REQUEST_CLONE_BYTES = 8 * 1024 * 1024;
 const MAX_TASK_BYTES = 1024 * 1024;
@@ -39,7 +39,8 @@ export interface ActiveBoundPreflightRequestV1 {
 	toolBudget?: SubagentDelegationToolBudget;
 	skill?: string | string[] | false;
 	environment?: ActiveBoundEnvironmentV1;
-	artifacts: false;
+	artifacts: boolean;
+	artifactDir?: "session";
 	result: { kind: "text" } | { kind: "structured"; schema: SubagentDelegationJsonSchemaObject };
 }
 
@@ -157,7 +158,8 @@ export function parseActiveBoundPreflightRequest(input: unknown): ActiveBoundPre
 	if (typeof value.prospectiveRunId !== "string" || !RFC4122_UUID.test(value.prospectiveRunId)) return fail();
 	if (!text(value.agent) || !content(value.task, MAX_TASK_BYTES) || !text(value.cwd, MAX_CWD_BYTES)) return fail();
 	if (value.context !== "fresh" || !text(value.model) || !MODEL.test(value.model)) return fail();
-	if (typeof value.thinking !== "string" || !THINKING.has(value.thinking as SubagentDelegationThinking) || value.artifacts !== false) return fail();
+	if (typeof value.thinking !== "string" || !THINKING.has(value.thinking as SubagentDelegationThinking)) return fail();
+	if ((value.artifacts !== false || value.artifactDir !== undefined) && (value.artifacts !== true || value.artifactDir !== "session")) return fail();
 	if (value.timeoutMs !== undefined && (!Number.isSafeInteger(value.timeoutMs) || (value.timeoutMs as number) < 1 || (value.timeoutMs as number) > 2_147_483_647)) return fail();
 	const turnBudget = parseTurnBudget(value.turnBudget);
 	const toolBudget = parseToolBudget(value.toolBudget);
@@ -189,7 +191,7 @@ export function parseActiveBoundPreflightRequest(input: unknown): ActiveBoundPre
 		...(value.timeoutMs !== undefined ? { timeoutMs: value.timeoutMs as number } : {}),
 		...(turnBudget ? { turnBudget } : {}), ...(toolBudget ? { toolBudget } : {}), ...(skill !== undefined ? { skill } : {}),
 		...(Object.keys(parsedEnvironment.environment).length ? { environment: parsedEnvironment.environment } : {}),
-		artifacts: false, result,
+		artifacts: value.artifacts as boolean, ...(value.artifactDir === "session" ? { artifactDir: "session" as const } : {}), result,
 	}) };
 }
 
@@ -205,7 +207,7 @@ export function projectActiveBoundPreflightRequest(request: ActiveBoundPreflight
 		...(request.toolBudget !== undefined ? { toolBudget: request.toolBudget } : {}),
 		...(request.skill !== undefined ? { skill: request.skill } : {}),
 		...(request.environment && Object.keys(request.environment).length ? { environment: request.environment } : {}),
-		artifacts: false, result: request.result,
+		artifacts: request.artifacts, ...(request.artifactDir ? { artifactDir: request.artifactDir } : {}), result: request.result,
 	};
 }
 

@@ -17,6 +17,7 @@ class MockStream implements JsonlWriteStream {
 	writes: string[] = [];
 	ended = false;
 	private drainHandler?: () => void;
+	private errorHandler?: () => void;
 	private readonly writeResults: boolean[];
 	constructor(writeResults: boolean[] = []) {
 		this.writeResults = writeResults;
@@ -26,6 +27,7 @@ class MockStream implements JsonlWriteStream {
 		if (this.writeResults.length === 0) return true;
 		return this.writeResults.shift() ?? true;
 	}
+	on(event: "error", listener: () => void): JsonlWriteStream { if (event === "error") this.errorHandler = listener; return this; }
 	once(event: "drain", listener: () => void): JsonlWriteStream {
 		if (event === "drain") this.drainHandler = listener;
 		return this;
@@ -37,6 +39,7 @@ class MockStream implements JsonlWriteStream {
 	emitDrain(): void {
 		this.drainHandler?.();
 	}
+	emitError(): void { this.errorHandler?.(); }
 }
 
 describe("createJsonlWriter", () => {
@@ -64,6 +67,20 @@ describe("createJsonlWriter", () => {
 		assert.equal(source.resumed, 1);
 		writer.writeLine('{"type":"b"}');
 		assert.deepEqual(stream.writes, ['{"type":"a"}\n', '{"type":"b"}\n']);
+	});
+
+	it("turns asynchronous stream errors into silent best-effort closure", async () => {
+		const source = new MockSource(); const stream = new MockStream([false]);
+		const writer = createJsonlWriter("/tmp/out.jsonl", source, { createWriteStream: () => stream });
+		writer.writeLine("first"); assert.equal(source.paused, 1); stream.emitError(); assert.equal(source.resumed, 1);
+		writer.writeLine("ignored"); assert.deepEqual(stream.writes, ["first\n"]); await writer.close();
+	});
+
+	it("settles close when the stream errors during end", async () => {
+		const source = new MockSource(); const stream = new MockStream();
+		stream.end = () => stream.emitError();
+		const writer = createJsonlWriter("/tmp/out.jsonl", source, { createWriteStream: () => stream });
+		await writer.close();
 	});
 
 	it("closes stream once", async () => {

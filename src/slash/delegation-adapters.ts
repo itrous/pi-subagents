@@ -98,6 +98,7 @@ export interface PromptTemplateBridgeResult {
 			skillsWarning?: string;
 			outputSaveError?: string;
 			transcriptError?: string;
+			artifactInitializationFailed?: boolean;
 		}>;
 		progress?: Array<{
 			index?: number;
@@ -342,8 +343,9 @@ function resolveSubagentDelegationStatus(
 	result: PromptTemplateBridgeResult,
 	aborted: boolean,
 ): SubagentDelegationStatus {
-	if (aborted) return "cancelled";
 	const child = result.details?.results?.[0];
+	if (child?.artifactInitializationFailed) return "failed";
+	if (aborted) return "cancelled";
 	if (!child) return "failed";
 	if (result.details?.timedOut || child.timedOut) return "timed_out";
 	if (child?.structuredOutputFailed) return "structured_output_failed";

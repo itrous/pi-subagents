@@ -124,6 +124,8 @@ describe("public subagent delegation contract", () => {
 		const parsed = parseSubagentDelegationRequest({ ...request, artifacts: false, environment: { ONECPI_REVIEW_SUBJECT_PATH: "/subject", ONECPI_REVIEW_ROOT: "/root" }, binding: boundBinding });
 		assert.equal(parsed.ok, true, parsed.ok ? undefined : parsed.error);
 		if (parsed.ok) { assert.deepEqual({ ...parsed.request.environment }, { ONECPI_REVIEW_ROOT: "/root", ONECPI_REVIEW_SUBJECT_PATH: "/subject" }); assert.equal(Object.getPrototypeOf(parsed.request.environment!), null); }
+		const sessionArtifacts = parseSubagentDelegationRequest({ ...request, artifacts: true, artifactDir: "session", binding: boundBinding }); assert.equal(sessionArtifacts.ok, true, sessionArtifacts.ok ? undefined : sessionArtifacts.error);
+		assert.equal(parseSubagentDelegationRequest({ ...request, artifactDir: "session" }).ok, false);
 	});
 
 	it("accepts exact zero tool budgets for structured delegated leaves", () => {

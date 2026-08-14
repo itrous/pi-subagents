@@ -290,6 +290,7 @@ async function runSingleAttempt(
 		jsonlPath?: string;
 		artifactPaths?: ArtifactPaths;
 		transcriptWriter?: ChildTranscriptWriter;
+		activateDeferredArtifacts?: () => ChildTranscriptWriter | undefined;
 		attemptNotes: string[];
 		outputSnapshot?: SingleOutputSnapshot;
 		originalTask?: string;
@@ -377,6 +378,7 @@ async function runSingleAttempt(
 		inheritSkills: agent.inheritSkills,
 		skills: shared.resolvedSkillNames ?? [],
 		...(options.activeBoundEnvironment !== undefined ? { environment: projectActiveBoundEnvironment(options.activeBoundEnvironment) } : {}),
+		...(options.activeBoundEnvironment !== undefined ? { artifactPolicy: options.deferArtifactsUntilSpawn ? { enabled: true, dir: "session", root: options.artifactsDir, includeInput: options.artifactConfig?.includeInput !== false, includeOutput: options.artifactConfig?.includeOutput !== false, includeJsonl: options.artifactConfig?.includeJsonl !== false, includeTranscript: options.artifactConfig?.includeTranscript !== false, includeMetadata: options.artifactConfig?.includeMetadata !== false } : { enabled: false } } : {}),
 		tools: toolPlan.effectiveToolAllowlist,
 		extensions: toolPlan.extensionArgs,
 		subagentOnlyExtensions: options.activeBoundProjectSkills ? agent.subagentOnlyExtensions ?? [] : undefined,
@@ -399,7 +401,7 @@ async function runSingleAttempt(
 		usage: emptyUsage(),
 		model: modelArg,
 		...(resolvedThinking ? { thinking: resolvedThinking } : {}),
-		artifactPaths: shared.artifactPaths,
+		artifactPaths: shared.activateDeferredArtifacts ? undefined : shared.artifactPaths,
 		transcriptPath: shared.transcriptWriter ? shared.artifactPaths?.transcriptPath : undefined,
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
@@ -479,6 +481,8 @@ async function runSingleAttempt(
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
 
+	let artifactActivationFailed = false;
+	let artifactActivationPending = Boolean(shared.activateDeferredArtifacts);
 	const exitCode = await new Promise<number>((resolve, reject) => {
 		const spawnSpec = getPiSpawnCommand(args);
 		try { options.beforeSpawn?.(launchContractDigest); } catch (error) { cleanupTempDir(tempDir); reject(error); return; }
@@ -502,9 +506,29 @@ async function runSingleAttempt(
 			reject(error);
 			return;
 		}
-		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
+		let jsonlWriter = createJsonlWriter(shared.activateDeferredArtifacts ? undefined : shared.jsonlPath, proc.stdout);
 		let spawnObserved = false;
-		proc.once("spawn", () => { if (!spawnObserved) { spawnObserved = true; options.onSpawn?.(); } });
+		proc.once("spawn", () => {
+			if (spawnObserved) return;
+			spawnObserved = true;
+			options.onSpawn?.();
+			if (!shared.activateDeferredArtifacts) return;
+			try {
+				shared.transcriptWriter = shared.activateDeferredArtifacts();
+				shared.jsonlPath = shared.artifactPaths?.jsonlPath;
+				result.artifactPaths = shared.artifactPaths;
+				result.transcriptPath = shared.transcriptWriter ? shared.artifactPaths?.transcriptPath : undefined;
+				artifactActivationPending = false;
+				jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
+			} catch (error) {
+				artifactActivationPending = false;
+				artifactActivationFailed = true;
+				const message = "Bound artifact initialization failed.";
+				result.error = message; result.finalOutput = message; result.artifactInitializationFailed = true; progress.error = message; progress.status = "failed";
+				trySignalChild(proc, "SIGTERM");
+				setTimeout(() => { if (!processClosed) trySignalChild(proc, "SIGKILL"); }, 3000).unref?.();
+			}
+		});
 		let processClosed = false;
 		let lifecycleFinished = false;
 		let detached = false;
@@ -546,7 +570,7 @@ async function runSingleAttempt(
 		};
 
 		const detachForeground = (reason: string): boolean => {
-			if (detached || processClosed || lifecycleFinished || options.signal?.aborted) return false;
+			if (artifactActivationFailed || detached || processClosed || lifecycleFinished || options.signal?.aborted) return false;
 			const receiptProgress = snapshotProgress(progress);
 			receiptProgress.status = "detached";
 			receiptProgress.durationMs = Date.now() - startTime;
@@ -768,7 +792,7 @@ async function runSingleAttempt(
 		};
 		const requestTurnBudgetAbort = (turnCount: number) => {
 			const budget = options.turnBudget;
-			if (!budget || result.timedOut || result.turnBudgetExceeded || interruptedByControl || processClosed || lifecycleFinished) return;
+			if (!budget || artifactActivationFailed || result.timedOut || result.turnBudgetExceeded || interruptedByControl || processClosed || lifecycleFinished) return;
 			const message = turnBudgetExceededMessage(budget, turnCount);
 			result.turnBudgetExceeded = true;
 			result.wrapUpRequested = true;
@@ -840,7 +864,7 @@ async function runSingleAttempt(
 
 
 		const emitUpdateSnapshot = (text: string) => {
-			if (!options.onUpdate || processClosed) return;
+			if (!options.onUpdate || processClosed || artifactActivationPending || artifactActivationFailed) return;
 			const progressSnapshot = snapshotProgress(progress);
 			const resultSnapshot = snapshotStreamResult(result, progressSnapshot);
 			const controlEvents = drainPendingControlEvents();
@@ -856,7 +880,7 @@ async function runSingleAttempt(
 		};
 
 		const fireUpdate = () => {
-			if (!options.onUpdate || processClosed) return;
+			if (!options.onUpdate || processClosed || artifactActivationPending || artifactActivationFailed) return;
 			progress.durationMs = Date.now() - startTime;
 			const output = (result.timedOut || result.turnBudgetExceeded) && result.finalOutput ? result.finalOutput : getFinalOutput(result.messages ?? []);
 			emitUpdateSnapshot(output || "(running...)");
@@ -864,7 +888,7 @@ async function runSingleAttempt(
 
 		const rawStdoutTail = createBoundedByteTail();
 		const processLine = (line: string) => {
-			if (!line.trim()) return;
+			if (artifactActivationPending || artifactActivationFailed || !line.trim()) return;
 			jsonlWriter.writeLine(line);
 			let evt: { type?: string; message?: Message; toolName?: string; args?: unknown; willRetry?: unknown };
 			try {
@@ -1039,7 +1063,7 @@ async function runSingleAttempt(
 		const activeAttemptTimeout = attemptTimeout;
 		if (activeAttemptTimeout) {
 			timeoutTimer = setTimeout(() => {
-				if (processClosed || lifecycleFinished || interruptedByControl) return;
+				if (processClosed || lifecycleFinished || interruptedByControl || artifactActivationFailed) return;
 				result.timedOut = true;
 				result.error = activeAttemptTimeout.message;
 				result.finalOutput = activeAttemptTimeout.message;
@@ -1064,7 +1088,7 @@ async function runSingleAttempt(
 
 		const stderrTail = createBoundedByteTail();
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
-			if (result.protocolError) return;
+			if (artifactActivationFailed || result.protocolError) return;
 			result.protocolError = limit;
 			result.error = formatProtocolOutputLimit(limit);
 			progress.status = "failed";
@@ -1101,19 +1125,20 @@ async function runSingleAttempt(
 			childExited = true;
 			clearFinalDrainTimers();
 		});
-		proc.on("close", (code, signal) => {
+		proc.on("close", async (code, signal) => {
 			if (lifecycleFinished) return;
 			processClosed = true;
 			clearFinalDrainTimers();
 			clearStdioGuard();
-			void jsonlWriter.close().catch(() => {
+			stdoutReader.end();
+			stderrReader.end();
+			const closeJsonl = jsonlWriter.close().catch(() => {
 				// JSONL artifact flush is best effort.
 			});
+			if (shared.activateDeferredArtifacts) await closeJsonl;
 			const toolDiagnosticError = readChildToolDiagnosticError(toolDiagnosticPath);
 			result.runtimeAcknowledgedExtensions = readRuntimeAcknowledgedExtensions(runtimeAcknowledgedExtensionsPath);
 			cleanupTempDir(tempDir);
-			stdoutReader.end();
-			stderrReader.end();
 			const stderr = stderrTail.text();
 			const rawStdout = rawStdoutTail.text();
 			let closeError = result.error ?? toolDiagnosticError ?? assistantError;
@@ -1171,7 +1196,7 @@ async function runSingleAttempt(
 
 		if (options.interruptSignal) {
 			const interrupt = () => {
-				if (processClosed || lifecycleFinished) return;
+				if (processClosed || lifecycleFinished || artifactActivationFailed) return;
 				if (result.timedOut) return;
 				interruptedByControl = true;
 				clearTimeoutTimers();
@@ -1205,7 +1230,7 @@ async function runSingleAttempt(
 		}
 	});
 	result.exitCode = exitCode;
-	if (interruptedByControl) {
+	if (interruptedByControl && !artifactActivationFailed) {
 		result.exitCode = 0;
 		result.interrupted = true;
 		result.error = undefined;
@@ -1354,7 +1379,7 @@ async function runSingleAttempt(
 		? result.outputReference.message
 		: fullOutput;
 	result.controlEvents = allControlEvents.length ? allControlEvents : undefined;
-	if (options.onUpdate) {
+	if (options.onUpdate && !artifactActivationPending && !artifactActivationFailed) {
 		const finalText = result.finalOutput || result.error || "(no output)";
 		const progressSnapshot = snapshotProgress(progress);
 		const resultSnapshot = snapshotStreamResult(result, progressSnapshot);
@@ -1506,18 +1531,22 @@ async function runSyncCompletion(
 	let artifactPathsResult: ArtifactPaths | undefined;
 	let jsonlPath: string | undefined;
 	let transcriptWriter: ChildTranscriptWriter | undefined;
+	let activateDeferredArtifacts: (() => ChildTranscriptWriter | undefined) | undefined;
+	let deferredArtifactsActivated = false;
 	if (options.artifactsDir && options.artifactConfig?.enabled !== false) {
-		artifactPathsResult = getArtifactPaths(options.artifactsDir, options.runId, agentName, options.index);
-		ensureArtifactsDir(options.artifactsDir);
+		const artifactPaths = getArtifactPaths(options.artifactsDir, options.runId, agentName, options.index);
+		artifactPathsResult = artifactPaths;
+		const activate = () => {
+			ensureArtifactsDir(options.artifactsDir!);
 		if (options.artifactConfig?.includeInput !== false) {
-				writeArtifact(artifactPathsResult.inputPath, `# Task for ${agentName}\n\n${taskWithAcceptance}`);
+				writeArtifact(artifactPaths.inputPath, `# Task for ${agentName}\n\n${taskWithAcceptance}`);
 		}
 		if (options.artifactConfig?.includeJsonl !== false) {
-			jsonlPath = artifactPathsResult.jsonlPath;
+			jsonlPath = artifactPaths.jsonlPath;
 		}
 		if (options.artifactConfig?.includeTranscript !== false) {
 			transcriptWriter = createChildTranscriptWriter({
-				transcriptPath: artifactPathsResult.transcriptPath,
+				transcriptPath: artifactPaths.transcriptPath,
 				source: "foreground",
 				runId: options.runId,
 				agent: agentName,
@@ -1526,12 +1555,17 @@ async function runSyncCompletion(
 			});
 			transcriptWriter.writeInitialUserMessage(taskWithAcceptance);
 		}
+			deferredArtifactsActivated = true;
+			return transcriptWriter;
+		};
+		if (options.deferArtifactsUntilSpawn) activateDeferredArtifacts = activate;
+		else activate();
 	}
 
 	const persistResultMetadata = (target: SingleResult): void => {
 		persistSingleResultMetadata({
 			metadataPath: artifactPathsResult?.metadataPath,
-			enabled: options.artifactConfig?.enabled !== false && options.artifactConfig?.includeMetadata !== false,
+			enabled: options.artifactConfig?.enabled !== false && options.artifactConfig?.includeMetadata !== false && (!options.deferArtifactsUntilSpawn || deferredArtifactsActivated),
 			runId: options.runId,
 			agent: agentName,
 			task,
@@ -1572,6 +1606,7 @@ async function runSyncCompletion(
 				jsonlPath,
 				artifactPaths: artifactPathsResult,
 				transcriptWriter,
+				activateDeferredArtifacts,
 				attemptNotes,
 				modelCandidates: candidates
 					.map((modelCandidate) => applyThinkingSuffix(modelCandidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
@@ -1692,7 +1727,7 @@ async function runSyncCompletion(
 	if (transcriptWriter?.getError()) result.transcriptError = transcriptWriter.getError();
 
 	try {
-		if (artifactPathsResult && options.artifactConfig?.enabled !== false) {
+		if (artifactPathsResult && options.artifactConfig?.enabled !== false && (!options.deferArtifactsUntilSpawn || deferredArtifactsActivated)) {
 			result.artifactPaths = artifactPathsResult;
 			if (options.artifactConfig?.includeOutput !== false) {
 				writeArtifact(artifactPathsResult.outputPath, formatOutputArtifactContent({

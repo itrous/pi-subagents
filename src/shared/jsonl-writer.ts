@@ -8,6 +8,7 @@ export interface DrainableSource {
 export interface JsonlWriteStream {
 	write(chunk: string): boolean;
 	once(event: "drain", listener: () => void): JsonlWriteStream;
+	on?(event: "error", listener: () => void): JsonlWriteStream;
 	end(callback?: () => void): void;
 }
 
@@ -48,6 +49,13 @@ export function createJsonlWriter(
 
 	let backpressured = false;
 	let closed = false;
+	let closeResolve: (() => void) | undefined;
+	stream.on?.("error", () => {
+		closed = true;
+		stream = undefined;
+		if (backpressured) { backpressured = false; source.resume(); }
+		closeResolve?.(); closeResolve = undefined;
+	});
 	let bytesWritten = 0;
 	const maxBytes = deps.maxBytes ?? DEFAULT_MAX_JSONL_BYTES;
 
@@ -75,7 +83,7 @@ export function createJsonlWriter(
 			closed = true;
 			const current = stream;
 			stream = undefined;
-			await new Promise<void>((resolve) => current.end(() => resolve()));
+			await new Promise<void>((resolve) => { closeResolve = resolve; current.end(() => { closeResolve = undefined; resolve(); }); });
 		},
 	};
 }

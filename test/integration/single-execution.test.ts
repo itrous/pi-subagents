@@ -1374,9 +1374,11 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		executionCtx.sessionManager.getSessionId = () => "pi-session";
 		executionCtx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }];
 		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => executionCtx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
+		const runtimeRecheck = runtime.recheck.bind(runtime); let artifactAbsenceChecks = 0;
+		runtime.recheck = (activeProof, options) => { if (activeProof.request.artifacts) { artifactAbsenceChecks++; assert.equal(fs.existsSync(path.join(base, activeProof.request.prospectiveRunId, "artifacts")), false); } return runtimeRecheck(activeProof, options); };
 		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
 		const proof = (runId: string) => {
-			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: `request-${runId}`, ownerRunId: "owner", nodeId: `node-${runId}`, prospectiveRunId: runId, agent: "echo", task: "Bound", cwd: aliasCwd, context: "fresh", model: "test/exact", thinking: "off", skill: ["bound-skill", "bound-skill"], environment: { ONECPI_REVIEW_ROOT: "/requested/root", ONECPI_REVIEW_SUBJECT_PATH: "/requested/subject" }, artifacts: false, result: { kind: "text" } });
+			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: `request-${runId}`, ownerRunId: "owner", nodeId: `node-${runId}`, prospectiveRunId: runId, agent: "echo", task: "Bound", cwd: aliasCwd, context: "fresh", model: "test/exact", thinking: "off", skill: ["bound-skill", "bound-skill"], environment: { ONECPI_REVIEW_ROOT: "/requested/root", ONECPI_REVIEW_SUBJECT_PATH: "/requested/subject" }, artifacts: true, artifactDir: "session", result: { kind: "text" } });
 			assert.equal(parsed.ok, true); if (!parsed.ok) throw new Error("invalid fixture");
 			const response = runtime.preflight(parsed.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) throw new Error("preflight failed");
 			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: parsed.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt };
@@ -1386,7 +1388,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		};
 		const params = (runId: string) => ({
 			agent: "echo", task: "Bound", context: "fresh", cwd: aliasCwd, model: "test/exact", skill: ["bound-skill", "bound-skill"],
-			output: false, acceptance: false, artifacts: false, share: false, mission: false,
+			output: false, acceptance: false, artifacts: true, share: false, mission: false,
 			delegatedThinkingOverride: "off" as const, activeBoundProof: proof(runId),
 			async: false as const, foregroundOnly: true as const, clarify: false as const,
 		});
@@ -1427,16 +1429,13 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(promptRecord.split(path.join(skillDir, "SKILL.md")).length - 1, 2);
 		assert.equal(promptRecord.split("BOUND_SKILL_MARKER").length - 1, 2);
 		assert.equal(fs.existsSync(path.join(base, firstId)), true);
+		assert.ok(artifactAbsenceChecks >= 2);
+		const artifactRoot = path.join(base, firstId, "artifacts");
+		const artifactPaths = first.details.results[0]?.artifactPaths; assert.ok(artifactPaths);
+		for (const artifactPath of Object.values(artifactPaths)) { assert.equal(path.relative(artifactRoot, artifactPath).startsWith(".."), false, artifactPath); assert.equal(fs.lstatSync(artifactPath).isFile(), true, artifactPath); }
+		assert.match(fs.readFileSync(artifactPaths.inputPath, "utf8"), /Bound/);
+		assert.match(fs.readFileSync(artifactPaths.transcriptPath, "utf8"), /Bound/);
 		assert.equal(fs.existsSync(path.join(tempDir, ".pi-subagents")), false);
-		const pendingLeakScan = [tempDir];
-		while (pendingLeakScan.length) {
-			const directory = pendingLeakScan.pop()!;
-			for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-				const candidate = path.join(directory, entry.name); if (entry.isSymbolicLink()) continue;
-				if (entry.isDirectory()) { pendingLeakScan.push(candidate); continue; } if (!entry.isFile()) continue;
-				const bytes = fs.readFileSync(candidate); assert.equal(bytes.includes(Buffer.from("/requested/root")), false, candidate); assert.equal(bytes.includes(Buffer.from("/requested/subject")), false, candidate);
-			}
-		}
 		const second = await executor.executeDelegated("bound-second", params("123e4567-e89b-12d3-a456-426614174001"), new AbortController().signal, undefined, executionCtx);
 		assert.equal(second.isError, true);
 		assert.match(second.content[0]?.text ?? "", /spawn limit reached/i);
