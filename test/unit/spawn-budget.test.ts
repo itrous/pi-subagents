@@ -6,6 +6,8 @@ import {
 	grantSpawnBudget,
 	preflightSpawnBudget,
 	reserveSpawnBudget,
+	reserveTransactionalSpawnBudget,
+	rollbackSpawnBudget,
 } from "../../src/runs/shared/spawn-budget.ts";
 import type { ExtensionConfig, SubagentState } from "../../src/shared/types.ts";
 
@@ -59,6 +61,52 @@ describe("spawn budget", () => {
 		const rejected = reserveSpawnBudget(state, capped, "session-a", 2);
 		assert.match(rejected.error ?? "", /3\/4 used, 2 requested\).*1 remaining/);
 		assert.equal(state.subagentSpawns?.count, 3);
+	});
+
+	it("rolls back an uncommitted bound reservation and preserves a spawn-committed one", () => {
+		const state = makeState();
+		assert.equal(reserveSpawnBudget(state, capped, "session-a", 1).snapshot.used, 1);
+		assert.equal(rollbackSpawnBudget(state, capped, "session-a", 1).used, 0);
+		const pending = reserveTransactionalSpawnBudget(state, capped, "session-a", 1).reservation!;
+		assert.equal(pending.rollback().used, 0);
+		const spawned = reserveTransactionalSpawnBudget(state, capped, "session-a", 1).reservation!;
+		spawned.commit();
+		assert.equal(spawned.rollback().used, 1);
+		assert.equal(spawned.committed(), true);
+	});
+
+	it("does not reset a replacement session when an older committed reservation settles", () => {
+		const state = {} as SubagentState; const config = { maxSubagentSpawnsPerSession: 1 };
+		const first = reserveTransactionalSpawnBudget(state, config, "session-a", 1).reservation!;
+		first.commit();
+		assert.equal(reserveSpawnBudget(state, config, "session-b", 1).error, undefined);
+		first.rollback();
+		assert.match(reserveSpawnBudget(state, config, "session-b", 1).error ?? "", /spawn limit reached/i);
+	});
+
+	it("does not roll an older tentative reservation into replacement-session counters", () => {
+		const state = {} as SubagentState; const config = { maxSubagentSpawnsPerSession: 1 };
+		const first = reserveTransactionalSpawnBudget(state, config, "session-a", 1).reservation!;
+		assert.equal(reserveSpawnBudget(state, config, "session-b", 1).error, undefined);
+		first.rollback();
+		assert.match(reserveSpawnBudget(state, config, "session-b", 1).error ?? "", /spawn limit reached/i);
+	});
+
+	it("does not roll back a replacement counter incarnation with the same session id", () => {
+		const state = {} as SubagentState; const config = { maxSubagentSpawnsPerSession: 1 };
+		const first = reserveTransactionalSpawnBudget(state, config, "session-a", 1).reservation!;
+		state.subagentSpawns = { ...state.subagentSpawns!, count: 1, grantHistory: [...(state.subagentSpawns?.grantHistory ?? [])] };
+		first.rollback();
+		assert.equal(state.subagentSpawns.count, 1);
+	});
+
+	it("keeps unlimited bound reservations pending until spawn without rolling back unrelated usage", () => {
+		const state = makeState();
+		state.subagentSpawns = { sessionId: "session-a", count: 3 };
+		const pending = reserveTransactionalSpawnBudget(state, {}, "session-a", 1).reservation!;
+		assert.equal(pending.committed(), false);
+		assert.equal(pending.rollback().used, 3);
+		assert.equal(state.subagentSpawns.count, 3);
 	});
 
 	it("grants at most the original configured limit and keeps bounded audit records", () => {

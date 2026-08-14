@@ -143,6 +143,28 @@ describe("subagent extension RPC bridge", () => {
 		bridge.dispose();
 	});
 
+	it("advertises and targets active-bound preflight without cross-instance replies", async () => {
+		const events = new FakeEvents();
+		let calls = 0;
+		const runtime = {
+			version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64),
+			preflight: () => { calls++; return { version: 1 as const, code: "invalid_request" as const }; },
+			admit: () => ({ ok: false as const, code: "invalid_request" as const }), recheck: () => false, dispose: () => {},
+		};
+		const sourceIdentity = { version: 1 as const, kind: "git" as const, repository: "https://github.com/itrous/pi-subagents.git" as const, commit: "0".repeat(40), digest: "a".repeat(64) };
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail(), serverInstanceId: runtime.serverInstanceId, sourceIdentityResolution: { available: true, sourceIdentity }, activeBoundRuntime: runtime });
+		bridge.prepare(); bridge.activate();
+		const ping = await request(events, "bound-ping", "ping") as any;
+		assert.deepEqual(ping.data.capabilities.boundForegroundLeaf, { version: 1 });
+		let foreignReplies = 0; events.on(subagentRpcReplyEvent("foreign"), () => { foreignReplies++; });
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "foreign", method: "preflight", params: { targetServerInstanceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(foreignReplies, 0); assert.equal(calls, 0);
+		const targeted = await request(events, "targeted", "preflight", { targetServerInstanceId: runtime.serverInstanceId }) as any;
+		assert.equal(targeted.success, true); assert.deepEqual(targeted.data, { version: 1, code: "invalid_request" }); assert.equal(calls, 1);
+		bridge.dispose();
+	});
+
 	it("publishes fresh identity copies and does not duplicate ping after a reply listener throws", () => {
 		const events = new FakeEvents();
 		const sourceIdentity = {

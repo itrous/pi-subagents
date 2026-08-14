@@ -11,6 +11,7 @@ import {
 	type PromptTemplateBridgeEvents,
 } from "../../src/slash/prompt-template-bridge.ts";
 import type { PromptTemplateBridgeResult } from "../../src/slash/delegation-adapters.ts";
+import { BOUND_IDENTITY_REGISTRY_GLOBAL_KEY, BoundIdentityRegistry, getBoundIdentityRegistry } from "../../src/slash/bound-identity-registry.ts";
 import { StructuredAttemptCoordinator } from "../../src/slash/structured-attempt-coordinator.ts";
 
 class FakeEvents implements PromptTemplateBridgeEvents {
@@ -53,6 +54,21 @@ function structuredRequest(overrides: Record<string, unknown> = {}): Record<stri
 		result: { kind: "text" },
 		...overrides,
 	};
+}
+
+function boundRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	const target = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+	const run = "123e4567-e89b-12d3-a456-426614174000";
+	return structuredRequest({
+		context: "fresh", model: "openai/gpt-5", thinking: "off", artifacts: false,
+		binding: {
+			version: 1, targetServerInstanceId: target, prospectiveRunId: run,
+			expectedSourceIdentityDigest: "a".repeat(64), expectedActiveSessionDigest: "b".repeat(64),
+			requestDigest: "c".repeat(64), expectedLaunchContractDigest: "d".repeat(64),
+			receipt: { version: 1, algorithm: "HMAC-SHA256", payload: { version: 1, serverInstanceId: target, sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: run, requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 30001 }, mac: "e".repeat(64) },
+		},
+		...overrides,
+	});
 }
 
 describe("prompt-template delegation bridge", () => {
@@ -145,6 +161,75 @@ describe("prompt-template delegation bridge", () => {
 		assert.deepEqual(response.result, { kind: "text", text: "ok" });
 		assert.equal(executeCalls, 1);
 
+		bridge.dispose();
+	});
+
+	it("commits a bound UUID before synchronous started and rejects a reentrant replay", async () => {
+		const events = new FakeEvents();
+		const globalStore = globalThis as Record<string, unknown>; const previousRegistry = globalStore[BOUND_IDENTITY_REGISTRY_GLOBAL_KEY]; delete globalStore[BOUND_IDENTITY_REGISTRY_GLOBAL_KEY];
+		const registry = getBoundIdentityRegistry();
+		let calls = 0; let admits = 0;
+		const proof = { version: 1, request: {}, contract: {}, launchContractDigest: "d".repeat(64) } as any;
+		const runtime = {
+			version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64),
+			preflight: () => ({ version: 1 as const, code: "invalid_request" as const }), admit: () => ++admits === 1 ? ({ ok: true as const, proof }) : ({ ok: false as const, code: "invalid_request" as const }), recheck: () => true, dispose: () => {},
+		};
+		const bridge = registerPromptTemplateDelegationBridge({
+			events, coordinator: new StructuredAttemptCoordinator(), activeBoundRuntime: runtime,
+			getContext: () => ({ cwd: "/repo" }), executeStructured: async (id, params) => {
+				calls++; assert.equal(id, "r1"); assert.equal((params as any).activeBoundProof, proof);
+				return { details: { results: [{ agent: "worker", exitCode: 0, finalOutput: "done" }] } };
+			}, execute: async () => assert.fail(),
+		});
+		bridge.activate(); bridge.activateTerminalSink();
+		const terminals: Array<{ requestId: string; status: string }> = [];
+		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, (value) => terminals.push(value as any));
+		let startedSynchronously = false;
+		events.on(PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT, () => {
+			startedSynchronously = true;
+			assert.equal(registry.has(runtime.serverInstanceId, "123e4567-e89b-12d3-a456-426614174000"), true);
+			assert.equal(registry.release(runtime.serverInstanceId, "123e4567-e89b-12d3-a456-426614174000"), false);
+			events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, boundRequest());
+		});
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, boundRequest());
+		assert.equal(startedSynchronously, true);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(calls, 1); assert.equal(admits, 1);
+		assert.equal(registry.release(runtime.serverInstanceId, "123e4567-e89b-12d3-a456-426614174000"), false);
+		assert.deepEqual(terminals.map((entry) => [entry.requestId, entry.status]).sort(), [["r1", "completed"], ["r1", "duplicate_node"]]);
+		bridge.dispose();
+		if (previousRegistry === undefined) delete globalStore[BOUND_IDENTITY_REGISTRY_GLOBAL_KEY]; else globalStore[BOUND_IDENTITY_REGISTRY_GLOBAL_KEY] = previousRegistry;
+	});
+
+	it("releases a tentative bound UUID when coordinator rejects the node", async () => {
+		const events = new FakeEvents(); const registry = new BoundIdentityRegistry(); const coordinator = new StructuredAttemptCoordinator();
+		const blocker = coordinator.admit({ requestId: "other", ownerRunId: "owner-1", nodeId: "node-1" }, "other-runtime"); assert.equal(blocker.accepted, true);
+		const runtime = { version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), preflight: () => ({ version: 1 as const, code: "invalid_request" as const }), admit: () => ({ ok: true as const, proof: {} as any }), recheck: () => true, claimBase: () => true, dispose: () => {} };
+		const bridge = registerPromptTemplateDelegationBridge({ events, coordinator, activeBoundRuntime: runtime, boundIdentityRegistry: registry, getContext: () => ({ cwd: "/repo" }), executeStructured: async () => assert.fail("coordinator rejection must not execute"), execute: async () => assert.fail() });
+		bridge.activate(); bridge.activateTerminalSink();
+		const terminal = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT) as Promise<{ status: string }>;
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, boundRequest());
+		assert.equal((await terminal).status, "duplicate_node");
+		assert.equal(registry.reserve(runtime.serverInstanceId, "123e4567-e89b-12d3-a456-426614174000"), "reserved");
+		assert.equal(registry.release(runtime.serverInstanceId, "123e4567-e89b-12d3-a456-426614174000"), true);
+		if (blocker.accepted) blocker.settle({ requestId: "other", ownerRunId: "owner-1", nodeId: "node-1", status: "cancelled" });
+		bridge.dispose();
+	});
+
+	it("rejects a bound top-level accessor without invoking it", async () => {
+		const events = new FakeEvents(); let getterCalls = 0;
+		const runtime = {
+			version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64),
+			preflight: () => ({ version: 1 as const, code: "invalid_request" as const }), admit: () => assert.fail("invalid accessor must not reach admission"), recheck: () => false, dispose: () => {},
+		};
+		const bridge = registerPromptTemplateDelegationBridge({ events, activeBoundRuntime: runtime, boundIdentityRegistry: new BoundIdentityRegistry(), getContext: () => ({ cwd: "/repo" }), execute: async () => assert.fail() });
+		bridge.activate(); bridge.activateTerminalSink();
+		const request = boundRequest({ requestId: "accessor", ownerRunId: "accessor-owner", nodeId: "accessor-node" });
+		Object.defineProperty(request, "task", { enumerable: true, get() { getterCalls++; throw new Error("getter ran"); } });
+		const terminal = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT) as Promise<{ status: string }>;
+		assert.doesNotThrow(() => events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, request));
+		assert.equal((await terminal).status, "invalid_request");
+		assert.equal(getterCalls, 0);
 		bridge.dispose();
 	});
 

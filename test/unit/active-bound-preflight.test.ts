@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
-import { activeBoundPreflightRequestDigest, parseActiveBoundPreflightRequest } from "../../src/api/active-bound-preflight.ts";
+import { activeBoundPreflightRequestDigest, activeBoundPreflightTarget, parseActiveBoundPreflightRequest } from "../../src/api/active-bound-preflight.ts";
 
 const VECTOR = {
 	version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: "request-a", ownerRunId: "owner-a", nodeId: "node-a",
@@ -25,6 +25,11 @@ describe("active-bound preflight DTO", () => {
 		const getter = { ...VECTOR } as Record<string, unknown>;
 		Object.defineProperty(getter, "task", { enumerable: true, get() { invoked++; return "bad"; } });
 		assert.deepEqual(parseActiveBoundPreflightRequest(getter), { ok: false, code: "invalid_request" });
+		assert.equal(activeBoundPreflightTarget(getter), VECTOR.targetServerInstanceId);
+		const targetGetter = { ...VECTOR } as Record<string, unknown>;
+		Object.defineProperty(targetGetter, "targetServerInstanceId", { enumerable: true, get() { invoked++; return VECTOR.targetServerInstanceId; } });
+		assert.equal(activeBoundPreflightTarget(targetGetter), undefined);
+		assert.equal(parseActiveBoundPreflightRequest(targetGetter).ok, false);
 		assert.equal(invoked, 0);
 		const toJSON = { ...VECTOR, toJSON() { invoked++; return VECTOR; } };
 		assert.equal(parseActiveBoundPreflightRequest(toJSON).ok, false);
@@ -51,5 +56,7 @@ describe("active-bound preflight DTO", () => {
 		]) assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, ...mutation }).ok, false);
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, skill: "résumé" }).ok, true);
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, model: "openrouter/openai/gpt-5" }).ok, true);
+		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, task: "\u0001".repeat(1024 * 1024) }).ok, true);
+		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, task: "x".repeat(1024 * 1024 + 1) }).ok, false);
 	});
 });

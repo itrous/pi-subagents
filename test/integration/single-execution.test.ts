@@ -27,6 +27,8 @@ import {
 	tryImport,
 } from "../support/helpers.ts";
 import registerSubagentExtension from "../../src/extension/index.ts";
+import { parseActiveBoundPreflightRequest } from "../../src/api/active-bound-preflight.ts";
+import { createActiveBoundRuntimeService } from "../../src/api/active-bound-runtime.ts";
 import {
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
 	SUBAGENT_DELEGATION_RESPONSE_EVENT,
@@ -41,6 +43,7 @@ import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait-config.ts"
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV } from "../../src/runs/shared/tool-budget.ts";
 import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
 import { MAX_CHILD_PENDING_LINE_BYTES, MAX_CHILD_STDERR_BYTES } from "../../src/runs/shared/child-protocol.ts";
+import { PI_SUBAGENT_PI_BINARY_ENV } from "../../src/runs/shared/pi-spawn.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
@@ -327,6 +330,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		workflowControllers?: Map<string, AbortController>,
 		handleScheduledRunAction?: Parameters<typeof createSubagentExecutor>[0]["handleScheduledRunAction"],
 		piEvents = createEventBus(),
+		activeBoundRuntime?: Parameters<typeof createSubagentExecutor>[0]["activeBoundRuntime"],
 	) {
 		return createSubagentExecutor!({
 			pi: { events: piEvents, getSessionName: () => undefined },
@@ -347,6 +351,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			discoverAgents: () => ({ agents }),
 			allowMutatingManagementActions,
 			...(handleScheduledRunAction ? { handleScheduledRunAction } : {}),
+			...(activeBoundRuntime ? { activeBoundRuntime } : {}),
 		});
 	}
 
@@ -1354,6 +1359,143 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const env = JSON.parse(structuredDelegated.content[0]?.text ?? "{}") as Record<string, string>;
 		assert.deepEqual(JSON.parse(env[TOOL_BUDGET_ENV] ?? "null"), zeroBudget);
 		assert.equal(env[TOOL_BUDGET_ZERO_AUTH_ENV], "1");
+		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("commits bound spawn budget on spawn and keeps the full prospective UUID", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const skillDir = path.join(tempDir, ".pi", "skills", "bound-skill"); fs.mkdirSync(skillDir, { recursive: true });
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: bound-skill\ndescription: Bound skill\n---\nBOUND_SKILL_MARKER\n");
+		const aliasCwd = path.join(tempDir, "cwd-alias"); fs.symlinkSync(tempDir, aliasCwd, "dir");
+		const base = path.join(tempDir, "bound-sessions");
+		const executionCtx = makeMinimalCtx(tempDir) as any;
+		executionCtx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
+		executionCtx.sessionManager.getSessionId = () => "pi-session";
+		executionCtx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }];
+		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => executionCtx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
+		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const proof = (runId: string) => {
+			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: `request-${runId}`, ownerRunId: "owner", nodeId: `node-${runId}`, prospectiveRunId: runId, agent: "echo", task: "Bound", cwd: aliasCwd, context: "fresh", model: "test/exact", thinking: "off", skill: ["bound-skill", "bound-skill"], artifacts: false, result: { kind: "text" } });
+			assert.equal(parsed.ok, true); if (!parsed.ok) throw new Error("invalid fixture");
+			const response = runtime.preflight(parsed.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) throw new Error("preflight failed");
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: parsed.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt };
+			const admitted = runtime.admit(parsed.request, binding); assert.equal(admitted.ok, true, JSON.stringify(admitted)); if (!admitted.ok) throw new Error("admission failed");
+			assert.match(admitted.proof.contract.launchInputsDigest, /^[0-9a-f]{64}$/);
+			return admitted.proof;
+		};
+		const params = (runId: string) => ({
+			agent: "echo", task: "Bound", context: "fresh", cwd: aliasCwd, model: "test/exact", skill: ["bound-skill", "bound-skill"],
+			output: false, acceptance: false, artifacts: false, share: false, mission: false,
+			delegatedThinkingOverride: "off" as const, activeBoundProof: proof(runId),
+			async: false as const, foregroundOnly: true as const, clarify: false as const,
+		});
+		const tampered = params("123e4567-e89b-12d3-a456-426614174009") as any;
+		tampered.activeBoundProof = { ...tampered.activeBoundProof, contract: { ...tampered.activeBoundProof.contract, launchInputsDigest: "0".repeat(64) } };
+		const rejectedDigest = await executor.executeDelegated("bound-digest-mismatch", tampered, new AbortController().signal, undefined, executionCtx);
+		assert.equal(rejectedDigest.isError, true); assert.equal(mockPi.callCount(), 0);
+		const poisonedEnv = ["PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE", "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR", "PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_STEER_INBOX", "PI_SUBAGENT_STEER_CAPABILITY", "PI_SUBAGENT_STEER_ACK_DIR", "PI_SUBAGENT_WATCHDOG_CHILD_CONFIG", "PI_SUBAGENT_PERMISSION_POLICY", "PI_SUBAGENT_TOOL_BUDGET", "PI_SUBAGENT_INTERCOM_SESSION_NAME", "PI_INTERCOM_STABLE_ID", "PI_INTERCOM_SESSION_ID", "PI_INTERCOM_UNLISTED_STALE", "PI_SUBAGENT_UNLISTED_STALE", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"];
+		const previousEnv = Object.fromEntries(poisonedEnv.map((key) => [key, process.env[key]]));
+		for (const key of poisonedEnv) process.env[key] = path.join(tempDir, `stale-${key}`);
+		mockPi.onCall({ echoEnv: poisonedEnv });
+		const firstId = "123e4567-e89b-12d3-a456-426614174000";
+		let first;
+		try { first = await executor.executeDelegated("bound-first", params(firstId), new AbortController().signal, undefined, executionCtx); }
+		finally { for (const key of poisonedEnv) { const previous = previousEnv[key]; if (previous === undefined) delete process.env[key]; else process.env[key] = previous; } }
+		assert.equal(first.isError, undefined, JSON.stringify(first));
+		assert.equal(first.details.runId, firstId);
+		const childEnv = JSON.parse(first.details.results[0]?.finalOutput ?? "{}") as Record<string, string | null>;
+		assert.equal(childEnv.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE, null);
+		assert.equal(childEnv.PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR, null);
+		assert.equal(childEnv.PI_SUBAGENT_STEER_INBOX, null);
+		assert.equal(childEnv.PI_SUBAGENT_DEPTH, "1");
+		assert.equal(childEnv.PI_SUBAGENT_MAX_DEPTH, "1");
+		for (const key of poisonedEnv.filter((key) => !["PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"].includes(key))) assert.equal(childEnv[key], null, key);
+		assert.match(childEnv.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH ?? "", /tool-diagnostic\.json$/);
+		assert.notEqual(childEnv.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH, path.join(tempDir, "stale-PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH"));
+		const call = readCall(); const toolsIndex = call.args.indexOf("--tools");
+		assert.equal(call.args.includes("--no-extensions"), true);
+		assert.equal(call.args.includes("--no-tools"), false);
+		assert.deepEqual(call.args.slice(toolsIndex, toolsIndex + 2), ["--tools", "read"]);
+		assert.equal(call.cwd, tempDir);
+		const promptRecord = JSON.stringify(call.systemPrompts);
+		assert.equal(promptRecord.split(path.join(skillDir, "SKILL.md")).length - 1, 2);
+		assert.equal(promptRecord.split("BOUND_SKILL_MARKER").length - 1, 2);
+		assert.equal(fs.existsSync(path.join(base, firstId)), true);
+		const second = await executor.executeDelegated("bound-second", params("123e4567-e89b-12d3-a456-426614174001"), new AbortController().signal, undefined, executionCtx);
+		assert.equal(second.isError, true);
+		assert.match(second.content[0]?.text ?? "", /spawn limit reached/i);
+		assert.equal(mockPi.callCount(), 1);
+		runtime.dispose();
+	});
+
+	it("keeps bound budget committed when a spawned child fails", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\nfallbackModels:\n  - test/fallback\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions"); const runtime = { claimBase: () => true, recheck: () => true } as any;
+		const ctx = makeMinimalCtx(tempDir) as any; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact" }, { provider: "test", id: "fallback" }];
+		const executor = makeExecutor([makeAgent("echo", { fallbackModels: ["test/fallback"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const params = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
+		mockPi.onCall({ jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "temporary provider failure" }], model: "test/exact", errorMessage: "rate limit exceeded", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }], exitCode: 1 });
+		mockPi.onCall({ output: "fallback must not run" });
+		const failed = await executor.executeDelegated("bound-spawned-failure", params("123e4567-e89b-12d3-a456-426614174010"), new AbortController().signal, undefined, ctx);
+		assert.equal(failed.isError, true); assert.equal(mockPi.callCount(), 1);
+		const blocked = await executor.executeDelegated("bound-after-spawned-failure", params("123e4567-e89b-12d3-a456-426614174011"), new AbortController().signal, undefined, ctx);
+		assert.equal(blocked.isError, true); assert.match(blocked.content[0]?.text ?? "", /spawn limit reached/i); assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("rolls back bound budget and empty owned root when the immediate spawn barrier drifts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions");
+		let checks = 0;
+		const runtime = { claimBase: () => true, recheck: () => ++checks !== 2 } as any;
+		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const runId = "123e4567-e89b-12d3-a456-426614174002";
+		const makeParams = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
+		const rejected = await executor.executeDelegated("bound-drift", makeParams(runId), new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(rejected.isError, true);
+		assert.equal(mockPi.callCount(), 0);
+		assert.equal(fs.existsSync(path.join(base, runId)), false);
+		checks = 10;
+		mockPi.onCall({ output: "retry ok" });
+		const retried = await executor.executeDelegated("bound-retry", makeParams("123e4567-e89b-12d3-a456-426614174005"), new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(retried.isError, undefined, JSON.stringify(retried));
+		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("preserves a replacement root after pre-spawn rejection", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions"); const runId = "123e4567-e89b-12d3-a456-426614174004"; const rootPath = path.join(base, runId);
+		let checks = 0;
+		const runtime = { claimBase: () => true, recheck: () => { checks++; if (checks !== 2) return true; fs.rmSync(rootPath, { recursive: true }); fs.mkdirSync(rootPath); fs.writeFileSync(path.join(rootPath, "sentinel"), "keep"); return false; } } as any;
+		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const proof = { version: 1, request: { prospectiveRunId: runId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any;
+		const result = await executor.executeDelegated("bound-replaced", { agent: "echo", task: "Bound", context: "fresh", cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false, mission: false, delegatedThinkingOverride: "off", activeBoundProof: proof, async: false, foregroundOnly: true, clarify: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(result.isError, true);
+		assert.equal(fs.readFileSync(path.join(rootPath, "sentinel"), "utf8"), "keep");
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rolls back bound budget when the child errors before spawn", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions");
+		const runtime = { claimBase: () => true, recheck: () => true } as any;
+		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const runId = "123e4567-e89b-12d3-a456-426614174003";
+		const params = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
+		const previousBinary = process.env[PI_SUBAGENT_PI_BINARY_ENV];
+		process.env[PI_SUBAGENT_PI_BINARY_ENV] = path.join(tempDir, "missing-pi");
+		let failed;
+		try { failed = await executor.executeDelegated("bound-error", params(runId), new AbortController().signal, undefined, makeMinimalCtx(tempDir)); }
+		finally { if (previousBinary === undefined) delete process.env[PI_SUBAGENT_PI_BINARY_ENV]; else process.env[PI_SUBAGENT_PI_BINARY_ENV] = previousBinary; }
+		assert.equal(failed.isError, true);
+		assert.equal(fs.existsSync(path.join(base, runId)), false);
+		mockPi.onCall({ output: "retry ok" });
+		const retried = await executor.executeDelegated("bound-error-retry", params("123e4567-e89b-12d3-a456-426614174006"), new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(retried.isError, undefined, JSON.stringify(retried));
 		assert.equal(mockPi.callCount(), 1);
 	});
 
