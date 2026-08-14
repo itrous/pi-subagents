@@ -3961,6 +3961,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				singleModelAttempt: true,
 				disableWatchdog: true,
 				activeBoundProjectSkills: true,
+				activeBoundEnvironment: Object.assign(Object.create(null), data.activeBoundProof.request.environment ?? {}),
 				parentDepthOverride: data.activeBoundProof.contract.policy.parentDepth,
 				launchToolsOverride: [...(data.activeBoundProof.contract.tools?.effectiveAllowlist ?? agentConfig.tools ?? [])],
 			} : {}),

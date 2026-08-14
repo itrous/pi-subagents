@@ -75,6 +75,12 @@ describe("restricted active-bound resolver", () => {
 		assert.equal(Object.hasOwn(first.contract, "launchBinding"), false);
 		assert.equal(fs.existsSync(path.join(root, "child-sessions")), false);
 		assert.deepEqual(new Set(fs.readdirSync(root)), before);
+		const withEnvironment = resolveActiveBoundLaunchContract(input(alias, request(alias, { environment: { ONECPI_REVIEW_ROOT: "/private/root" } })));
+		assert.equal(withEnvironment.ok, true); if (!withEnvironment.ok) return;
+		assert.deepEqual(withEnvironment.contract.environment.names, ["ONECPI_REVIEW_ROOT"]);
+		assert.doesNotMatch(JSON.stringify(withEnvironment.contract), /private\/root/);
+		assert.notEqual(withEnvironment.contract.launchInputsDigest, first.contract.launchInputsDigest);
+		assert.notEqual(withEnvironment.contract.digest, first.contract.digest);
 	});
 
 	it("fails exact model, cwd, session and deterministic-root restrictions closed", () => {

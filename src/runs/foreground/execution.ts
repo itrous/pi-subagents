@@ -96,6 +96,7 @@ import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudget
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
+import { buildActiveBoundSpawnEnvironment, projectActiveBoundEnvironment } from "../../api/active-bound-environment.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, PI_AGGREGATE_EVENT_PROJECTOR, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import {
 	acceptChildWatchdogEvent,
@@ -375,6 +376,7 @@ async function runSingleAttempt(
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
 		skills: shared.resolvedSkillNames ?? [],
+		...(options.activeBoundEnvironment !== undefined ? { environment: projectActiveBoundEnvironment(options.activeBoundEnvironment) } : {}),
 		tools: toolPlan.effectiveToolAllowlist,
 		extensions: toolPlan.extensionArgs,
 		subagentOnlyExtensions: options.activeBoundProjectSkills ? agent.subagentOnlyExtensions ?? [] : undefined,
@@ -461,13 +463,17 @@ async function runSingleAttempt(
 		};
 		return result;
 	}
-	const inheritedSpawnEnv = { ...process.env };
-	if (options.disableWatchdog) {
+	const inheritedSpawnEnv = options.activeBoundEnvironment !== undefined
+		? buildActiveBoundSpawnEnvironment(process.env, options.activeBoundEnvironment)
+		: { ...process.env };
+	if (options.disableWatchdog && options.activeBoundEnvironment === undefined) {
 		for (const key of Object.keys(inheritedSpawnEnv)) {
 			if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INTERCOM_")) delete inheritedSpawnEnv[key];
 		}
 	}
-	const spawnEnv = { ...inheritedSpawnEnv, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride) };
+	const spawnEnv: NodeJS.ProcessEnv = options.activeBoundEnvironment !== undefined
+		? Object.assign(Object.create(null), inheritedSpawnEnv, sharedEnv, getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride))
+		: { ...inheritedSpawnEnv, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride) };
 	for (const [key, value] of Object.entries(spawnEnv)) if (value === undefined) delete spawnEnv[key];
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;

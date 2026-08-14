@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import { cloneJsonWithinByteLimit } from "../slash/delegation-json.ts";
 import { canonicalSha256 } from "../shared/canonical-json.ts";
+import { parseActiveBoundEnvironment, type ActiveBoundEnvironmentV1 } from "./active-bound-environment.ts";
 import type {
 	SubagentDelegationJsonSchemaObject,
 	SubagentDelegationThinking,
@@ -13,7 +14,7 @@ export const ACTIVE_BOUND_PREFLIGHT_VERSION = 1 as const;
 const RFC4122_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MODEL = /^[^\s/:]+\/[^\s:]+$/u;
 const THINKING = new Set<SubagentDelegationThinking>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const FIELDS = new Set(["version", "targetServerInstanceId", "requestId", "ownerRunId", "nodeId", "prospectiveRunId", "agent", "task", "cwd", "context", "model", "thinking", "timeoutMs", "turnBudget", "toolBudget", "skill", "artifacts", "result"]);
+const FIELDS = new Set(["version", "targetServerInstanceId", "requestId", "ownerRunId", "nodeId", "prospectiveRunId", "agent", "task", "cwd", "context", "model", "thinking", "timeoutMs", "turnBudget", "toolBudget", "skill", "artifacts", "environment", "result"]);
 const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_REQUEST_CLONE_BYTES = 8 * 1024 * 1024;
 const MAX_TASK_BYTES = 1024 * 1024;
@@ -37,6 +38,7 @@ export interface ActiveBoundPreflightRequestV1 {
 	turnBudget?: SubagentDelegationTurnBudget;
 	toolBudget?: SubagentDelegationToolBudget;
 	skill?: string | string[] | false;
+	environment?: ActiveBoundEnvironmentV1;
 	artifacts: false;
 	result: { kind: "text" } | { kind: "structured"; schema: SubagentDelegationJsonSchemaObject };
 }
@@ -138,7 +140,9 @@ export function parseActiveBoundPreflightRequest(input: unknown): ActiveBoundPre
 						? omitActiveOptionalUndefined(descriptor.value, new Set(["maxTurns", "graceTurns"]))
 						: key === "toolBudget"
 							? omitActiveOptionalUndefined(descriptor.value, new Set(["soft", "hard", "block"]))
-							: descriptor.value;
+							: key === "environment"
+								? omitActiveOptionalUndefined(descriptor.value, new Set(["ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH"]))
+								: descriptor.value;
 				}
 			}
 			if (safe) cloneInput = prepared;
@@ -167,6 +171,8 @@ export function parseActiveBoundPreflightRequest(input: unknown): ActiveBoundPre
 			skill = [...value.skill];
 		} else return fail();
 	}
+	const parsedEnvironment = parseActiveBoundEnvironment(value.environment);
+	if (!parsedEnvironment.ok) return fail();
 	if (!plainRecord(value.result)) return fail();
 	let result: ActiveBoundPreflightRequestV1["result"];
 	if (value.result.kind === "text" && exactFields(value.result, new Set(["kind"]))) result = { kind: "text" };
@@ -182,6 +188,7 @@ export function parseActiveBoundPreflightRequest(input: unknown): ActiveBoundPre
 		thinking: value.thinking as SubagentDelegationThinking,
 		...(value.timeoutMs !== undefined ? { timeoutMs: value.timeoutMs as number } : {}),
 		...(turnBudget ? { turnBudget } : {}), ...(toolBudget ? { toolBudget } : {}), ...(skill !== undefined ? { skill } : {}),
+		...(Object.keys(parsedEnvironment.environment).length ? { environment: parsedEnvironment.environment } : {}),
 		artifacts: false, result,
 	}) };
 }
@@ -196,7 +203,9 @@ export function projectActiveBoundPreflightRequest(request: ActiveBoundPreflight
 		...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
 		...(request.turnBudget !== undefined ? { turnBudget: request.turnBudget } : {}),
 		...(request.toolBudget !== undefined ? { toolBudget: request.toolBudget } : {}),
-		...(request.skill !== undefined ? { skill: request.skill } : {}), artifacts: false, result: request.result,
+		...(request.skill !== undefined ? { skill: request.skill } : {}),
+		...(request.environment && Object.keys(request.environment).length ? { environment: request.environment } : {}),
+		artifacts: false, result: request.result,
 	};
 }
 

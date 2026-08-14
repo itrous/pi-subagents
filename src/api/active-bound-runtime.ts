@@ -90,7 +90,8 @@ export function activeBoundRequestFromDelegation(
 		requestId: string; ownerRunId: string; nodeId: string; agent: string; task: string; context: "fresh";
 		cwd: string; model: string; thinking: ActiveBoundPreflightRequestV1["thinking"]; timeoutMs?: number;
 		turnBudget?: ActiveBoundPreflightRequestV1["turnBudget"]; toolBudget?: ActiveBoundPreflightRequestV1["toolBudget"];
-		skill?: ActiveBoundPreflightRequestV1["skill"]; artifacts: false; result: ActiveBoundPreflightRequestV1["result"];
+		skill?: ActiveBoundPreflightRequestV1["skill"]; environment?: ActiveBoundPreflightRequestV1["environment"];
+		artifacts: false; result: ActiveBoundPreflightRequestV1["result"];
 	},
 	binding: ActiveBoundBindingV1,
 ): ActiveBoundPreflightRequestV1 {
@@ -111,6 +112,7 @@ export function activeBoundRequestFromDelegation(
 		...(request.turnBudget !== undefined ? { turnBudget: request.turnBudget } : {}),
 		...(request.toolBudget !== undefined ? { toolBudget: request.toolBudget } : {}),
 		...(request.skill !== undefined ? { skill: request.skill } : {}),
+		...(request.environment && Object.keys(request.environment).length ? { environment: Object.assign(Object.create(null), request.environment) as ActiveBoundPreflightRequestV1["environment"] } : {}),
 		artifacts: false,
 		result: request.result,
 	};

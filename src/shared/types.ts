@@ -1705,6 +1705,8 @@ export interface RunSyncOptions {
 	beforeSpawn?: (materializedLaunchDigest: string) => void;
 	/** Private active-bound path: resolve only uncached nearest-project skills. */
 	activeBoundProjectSkills?: boolean;
+	/** Private active-bound per-spawn values; empty object still selects isolated mode. */
+	activeBoundEnvironment?: import("../api/active-bound-environment.ts").ActiveBoundEnvironmentV1;
 	/** Private active-bound snapshot; avoids rereading mutable ambient depth. */
 	parentDepthOverride?: number;
 	/** Private active-bound materialized tool plan without mutating source definition. */

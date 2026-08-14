@@ -19,6 +19,7 @@ import { resolvePermissionRules } from "../runs/shared/permissions.ts";
 import type { ActiveBoundPreflightRequestV1 } from "./active-bound-preflight.ts";
 import type { ActiveBoundRootIdentityV1 } from "./active-bound-runtime.ts";
 import { activeBoundPreflightRequestDigest } from "./active-bound-preflight.ts";
+import { projectActiveBoundEnvironment, type ActiveBoundEnvironmentProjectionV1 } from "./active-bound-environment.ts";
 
 export const ACTIVE_BOUND_LAUNCH_CONTRACT_VERSION = 1 as const;
 const FIXED_CHILD_TOOLS = new Set([
@@ -74,6 +75,7 @@ export interface ActiveBoundLaunchContractV1 {
 	context: "fresh";
 	taskDigest: string;
 	skills: Array<{ name: string; source: string; contentDigest: string }>;
+	environment: ActiveBoundEnvironmentProjectionV1;
 	tools: { effectiveAllowlist: string[]; requiredChildTools: string[]; disableAmbientExtensions: boolean; capabilityCeiling?: ResolvedSubagentCapabilityCeiling };
 	roots: { baseRootPathDigest: string; baseRootIdentityDigest?: string; sessionRootDigest: string; sessionDirDigest: string; sessionFileDigest: string };
 	policy: { foregroundOnly: true; async: false; clarify: false; share: false; acceptance: false; mission: false; output: false; outputMode: "inline"; artifacts: false; watchdog: false; control: false; intercom: false; usageBudget: false; waitToolEnabled: boolean; parentDepth: number; maxSubagentDepth?: number; permissionsDigest?: string; modelScopeDigest: string };
@@ -287,11 +289,12 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	if (!Number.isInteger(parentDepth) || parentDepth !== 0 || parentDepth >= runtimeMaxSubagentDepth) return failure("restricted_agent");
 	const effectiveMaxSubagentDepth = resolveChildMaxSubagentDepth(runtimeMaxSubagentDepth, agent.maxSubagentDepth);
 	const materializedModel = applyThinkingSuffix(input.request.model, input.request.thinking, true)!;
+	const environment = projectActiveBoundEnvironment(input.request.environment);
 	const launchBindingInput = {
 		definitionDigest, task: input.request.task,
 		modelCandidates: [materializedModel], thinking: input.request.thinking, systemPrompt,
 		systemPromptMode: agent.systemPromptMode, inheritProjectContext: agent.inheritProjectContext, inheritSkills: agent.inheritSkills,
-		skills: skillNames, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: agent.subagentOnlyExtensions ?? [], mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
+		skills: skillNames, environment, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: agent.subagentOnlyExtensions ?? [], mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
 		outputMode: "inline" as const, ...(input.request.result.kind === "structured" ? { structuredOutputSchema: input.request.result.schema } : {}),
 	};
 	const base: Omit<ActiveBoundLaunchContractV1, "digest"> = {
@@ -300,6 +303,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		agent: { name: agent.name, source: agent.source, definitionProjectionVersion: AGENT_DEFINITION_PROJECTION_VERSION, definitionDigest, fileContentDigest: agentBytesDigest },
 		model: input.request.model, modelRegistryDigest, modelCandidates: [materializedModel], thinking: input.request.thinking, context: "fresh", taskDigest: canonicalSha256(input.request.task),
 		skills: skillEvidence,
+		environment,
 		tools: { effectiveAllowlist: toolPlan.effectiveToolAllowlist, requiredChildTools: toolPlan.requiredChildTools, disableAmbientExtensions: toolPlan.disableAmbientExtensions, ...(boundCeiling ? { capabilityCeiling: boundCeiling } : {}) },
 		roots: {
 			baseRootPathDigest: canonicalSha256(baseRoot),

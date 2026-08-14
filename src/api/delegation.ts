@@ -51,6 +51,8 @@ export interface SubagentDelegationRequest {
 	turnBudget?: SubagentDelegationTurnBudget;
 	toolBudget?: SubagentDelegationToolBudget;
 	skill?: string | string[] | boolean;
+	/** Bound-only per-request environment. Public unbound delegation rejects it. */
+	environment?: import("./active-bound-environment.ts").ActiveBoundEnvironmentV1;
 	artifacts?: boolean;
 	result: SubagentDelegationResultRequest;
 	binding?: SubagentDelegationBindingV1;

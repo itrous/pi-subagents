@@ -85,6 +85,7 @@ export interface LaunchBindingInput {
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
+	environment?: unknown;
 	tools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
@@ -110,6 +111,7 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		inheritProjectContext: input.inheritProjectContext,
 		inheritSkills: input.inheritSkills,
 		skills: input.skills,
+		environment: input.environment,
 		tools: input.tools,
 		extensions: input.extensions,
 		subagentOnlyExtensions: input.subagentOnlyExtensions,

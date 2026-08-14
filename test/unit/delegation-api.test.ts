@@ -57,6 +57,12 @@ function registerActiveBridge(options: BridgeOptions) {
 	return bridge;
 }
 
+const boundBinding = {
+	version: 1 as const, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000",
+	expectedSourceIdentityDigest: "a".repeat(64), expectedActiveSessionDigest: "b".repeat(64), requestDigest: "c".repeat(64), expectedLaunchContractDigest: "d".repeat(64),
+	receipt: { version: 1 as const, algorithm: "HMAC-SHA256" as const, payload: { version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 2 }, mac: "e".repeat(64) },
+};
+
 const request: SubagentDelegationRequest = {
 	requestId: "attempt-1",
 	ownerRunId: "owner-1",
@@ -94,6 +100,7 @@ describe("public subagent delegation contract", () => {
 			[{ ...request, output: false }, /Unsupported delegation field: output/],
 			[{ ...request, acceptance: false }, /Unsupported delegation field: acceptance/],
 			[{ ...request, agentContract: { version: 1 } }, /Unsupported delegation field: agentContract/],
+			[{ ...request, environment: { ONECPI_REVIEW_ROOT: "/root" } }, /environment is supported only for bound delegation/],
 			[{ ...request, result: { kind: "text", schema: {} } }, /result.schema is not supported/],
 			[{ ...request, result: { kind: "structured" } }, /result.schema must be a JSON Schema object/],
 			[{ ...request, task: "é".repeat(524_289) }, /task exceeds 1 MiB/],
@@ -111,6 +118,12 @@ describe("public subagent delegation contract", () => {
 			assert.equal(parsed.ok, false);
 			if (!parsed.ok) assert.match(parsed.error, expected);
 		}
+	});
+
+	it("accepts environment only on a bound request and normalizes it", () => {
+		const parsed = parseSubagentDelegationRequest({ ...request, artifacts: false, environment: { ONECPI_REVIEW_SUBJECT_PATH: "/subject", ONECPI_REVIEW_ROOT: "/root" }, binding: boundBinding });
+		assert.equal(parsed.ok, true, parsed.ok ? undefined : parsed.error);
+		if (parsed.ok) { assert.deepEqual({ ...parsed.request.environment }, { ONECPI_REVIEW_ROOT: "/root", ONECPI_REVIEW_SUBJECT_PATH: "/subject" }); assert.equal(Object.getPrototypeOf(parsed.request.environment!), null); }
 	});
 
 	it("accepts exact zero tool budgets for structured delegated leaves", () => {

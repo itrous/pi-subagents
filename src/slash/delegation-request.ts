@@ -4,6 +4,7 @@ import {
 	type SubagentDelegationRequest,
 } from "../api/delegation.ts";
 import type { LaunchReceiptV1 } from "../api/launch-receipt.ts";
+import { parseActiveBoundEnvironment } from "../api/active-bound-environment.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { cloneJsonWithinByteLimit } from "./delegation-json.ts";
@@ -26,6 +27,7 @@ const supportedFields = new Set([
 	"turnBudget",
 	"toolBudget",
 	"skill",
+	"environment",
 	"artifacts",
 	"result",
 	"binding",
@@ -143,7 +145,9 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 							? omitKnownOptionalUndefined(descriptor.value, new Set(["maxTurns", "graceTurns"]))
 							: key === "toolBudget"
 								? omitKnownOptionalUndefined(descriptor.value, new Set(["soft", "hard", "block"]))
-								: descriptor.value;
+								: key === "environment"
+									? omitKnownOptionalUndefined(descriptor.value, new Set(["ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH"]))
+									: descriptor.value;
 					}
 				}
 				if (safe) cloneInput = prepared;
@@ -209,6 +213,9 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 	}
 	const binding = value.binding === undefined ? undefined : parseBinding(value.binding);
 	if (value.binding !== undefined && !binding) return { ok: false, ...identity, error: "binding must be a closed active-bound v1 proof." };
+	if (!binding && value.environment !== undefined) return { ok: false, ...identity, error: "environment is supported only for bound delegation." };
+	const parsedEnvironment = parseActiveBoundEnvironment(value.environment);
+	if (!parsedEnvironment.ok) return { ok: false, ...identity, error: "environment must contain only bounded active-bound keys." };
 	if (binding && (value.context !== "fresh" || typeof value.model !== "string" || typeof value.thinking !== "string" || value.artifacts !== false || value.skill === true)) {
 		return { ok: false, ...identity, error: "bound delegation requires fresh context, explicit model/thinking, artifacts:false, and explicit project skills." };
 	}
@@ -265,10 +272,12 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 	} else {
 		return { ok: false, ...identity, error: "result.kind must be text or structured." };
 	}
+	const { environment: _rawEnvironment, ...requestValue } = value;
 	return {
 		ok: true,
 		request: {
-			...value,
+			...requestValue,
+			...(Object.keys(parsedEnvironment.environment).length ? { environment: parsedEnvironment.environment } : {}),
 			...(binding ? { binding } : {}),
 			result: structuredSchema
 				? { kind: "structured", schema: structuredSchema }

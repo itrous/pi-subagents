@@ -47,6 +47,17 @@ describe("active-bound preflight DTO", () => {
 		assert.equal(proxyTrapCalls, 0);
 	});
 
+	it("normalizes bounded environment ordering and omitted empty objects", () => {
+		const left = parseActiveBoundPreflightRequest({ ...VECTOR, environment: { ONECPI_REVIEW_SUBJECT_PATH: "/subject", ONECPI_REVIEW_ROOT: "/root" } });
+		const right = parseActiveBoundPreflightRequest({ ...VECTOR, environment: { ONECPI_REVIEW_ROOT: "/root", ONECPI_REVIEW_SUBJECT_PATH: "/subject" } });
+		assert.equal(left.ok, true); assert.equal(right.ok, true); if (!left.ok || !right.ok) return;
+		assert.equal(activeBoundPreflightRequestDigest(left.request), activeBoundPreflightRequestDigest(right.request));
+		const omitted = parseActiveBoundPreflightRequest(VECTOR); const empty = parseActiveBoundPreflightRequest({ ...VECTOR, environment: {} });
+		assert.equal(omitted.ok, true); assert.equal(empty.ok, true); if (!omitted.ok || !empty.ok) return;
+		assert.deepEqual(empty.request, omitted.request);
+		assert.equal(activeBoundPreflightRequestDigest(empty.request), activeBoundPreflightRequestDigest(omitted.request));
+	});
+
 	it("requires RFC4122 UUID, fresh, exact provider/id, explicit thinking, false artifacts and closed bounds", () => {
 		for (const mutation of [
 			{ targetServerInstanceId: "not-a-uuid" }, { prospectiveRunId: "not-a-uuid" }, { context: "fork" }, { model: "exact" }, { model: "p/m:high" }, { model: `p/${"a".repeat(1023)}` },
@@ -58,5 +69,8 @@ describe("active-bound preflight DTO", () => {
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, model: "openrouter/openai/gpt-5" }).ok, true);
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, task: "\u0001".repeat(1024 * 1024) }).ok, true);
 		assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, task: "x".repeat(1024 * 1024 + 1) }).ok, false);
+		for (const environment of [{ UNKNOWN: "x" }, { onecpi_review_root: "/root" }, { ONECPI_REVIEW_ROOT: "" }, { ONECPI_REVIEW_ROOT: "x\0y" }, { ONECPI_REVIEW_ROOT: "\ud800" }, { ONECPI_REVIEW_ROOT: "x".repeat(4097) }]) {
+			assert.equal(parseActiveBoundPreflightRequest({ ...VECTOR, environment }).ok, false);
+		}
 	});
 });

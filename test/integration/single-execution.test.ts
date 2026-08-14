@@ -1376,7 +1376,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => executionCtx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
 		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
 		const proof = (runId: string) => {
-			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: `request-${runId}`, ownerRunId: "owner", nodeId: `node-${runId}`, prospectiveRunId: runId, agent: "echo", task: "Bound", cwd: aliasCwd, context: "fresh", model: "test/exact", thinking: "off", skill: ["bound-skill", "bound-skill"], artifacts: false, result: { kind: "text" } });
+			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: `request-${runId}`, ownerRunId: "owner", nodeId: `node-${runId}`, prospectiveRunId: runId, agent: "echo", task: "Bound", cwd: aliasCwd, context: "fresh", model: "test/exact", thinking: "off", skill: ["bound-skill", "bound-skill"], environment: { ONECPI_REVIEW_ROOT: "/requested/root", ONECPI_REVIEW_SUBJECT_PATH: "/requested/subject" }, artifacts: false, result: { kind: "text" } });
 			assert.equal(parsed.ok, true); if (!parsed.ok) throw new Error("invalid fixture");
 			const response = runtime.preflight(parsed.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) throw new Error("preflight failed");
 			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: parsed.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt };
@@ -1394,13 +1394,16 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		tampered.activeBoundProof = { ...tampered.activeBoundProof, contract: { ...tampered.activeBoundProof.contract, launchInputsDigest: "0".repeat(64) } };
 		const rejectedDigest = await executor.executeDelegated("bound-digest-mismatch", tampered, new AbortController().signal, undefined, executionCtx);
 		assert.equal(rejectedDigest.isError, true); assert.equal(mockPi.callCount(), 0);
-		const poisonedEnv = ["PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE", "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR", "PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_STEER_INBOX", "PI_SUBAGENT_STEER_CAPABILITY", "PI_SUBAGENT_STEER_ACK_DIR", "PI_SUBAGENT_WATCHDOG_CHILD_CONFIG", "PI_SUBAGENT_PERMISSION_POLICY", "PI_SUBAGENT_TOOL_BUDGET", "PI_SUBAGENT_INTERCOM_SESSION_NAME", "PI_INTERCOM_STABLE_ID", "PI_INTERCOM_SESSION_ID", "PI_INTERCOM_UNLISTED_STALE", "PI_SUBAGENT_UNLISTED_STALE", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"];
+		const poisonedEnv = ["PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE", "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR", "PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_STEER_INBOX", "PI_SUBAGENT_STEER_CAPABILITY", "PI_SUBAGENT_STEER_ACK_DIR", "PI_SUBAGENT_WATCHDOG_CHILD_CONFIG", "PI_SUBAGENT_PERMISSION_POLICY", "PI_SUBAGENT_TOOL_BUDGET", "PI_SUBAGENT_INTERCOM_SESSION_NAME", "PI_INTERCOM_STABLE_ID", "PI_INTERCOM_SESSION_ID", "PI_INTERCOM_UNLISTED_STALE", "PI_SUBAGENT_UNLISTED_STALE", "Pi_Subagent_Mixed_Stale", "pi_intercom_mixed_stale", "ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH", "Onecpi_Review_Root", "Onecpi_Review_Subject_Path", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"];
 		const previousEnv = Object.fromEntries(poisonedEnv.map((key) => [key, process.env[key]]));
 		for (const key of poisonedEnv) process.env[key] = path.join(tempDir, `stale-${key}`);
 		mockPi.onCall({ echoEnv: poisonedEnv });
 		const firstId = "123e4567-e89b-12d3-a456-426614174000";
 		let first;
-		try { first = await executor.executeDelegated("bound-first", params(firstId), new AbortController().signal, undefined, executionCtx); }
+		try {
+			first = await executor.executeDelegated("bound-first", params(firstId), new AbortController().signal, undefined, executionCtx);
+			for (const key of poisonedEnv) assert.equal(process.env[key], path.join(tempDir, `stale-${key}`), key);
+		}
 		finally { for (const key of poisonedEnv) { const previous = previousEnv[key]; if (previous === undefined) delete process.env[key]; else process.env[key] = previous; } }
 		assert.equal(first.isError, undefined, JSON.stringify(first));
 		assert.equal(first.details.runId, firstId);
@@ -1410,7 +1413,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(childEnv.PI_SUBAGENT_STEER_INBOX, null);
 		assert.equal(childEnv.PI_SUBAGENT_DEPTH, "1");
 		assert.equal(childEnv.PI_SUBAGENT_MAX_DEPTH, "1");
-		for (const key of poisonedEnv.filter((key) => !["PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"].includes(key))) assert.equal(childEnv[key], null, key);
+		assert.equal(childEnv.ONECPI_REVIEW_ROOT, "/requested/root");
+		assert.equal(childEnv.ONECPI_REVIEW_SUBJECT_PATH, "/requested/subject");
+		for (const key of poisonedEnv.filter((key) => !["PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH", "ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH"].includes(key))) assert.equal(childEnv[key], null, key);
 		assert.match(childEnv.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH ?? "", /tool-diagnostic\.json$/);
 		assert.notEqual(childEnv.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH, path.join(tempDir, "stale-PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH"));
 		const call = readCall(); const toolsIndex = call.args.indexOf("--tools");
@@ -1422,11 +1427,32 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(promptRecord.split(path.join(skillDir, "SKILL.md")).length - 1, 2);
 		assert.equal(promptRecord.split("BOUND_SKILL_MARKER").length - 1, 2);
 		assert.equal(fs.existsSync(path.join(base, firstId)), true);
+		assert.equal(fs.existsSync(path.join(tempDir, ".pi-subagents")), false);
+		const pendingLeakScan = [tempDir];
+		while (pendingLeakScan.length) {
+			const directory = pendingLeakScan.pop()!;
+			for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+				const candidate = path.join(directory, entry.name); if (entry.isSymbolicLink()) continue;
+				if (entry.isDirectory()) { pendingLeakScan.push(candidate); continue; } if (!entry.isFile()) continue;
+				const bytes = fs.readFileSync(candidate); assert.equal(bytes.includes(Buffer.from("/requested/root")), false, candidate); assert.equal(bytes.includes(Buffer.from("/requested/subject")), false, candidate);
+			}
+		}
 		const second = await executor.executeDelegated("bound-second", params("123e4567-e89b-12d3-a456-426614174001"), new AbortController().signal, undefined, executionCtx);
 		assert.equal(second.isError, true);
 		assert.match(second.content[0]?.text ?? "", /spawn limit reached/i);
 		assert.equal(mockPi.callCount(), 1);
 		runtime.dispose();
+	});
+
+	it("preserves ambient ONECPI keys for legacy unbound children", async () => {
+		const keys = ["ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH"];
+		const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+		process.env.ONECPI_REVIEW_ROOT = "/legacy/root"; process.env.ONECPI_REVIEW_SUBJECT_PATH = "/legacy/subject";
+		mockPi.onCall({ echoEnv: keys });
+		let result;
+		try { result = await runSync(tempDir, [makeAgent("echo")], "echo", "legacy env", { runId: "legacy-onecpi-env", acceptance: false }); }
+		finally { for (const key of keys) { const value = previous[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
+		assert.equal(result.exitCode, 0); assert.deepEqual(JSON.parse(result.finalOutput ?? "{}"), { ONECPI_REVIEW_ROOT: "/legacy/root", ONECPI_REVIEW_SUBJECT_PATH: "/legacy/subject" });
 	});
 
 	it("keeps bound budget committed when a spawned child fails", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
