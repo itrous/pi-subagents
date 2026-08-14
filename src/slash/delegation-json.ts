@@ -1,3 +1,5 @@
+import { types as utilTypes } from "node:util";
+
 const MAX_JSON_DEPTH = 64;
 const MAX_JSON_ENTRIES = 100_000;
 
@@ -40,7 +42,7 @@ export function cloneJsonWithinByteLimit(input: unknown, maxBytes: number): Boun
 		if (typeof value !== "object") throw new TypeError("invalid");
 
 		const object = value as object;
-		if (active.has(object)) throw new TypeError("invalid");
+		if (utilTypes.isProxy(object) || active.has(object)) throw new TypeError("invalid");
 		active.add(object);
 		try {
 			const prototype = Object.getPrototypeOf(object);

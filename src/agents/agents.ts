@@ -654,7 +654,31 @@ export function findNearestProjectRoot(cwd: string): string | null {
 	return findProjectRootCandidates(cwd)[0] ?? null;
 }
 
-function findConfiguredProjectRoot(cwd: string): string | null {
+/** Fixed .pi project root lookup without package-root configuration reads. */
+function isWithinProjectRoot(candidate: string, root: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function findNearestStandardProjectRoot(cwd: string): string | null {
+	let currentDir = path.resolve(cwd);
+	while (true) {
+		const candidate = path.join(currentDir, ".pi");
+		try {
+			const stat = fs.lstatSync(candidate);
+			if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe-marker");
+			return currentDir;
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+			if (code !== "ENOENT") throw error;
+		}
+		const parentDir = path.dirname(currentDir);
+		if (parentDir === currentDir) return null;
+		currentDir = parentDir;
+	}
+}
+
+export function findConfiguredProjectRoot(cwd: string): string | null {
 	const candidates = findProjectRootCandidates(cwd);
 	const nearestRoot = candidates[0];
 	if (!nearestRoot) return null;
@@ -1488,16 +1512,22 @@ function parseAgentAcceptanceFrontmatter(raw: string | undefined, agentName: str
 	return parsed as AcceptanceInput;
 }
 
-function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
+function loadAgentsFromDir(dir: string, source: AgentSource, strictRegularFiles = false): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
-	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
+	const filePaths = listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"));
+	if (strictRegularFiles) filePaths.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+	for (const filePath of filePaths) {
 		if (isLegacyAgentSkillPath(dir, filePath)) {
 			continue;
 		}
 
 		let content: string;
 		try {
+			if (strictRegularFiles) {
+				const stat = fs.lstatSync(filePath);
+				if (!stat.isFile() || stat.isSymbolicLink()) continue;
+			}
 			content = fs.readFileSync(filePath, "utf-8");
 		} catch {
 			continue;
@@ -1731,6 +1761,59 @@ function extraUserAgentDirs(): string[] {
 		.split(path.delimiter)
 		.map((dir) => dir.trim())
 		.filter((dir) => dir.length > 0);
+}
+
+/**
+ * Restricted project-only discovery for active-bound launch. It intentionally
+ * does not inspect user/global/package roots or apply ambient agent defaults.
+ */
+export function discoverProjectAgentsRestricted(cwd: string): AgentDiscoveryResult {
+	const projectRoot = findNearestStandardProjectRoot(cwd);
+	if (!projectRoot) return { agents: [], projectAgentsDir: null };
+	const projectConfigDir = path.join(projectRoot, ".pi");
+	try {
+		const stat = fs.lstatSync(projectConfigDir);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("symlink");
+	} catch {
+		if (fs.existsSync(projectConfigDir)) throw new Error("Active-bound project config root must be a regular directory.");
+	}
+	const settingsPath = path.join(projectConfigDir, "settings.json");
+	let modelScope: ModelScopeConfig | undefined;
+	if (fs.existsSync(settingsPath)) {
+		const stat = fs.lstatSync(settingsPath);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) {
+			throw new Error(`Unsupported active-bound project settings '${settingsPath}'.`);
+		}
+		const settings = readSettingsFileStrict(settingsPath);
+		if ((Array.isArray(settings.packages) && settings.packages.length > 0)
+			|| (Array.isArray(settings.skills) && settings.skills.length > 0)) {
+			throw new Error("Active-bound project discovery does not support package or custom skill refs.");
+		}
+		const subagents = settings.subagents;
+		if (subagents !== undefined && (!subagents || typeof subagents !== "object" || Array.isArray(subagents))) {
+			throw new Error("Active-bound project subagent settings must be an object.");
+		}
+		const subagentSettings = (subagents ?? {}) as Record<string, unknown>;
+		for (const key of ["defaultModel", "defaultThinking", "defaultExtensions", "disableBuiltins", "disableThinking", "agentOverrides"]) {
+			if (key in subagentSettings) throw new Error(`Active-bound project discovery does not support '${key}'.`);
+		}
+		const rootResolution = subagentSettings.projectRootResolution;
+		if (rootResolution !== undefined && rootResolution !== "nearest") {
+			throw new Error("Active-bound project discovery only supports nearest project roots.");
+		}
+		modelScope = parseModelScopeConfig(subagentSettings.modelScope, { filePath: settingsPath });
+	}
+	const legacyDir = path.join(projectRoot, ".agents");
+	const preferredDir = path.join(projectConfigDir, "agents");
+	const safeAgentDirs = [legacyDir, preferredDir].filter((dir) => {
+		try {
+			const stat = fs.lstatSync(dir);
+			return stat.isDirectory() && !stat.isSymbolicLink() && isWithinProjectRoot(fs.realpathSync(dir), projectRoot);
+		} catch { return false; }
+	});
+	const projectAgents = safeAgentDirs.flatMap((dir) => loadAgentsFromDir(dir, "project", true));
+	const agents = mergeAgentsForScope("project", [], projectAgents).filter((agent) => agent.disabled !== true);
+	return { agents, projectAgentsDir: preferredDir, ...(modelScope !== undefined ? { modelScope } : {}) };
 }
 
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
