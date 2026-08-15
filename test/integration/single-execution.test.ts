@@ -1370,6 +1370,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const aliasCwd = path.join(tempDir, "cwd-alias"); fs.symlinkSync(tempDir, aliasCwd, "dir");
 		const base = path.join(tempDir, "bound-sessions");
 		const executionCtx = makeMinimalCtx(tempDir) as any;
+		executionCtx.isProjectTrusted = () => true;
 		executionCtx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
 		executionCtx.sessionManager.getSessionId = () => "pi-session";
 		executionCtx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }];

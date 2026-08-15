@@ -15,7 +15,9 @@ import {
 } from "./active-bound-resolver.ts";
 import { createLaunchReceiptService, type LaunchReceiptService, type LaunchReceiptV1 } from "./launch-receipt.ts";
 
-export interface ActiveBoundRuntimeContext extends Pick<ExtensionContext, "cwd" | "sessionManager" | "modelRegistry"> {}
+export interface ActiveBoundRuntimeContext extends Pick<ExtensionContext, "cwd" | "sessionManager" | "modelRegistry"> {
+	isProjectTrusted?: () => boolean;
+}
 
 export interface ActiveBoundBindingV1 {
 	version: 1;
@@ -141,6 +143,7 @@ export function createActiveBoundRuntimeService(options: CreateActiveBoundRuntim
 				availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
 				serverInstanceId: options.serverInstanceId,
 				sourceIdentityDigest: options.sourceIdentityDigest,
+				isProjectTrusted: ctx.isProjectTrusted,
 				defaultSessionDir: options.config.defaultSessionDir,
 				ownedBaseRootIdentity,
 				projectOwnedBaseAsFuture,

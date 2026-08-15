@@ -66,6 +66,12 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 		completionGuard: agent.completionGuard,
 		toolBudget: agent.toolBudget,
 		memory: agent.memory,
+		activeBoundPackageOwner: agent.activeBoundPackageOwner ? {
+			name: agent.activeBoundPackageOwner.name,
+			version: agent.activeBoundPackageOwner.version,
+			manifestDigest: agent.activeBoundPackageOwner.manifestDigest,
+		} : undefined,
+		activeBoundExtensionProjection: agent.activeBoundExtensionProjection,
 	};
 }
 
@@ -86,6 +92,7 @@ export interface LaunchBindingInput {
 	inheritSkills: boolean;
 	skills?: string[];
 	environment?: unknown;
+	packageExtensions?: unknown;
 	artifactPolicy?: unknown;
 	tools?: string[];
 	extensions?: string[];
@@ -113,6 +120,7 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		inheritSkills: input.inheritSkills,
 		skills: input.skills,
 		environment: input.environment,
+		packageExtensions: input.packageExtensions,
 		artifactPolicy: input.artifactPolicy,
 		tools: input.tools,
 		extensions: input.extensions,

@@ -5363,7 +5363,14 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const scope: AgentScope = activeBoundProof ? "project" : resolveExecutionAgentScope(effectiveParams.agentScope);
 		const effectiveCwd = effectiveParams.cwd ?? ctx.cwd;
 		const parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
-		const discovered = activeBoundProof ? discoverProjectAgentsRestricted(effectiveCwd) : deps.discoverAgents(effectiveCwd, scope);
+		let projectTrusted = false;
+		try { projectTrusted = ctx.isProjectTrusted?.() === true; } catch { projectTrusted = false; }
+		let discovered: ReturnType<ExecutorDeps["discoverAgents"]>;
+		try { discovered = activeBoundProof ? discoverProjectAgentsRestricted(effectiveCwd, projectTrusted) : deps.discoverAgents(effectiveCwd, scope); }
+		catch (error) {
+			if (activeBoundProof) return buildRequestedModeError(effectiveParams, "Active-bound launch contract changed before spawn.");
+			throw error;
+		}
 		const discoveredAgents = discovered.agents;
 		const canonicalParams = canonicalizeExecutionParams(effectiveParams, discoveredAgents);
 		if (canonicalParams.error) return buildRequestedModeError(effectiveParams, canonicalParams.error);

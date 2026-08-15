@@ -7,7 +7,7 @@ import { getAgentRefinementPath } from "../agents/agent-refinements.ts";
 import { applyThinkingSuffix, resolvePiLaunchToolPlan } from "../runs/shared/pi-args.ts";
 import { appendTurnBudgetSystemPrompt, resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
-import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
+import { capabilityCeilingAgentRestrictionMessage, type ResolvedSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import type { AvailableModelInfo } from "../runs/shared/model-fallback.ts";
 import { checkModelScope } from "../runs/shared/model-scope.ts";
 import { getSupportedThinkingLevels } from "../shared/model-info.ts";
@@ -20,6 +20,7 @@ import type { ActiveBoundPreflightRequestV1 } from "./active-bound-preflight.ts"
 import type { ActiveBoundRootIdentityV1 } from "./active-bound-runtime.ts";
 import { activeBoundPreflightRequestDigest } from "./active-bound-preflight.ts";
 import { projectActiveBoundEnvironment, type ActiveBoundEnvironmentProjectionV1 } from "./active-bound-environment.ts";
+import { resolveActiveBoundPackageExtensions, type ActiveBoundPackageExtensionProjectionV1 } from "./active-bound-package-extensions.ts";
 
 export const ACTIVE_BOUND_LAUNCH_CONTRACT_VERSION = 1 as const;
 const FIXED_CHILD_TOOLS = new Set([
@@ -43,6 +44,9 @@ export interface ResolveActiveBoundLaunchContractInput {
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	expandTilde?: (value: string) => string;
 	discover?: typeof discoverAgents;
+	projectTrusted?: boolean;
+	/** Private live trust accessor; sampled for every discovery pass. */
+	isProjectTrusted?: () => boolean;
 	/** Private executor barrier permits only the exact directory created by this launch. */
 	ownedBaseRootIdentity?: ActiveBoundRootIdentityV1;
 	projectOwnedBaseAsFuture?: boolean;
@@ -76,6 +80,8 @@ export interface ActiveBoundLaunchContractV1 {
 	taskDigest: string;
 	skills: Array<{ name: string; source: string; contentDigest: string }>;
 	environment: ActiveBoundEnvironmentProjectionV1;
+	packageExtensions: ActiveBoundPackageExtensionProjectionV1[];
+	packageExtensionsDigest: string;
 	tools: { effectiveAllowlist: string[]; requiredChildTools: string[]; disableAmbientExtensions: boolean; capabilityCeiling?: ResolvedSubagentCapabilityCeiling };
 	roots: { baseRootPathDigest: string; baseRootIdentityDigest?: string; sessionRootDigest: string; sessionDirDigest: string; sessionFileDigest: string; artifactRootDigest?: string };
 	policy: { foregroundOnly: true; async: false; clarify: false; share: false; acceptance: false; mission: false; output: false; outputMode: "inline"; artifacts: boolean; artifactDir?: "session"; watchdog: false; control: false; intercom: false; usageBudget: false; waitToolEnabled: boolean; parentDepth: number; maxSubagentDepth?: number; permissionsDigest?: string; modelScopeDigest: string };
@@ -142,10 +148,12 @@ function directoryIdentityDigest(directory: string): string | undefined {
 }
 
 function forbiddenAgentMode(agent: AgentConfig): boolean {
-	return agent.source !== "project" || agent.runner?.type === "external-cli" || Boolean(agent.fallbackModels?.length)
-		|| !Array.isArray(agent.tools) || Boolean(agent.extensions?.length) || Boolean(agent.subagentOnlyExtensions?.length)
-		|| Boolean(agent.skillPath?.length) || agent.inheritProjectContext || agent.inheritSkills || Boolean(agent.memory)
-		|| Boolean(agent.defaultReads?.length) || agent.defaultAsync === true || agent.defaultAcceptance !== undefined || agent.output !== undefined
+	const extensionOwnerInvalid = agent.extensions !== undefined
+		|| (agent.source !== "package" && agent.subagentOnlyExtensions !== undefined);
+	return (agent.source !== "project" && agent.source !== "package") || agent.runner?.type === "external-cli" || Boolean(agent.fallbackModels?.length)
+		|| !Array.isArray(agent.tools) || extensionOwnerInvalid
+		|| Boolean(agent.skillPath?.length) || (agent.source === "package" && Boolean(agent.skills?.length)) || agent.inheritProjectContext || agent.inheritSkills || Boolean(agent.memory)
+		|| Boolean(agent.defaultReads?.length) || (agent.source === "package" && agent.defaultContext === "fork") || agent.defaultAsync === true || agent.defaultAcceptance !== undefined || (agent.source === "package" && agent.acceptanceRole !== undefined) || agent.output !== undefined
 		|| Boolean(agent.tools.some((tool) => tool === "subagent" || tool.startsWith("mcp:") || tool.includes("/") || /\.(?:ts|js)$/u.test(tool)))
 		|| Boolean(agent.mcpDirectTools?.length);
 }
@@ -219,9 +227,21 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		try { fs.lstatSync(artifactRoot); return failure("host_required"); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return failure("host_required"); }
 	}
+	const discoverRestricted = () => {
+		if (input.discover) return input.discover(requestCwd, "project");
+		let trusted = input.projectTrusted === true;
+		if (input.isProjectTrusted) { try { trusted = input.isProjectTrusted() === true; } catch { trusted = false; } }
+		return discoverProjectAgentsRestricted(requestCwd, trusted);
+	};
 	let discovered: ReturnType<typeof discoverAgents>;
-	try { discovered = (input.discover ?? discoverProjectAgentsRestricted)(requestCwd, "project"); }
-	catch { return failure("unsupported_mode"); }
+	try {
+		discovered = discoverRestricted();
+		for (const candidate of discovered.agents) if (candidate.source === "package") {
+			const extensions = resolveActiveBoundPackageExtensions(candidate);
+			candidate.activeBoundResolvedExtensions = extensions.paths;
+			candidate.activeBoundExtensionProjection = extensions.projection;
+		}
+	} catch { return failure("unsupported_mode"); }
 	const resolved = resolveAgentName(input.request.agent, discovered.agents);
 	if (resolved.error) return failure("ambiguous_agent");
 	if (!resolved.agent) return failure("missing_agent");
@@ -248,22 +268,30 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const skillNames = explicitSkills === false ? [] : explicitSkills ?? agent.skills ?? [];
 	const resolvedSkills = resolveProjectSkillsUncached(skillNames, requestCwd);
 	if (resolvedSkills.missing.length > 0) return failure("missing_skill");
-	const boundCeiling = intersectSubagentCapabilityCeilings(input.capabilityCeiling, {
-		version: 1, denyExtensions: true, sources: ["active-bound-v1"],
-	});
+	let packageExtensions;
+	try { packageExtensions = resolveActiveBoundPackageExtensions(agent); }
+	catch { return failure("unsupported_mode"); }
+	if (agent.source === "package") {
+		agent.activeBoundResolvedExtensions = packageExtensions.paths;
+		agent.activeBoundExtensionProjection = packageExtensions.projection;
+	}
+	if (packageExtensions.paths.length > 0 && input.capabilityCeiling?.denyExtensions) return failure("restricted_agent");
+	const boundCeiling = input.capabilityCeiling;
 	const explicitAgentTools = agent.tools ?? [];
 	if (explicitAgentTools.some((tool) => !FIXED_CHILD_TOOLS.has(tool))) return failure("unsupported_mode");
 	const boundTools = resolvedSkills.resolved.length > 0 && !explicitAgentTools.includes("read") ? ["read", ...explicitAgentTools] : explicitAgentTools;
 	let toolPlan;
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
-			tools: boundTools, cwd: requestCwd, requireReadTool: resolvedSkills.resolved.length > 0,
+			tools: boundTools, extensions: [], subagentOnlyExtensions: packageExtensions.paths,
+			cwd: requestCwd, requireReadTool: resolvedSkills.resolved.length > 0,
 			structuredOutput: input.request.result.kind === "structured", capabilityCeiling: boundCeiling, agentName: agent.name,
+			disablePermissionSystemExtension: true,
 		});
 	} catch { return failure("restricted_agent"); }
 	if (!toolPlan.explicitToolAllowlist || !toolPlan.disableAmbientExtensions || toolPlan.fanoutAuthorized
 		|| (resolvedSkills.resolved.length > 0 && !toolPlan.effectiveToolAllowlist.includes("read"))
-		|| toolPlan.extensionArgs.some((entry) => !toolPlan.runtimeExtensions.includes(entry))) return failure("unsupported_mode");
+		|| toolPlan.extensionArgs.some((entry) => !toolPlan.runtimeExtensions.includes(entry) && !packageExtensions.paths.includes(entry))) return failure("unsupported_mode");
 	let skillEvidence: ActiveBoundLaunchContractV1["skills"];
 	let agentBytesDigest: string;
 	try {
@@ -302,7 +330,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		definitionDigest, task: input.request.task,
 		modelCandidates: [materializedModel], thinking: input.request.thinking, systemPrompt,
 		systemPromptMode: agent.systemPromptMode, inheritProjectContext: agent.inheritProjectContext, inheritSkills: agent.inheritSkills,
-		skills: skillNames, environment, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: agent.subagentOnlyExtensions ?? [], mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
+		skills: skillNames, environment, packageExtensions: packageExtensions.projection, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: packageExtensions.paths, mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
 		outputMode: "inline" as const, ...(input.request.result.kind === "structured" ? { structuredOutputSchema: input.request.result.schema } : {}),
 	};
 	const base: Omit<ActiveBoundLaunchContractV1, "digest"> = {
@@ -312,6 +340,8 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		model: input.request.model, modelRegistryDigest, modelCandidates: [materializedModel], thinking: input.request.thinking, context: "fresh", taskDigest: canonicalSha256(input.request.task),
 		skills: skillEvidence,
 		environment,
+		packageExtensions: packageExtensions.projection,
+		packageExtensionsDigest: canonicalSha256(packageExtensions.projection),
 		tools: { effectiveAllowlist: toolPlan.effectiveToolAllowlist, requiredChildTools: toolPlan.requiredChildTools, disableAmbientExtensions: toolPlan.disableAmbientExtensions, ...(boundCeiling ? { capabilityCeiling: boundCeiling } : {}) },
 		roots: {
 			baseRootPathDigest: canonicalSha256(baseRoot),
@@ -356,8 +386,23 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 				|| existing.dev !== input.ownedSessionDirIdentity.dev || existing.ino !== input.ownedSessionDirIdentity.ino) return failure("host_required");
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" || input.ownedSessionDirIdentity) return failure("host_required"); }
 		if (freshBaseRoot !== baseRoot || freshSessionRoot !== sessionRoot || freshSessionDir !== sessionDir || freshSessionFile !== sessionFile) return failure("host_required");
-		const freshDiscovery = (input.discover ?? discoverProjectAgentsRestricted)(requestCwd, "project");
+		const freshDiscovery = discoverRestricted();
+		for (const candidate of freshDiscovery.agents) if (candidate.source === "package") {
+			const extensions = resolveActiveBoundPackageExtensions(candidate);
+			candidate.activeBoundResolvedExtensions = extensions.paths;
+			candidate.activeBoundExtensionProjection = extensions.projection;
+		}
 		const freshResolved = resolveAgentName(input.request.agent, freshDiscovery.agents);
+		if (freshResolved.agent) {
+			const freshPackageExtensions = resolveActiveBoundPackageExtensions(freshResolved.agent);
+			if (freshResolved.agent.source === "package") {
+				freshResolved.agent.activeBoundResolvedExtensions = freshPackageExtensions.paths;
+				freshResolved.agent.activeBoundExtensionProjection = freshPackageExtensions.projection;
+			}
+			if (canonicalSha256(freshPackageExtensions.projection) !== canonicalSha256(packageExtensions.projection)
+				|| freshPackageExtensions.paths.length !== packageExtensions.paths.length
+				|| freshPackageExtensions.paths.some((entry, index) => entry !== packageExtensions.paths[index])) return failure("unsupported_mode");
+		}
 		if (freshResolved.error || !freshResolved.agent || freshResolved.agent.name !== agent.name
 			|| agentDefinitionDigest(freshResolved.agent) !== definitionDigest
 			|| fileDigest(freshResolved.agent.filePath) !== agentBytesDigest

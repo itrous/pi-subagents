@@ -151,6 +151,7 @@ export interface BuildPiArgsInput {
 	childWatchdog?: ChildWatchdogConfig;
 	waitToolEnabled?: boolean;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	disablePermissionSystemExtension?: boolean;
 }
 
 export interface BuildPiArgsResult {
@@ -216,6 +217,7 @@ export interface ResolvePiLaunchToolPlanInput {
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	agentName?: string;
+	disablePermissionSystemExtension?: boolean;
 }
 
 export interface PiLaunchToolPlan {
@@ -407,7 +409,7 @@ export function resolvePiLaunchToolPlan(
 				]),
 			]
 		: [];
-	const permSystemExt = capabilityCeiling?.denyExtensions
+	const permSystemExt = capabilityCeiling?.denyExtensions || input.disablePermissionSystemExtension
 		? undefined
 		: resolvePermissionSystemExtension();
 	const runtimeExtensions = [
@@ -545,6 +547,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 			process.env[SUBAGENT_CAPABILITY_CEILING_ENV],
 		),
 		agentName: input.childAgentName,
+		disablePermissionSystemExtension: input.disablePermissionSystemExtension,
 	});
 	if (toolPlan.explicitToolAllowlist) {
 		args.push(

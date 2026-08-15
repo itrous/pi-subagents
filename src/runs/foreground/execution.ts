@@ -8,6 +8,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
+import { resolveActiveBoundPackageExtensions, type ActiveBoundResolvedPackageExtensions } from "../../api/active-bound-package-extensions.ts";
 import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts";
 import { alignForkedSessionCwd } from "../../shared/fork-context.ts";
 import {
@@ -309,6 +310,14 @@ async function runSingleAttempt(
 		})
 		: undefined;
 	const permissionRules = resolvePermissionRules(options.permissions, agent.permissions);
+	let boundPackageExtensions: ActiveBoundResolvedPackageExtensions | undefined;
+	try { boundPackageExtensions = options.activeBoundProjectSkills ? resolveActiveBoundPackageExtensions(agent) : undefined; }
+	catch { throw new Error("Active-bound launch contract changed before spawn."); }
+	if (boundPackageExtensions && agent.source === "package") {
+		agent.activeBoundResolvedExtensions = boundPackageExtensions.paths;
+		agent.activeBoundExtensionProjection = boundPackageExtensions.projection;
+	}
+	const launchSubagentOnlyExtensions = boundPackageExtensions?.paths ?? agent.subagentOnlyExtensions;
 	const launchTools = options.launchToolsOverride ?? agent.tools;
 	const permissionAuditPath = permissionRules && options.artifactsDir
 		? path.join(options.artifactsDir, "permission-audit", `${options.runId}-${options.index ?? 0}.jsonl`)
@@ -326,8 +335,8 @@ async function runSingleAttempt(
 		inheritSkills: agent.inheritSkills,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
 		tools: launchTools,
-		extensions: agent.extensions,
-		subagentOnlyExtensions: agent.subagentOnlyExtensions,
+		extensions: options.activeBoundProjectSkills ? [] : agent.extensions,
+		subagentOnlyExtensions: launchSubagentOnlyExtensions,
 		systemPrompt: appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget),
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
@@ -350,13 +359,14 @@ async function runSingleAttempt(
 		childWatchdog,
 		waitToolEnabled: options.waitToolEnabled,
 		capabilityCeiling: options.capabilityCeiling,
+		disablePermissionSystemExtension: options.activeBoundProjectSkills,
 	});
 
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: launchTools,
-		extensions: agent.extensions,
-		subagentOnlyExtensions: agent.subagentOnlyExtensions,
+		extensions: options.activeBoundProjectSkills ? [] : agent.extensions,
+		subagentOnlyExtensions: launchSubagentOnlyExtensions,
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
@@ -364,6 +374,7 @@ async function runSingleAttempt(
 		capabilityCeiling: options.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agent.name,
+		disablePermissionSystemExtension: options.activeBoundProjectSkills,
 	});
 	const launchResolvedExtensions = projectLaunchResolvedChildExtensions(toolPlan);
 	const launchContractDigest = launchBindingDigest({
@@ -378,10 +389,11 @@ async function runSingleAttempt(
 		inheritSkills: agent.inheritSkills,
 		skills: shared.resolvedSkillNames ?? [],
 		...(options.activeBoundEnvironment !== undefined ? { environment: projectActiveBoundEnvironment(options.activeBoundEnvironment) } : {}),
+		...(boundPackageExtensions ? { packageExtensions: boundPackageExtensions.projection } : {}),
 		...(options.activeBoundEnvironment !== undefined ? { artifactPolicy: options.deferArtifactsUntilSpawn ? { enabled: true, dir: "session", root: options.artifactsDir, includeInput: options.artifactConfig?.includeInput !== false, includeOutput: options.artifactConfig?.includeOutput !== false, includeJsonl: options.artifactConfig?.includeJsonl !== false, includeTranscript: options.artifactConfig?.includeTranscript !== false, includeMetadata: options.artifactConfig?.includeMetadata !== false } : { enabled: false } } : {}),
 		tools: toolPlan.effectiveToolAllowlist,
 		extensions: toolPlan.extensionArgs,
-		subagentOnlyExtensions: options.activeBoundProjectSkills ? agent.subagentOnlyExtensions ?? [] : undefined,
+		subagentOnlyExtensions: options.activeBoundProjectSkills ? launchSubagentOnlyExtensions ?? [] : undefined,
 		mcpDirectTools: toolPlan.effectiveMcpTools,
 		permissionRules: options.activeBoundProjectSkills ? permissionRules : undefined,
 		...(options.outputPath ? { outputPath: options.outputPath } : {}),

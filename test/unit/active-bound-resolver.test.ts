@@ -37,7 +37,7 @@ function setup(cwd: string): { agent: string; skill: string } {
 function input(cwd: string, req = request(cwd)): ResolveActiveBoundLaunchContractInput {
 	return {
 		request: req, activeCwd: cwd, sessionManager: { getSessionFile: () => path.join(root, "sessions", "parent.jsonl"), getSessionId: () => "pi-session" },
-		availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: true }], serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "child-sessions"),
+		projectTrusted: true, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: true }], serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "child-sessions"),
 		runtimePolicy: { foregroundTimeoutMs: 30 * 60 * 1000, waitToolEnabled: true },
 	};
 }

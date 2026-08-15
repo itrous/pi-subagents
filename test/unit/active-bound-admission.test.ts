@@ -20,6 +20,7 @@ function fixture(config: Record<string, unknown> = {}) {
 	assert.equal(request.ok, true);
 	const ctx = {
 		cwd: project,
+		isProjectTrusted: () => true,
 		sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "pi-session" },
 		modelRegistry: { getAvailable: () => [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }] },
 	} as any;
