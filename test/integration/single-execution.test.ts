@@ -54,6 +54,12 @@ import {
 } from "../../src/runs/shared/pi-args.ts";
 import { createNestedRoute, nestedRouteEnv, parseNestedEventRecords } from "../../src/runs/shared/nested-events.ts";
 
+function makeTrustedCtx(cwd: string): ReturnType<typeof makeMinimalCtx> {
+	const ctx = makeMinimalCtx(cwd);
+	ctx.isProjectTrusted = () => true;
+	return ctx;
+}
+
 interface ModelAttempt {
 	success?: boolean;
 	exitCode?: number;
@@ -1459,7 +1465,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
 		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\nfallbackModels:\n  - test/fallback\n---\nEcho.\n");
 		const base = path.join(tempDir, "bound-sessions"); const runtime = { claimBase: () => true, recheck: () => true } as any;
-		const ctx = makeMinimalCtx(tempDir) as any; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact" }, { provider: "test", id: "fallback" }];
+		const ctx = makeTrustedCtx(tempDir) as any; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact" }, { provider: "test", id: "fallback" }];
 		const executor = makeExecutor([makeAgent("echo", { fallbackModels: ["test/fallback"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
 		const params = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
 		mockPi.onCall({ jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "temporary provider failure" }], model: "test/exact", errorMessage: "rate limit exceeded", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }], exitCode: 1 });
@@ -1479,13 +1485,13 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
 		const runId = "123e4567-e89b-12d3-a456-426614174002";
 		const makeParams = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
-		const rejected = await executor.executeDelegated("bound-drift", makeParams(runId), new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const rejected = await executor.executeDelegated("bound-drift", makeParams(runId), new AbortController().signal, undefined, makeTrustedCtx(tempDir));
 		assert.equal(rejected.isError, true);
 		assert.equal(mockPi.callCount(), 0);
 		assert.equal(fs.existsSync(path.join(base, runId)), false);
 		checks = 10;
 		mockPi.onCall({ output: "retry ok" });
-		const retried = await executor.executeDelegated("bound-retry", makeParams("123e4567-e89b-12d3-a456-426614174005"), new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const retried = await executor.executeDelegated("bound-retry", makeParams("123e4567-e89b-12d3-a456-426614174005"), new AbortController().signal, undefined, makeTrustedCtx(tempDir));
 		assert.equal(retried.isError, undefined, JSON.stringify(retried));
 		assert.equal(mockPi.callCount(), 1);
 	});
@@ -1498,7 +1504,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const runtime = { claimBase: () => true, recheck: () => { checks++; if (checks !== 2) return true; fs.rmSync(rootPath, { recursive: true }); fs.mkdirSync(rootPath); fs.writeFileSync(path.join(rootPath, "sentinel"), "keep"); return false; } } as any;
 		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
 		const proof = { version: 1, request: { prospectiveRunId: runId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any;
-		const result = await executor.executeDelegated("bound-replaced", { agent: "echo", task: "Bound", context: "fresh", cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false, mission: false, delegatedThinkingOverride: "off", activeBoundProof: proof, async: false, foregroundOnly: true, clarify: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const result = await executor.executeDelegated("bound-replaced", { agent: "echo", task: "Bound", context: "fresh", cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false, mission: false, delegatedThinkingOverride: "off", activeBoundProof: proof, async: false, foregroundOnly: true, clarify: false }, new AbortController().signal, undefined, makeTrustedCtx(tempDir));
 		assert.equal(result.isError, true);
 		assert.equal(fs.readFileSync(path.join(rootPath, "sentinel"), "utf8"), "keep");
 		assert.equal(mockPi.callCount(), 0);
@@ -1515,12 +1521,12 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const previousBinary = process.env[PI_SUBAGENT_PI_BINARY_ENV];
 		process.env[PI_SUBAGENT_PI_BINARY_ENV] = path.join(tempDir, "missing-pi");
 		let failed;
-		try { failed = await executor.executeDelegated("bound-error", params(runId), new AbortController().signal, undefined, makeMinimalCtx(tempDir)); }
+		try { failed = await executor.executeDelegated("bound-error", params(runId), new AbortController().signal, undefined, makeTrustedCtx(tempDir)); }
 		finally { if (previousBinary === undefined) delete process.env[PI_SUBAGENT_PI_BINARY_ENV]; else process.env[PI_SUBAGENT_PI_BINARY_ENV] = previousBinary; }
 		assert.equal(failed.isError, true);
 		assert.equal(fs.existsSync(path.join(base, runId)), false);
 		mockPi.onCall({ output: "retry ok" });
-		const retried = await executor.executeDelegated("bound-error-retry", params("123e4567-e89b-12d3-a456-426614174006"), new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const retried = await executor.executeDelegated("bound-error-retry", params("123e4567-e89b-12d3-a456-426614174006"), new AbortController().signal, undefined, makeTrustedCtx(tempDir));
 		assert.equal(retried.isError, undefined, JSON.stringify(retried));
 		assert.equal(mockPi.callCount(), 1);
 	});
