@@ -7,6 +7,7 @@ import { discoverProjectAgentsRestricted } from "../../src/agents/agents.ts";
 import { resolveActiveBoundPackageExtensions } from "../../src/api/active-bound-package-extensions.ts";
 import { resolveActiveBoundLaunchContract } from "../../src/api/active-bound-resolver.ts";
 import { resolvePiLaunchToolPlan } from "../../src/runs/shared/pi-args.ts";
+import { packageEvidenceRoot, packageTreeDigest } from "../../src/runs/shared/package-tree-evidence.ts";
 
 let root: string; let previousAgentDir: string | undefined;
 function writeJson(file: string, value: unknown): void { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(value)); }
@@ -28,6 +29,18 @@ beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), "bound-package-"
 afterEach(() => { if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("active-bound package extension refs", () => {
+	it("uses the exact owning package rather than the whole npm ecosystem as evidence root", () => {
+		const packageRoot = path.join(root, "npm", "node_modules", "owner", "node_modules", "adapter");
+		assert.equal(packageEvidenceRoot(packageRoot), packageRoot);
+	});
+
+	it("bounds package evidence directory depth", () => {
+		const evidenceRoot = path.join(root, "deep-package"); fs.mkdirSync(evidenceRoot); writeJson(path.join(evidenceRoot, "package.json"), { name: "deep-package", version: "1.0.0" });
+		const entry = path.join(evidenceRoot, "entry.ts"); fs.writeFileSync(entry, "export default 1;\n");
+		let current = evidenceRoot; for (let index = 0; index < 66; index++) { current = path.join(current, "d"); fs.mkdirSync(current); }
+		assert.throws(() => packageTreeDigest(entry, evidenceRoot), /too deep/);
+	});
+
 	it("discovers only the active settings package and resolves refs without importing code", () => {
 		const f = fixture();
 		const unregistered = path.join(f.project, "node_modules", "ambient"); fs.mkdirSync(unregistered, { recursive: true });
@@ -46,7 +59,7 @@ describe("active-bound package extension refs", () => {
 	it("publishes only the bound projection and rejects an external extension ceiling", () => {
 		const f = fixture(); const sessions = path.join(root, "sessions"); fs.mkdirSync(sessions);
 		const request = { version: 1 as const, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: "request", ownerRunId: "owner", nodeId: "node", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", agent: "package-worker", task: "Inspect", cwd: f.project, context: "fresh" as const, model: "test/exact", thinking: "off" as const, artifacts: false, result: { kind: "text" as const } };
-		const input = { request, activeCwd: f.project, projectTrusted: true, sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "session" }, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }], serverInstanceId: request.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), defaultSessionDir: sessions, runtimePolicy: { foregroundTimeoutMs: 1000, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1 } };
+		const input = { request, activeCwd: f.project, projectTrusted: true, sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "session" }, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }], serverInstanceId: request.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), defaultSessionDir: sessions, runtimePolicy: { foregroundTimeoutMs: 1000, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1 } };
 		const resolved = resolveActiveBoundLaunchContract(input); assert.equal(resolved.ok, true); if (!resolved.ok) return;
 		assert.equal(resolved.contract.packageExtensions.length, 2); const serialized = JSON.stringify(resolved.contract);
 		assert.doesNotMatch(serialized, new RegExp(f.owner.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -60,6 +73,14 @@ describe("active-bound package extension refs", () => {
 		assert.notEqual(first.projection[0]!.contentDigest, second.projection[0]!.contentDigest);
 		const denied = resolvePiLaunchToolPlan({ tools: ["read"], extensions: [], subagentOnlyExtensions: second.paths, capabilityCeiling: { version: 1, denyExtensions: true, sources: ["test"] }, disablePermissionSystemExtension: true });
 		assert.deepEqual(denied.configuredExtensions, []); assert.equal(denied.capabilityAudit?.removedExtensionCount, 2);
+	});
+
+	it("binds transitive package-tree byte mutations", () => {
+		const f = fixture(); const agent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		const first = resolveActiveBoundPackageExtensions(agent);
+		fs.writeFileSync(path.join(f.owner, "node_modules", "fixture-adapter", "helper.ts"), "export const drift = 1;\n");
+		const second = resolveActiveBoundPackageExtensions(discoverProjectAgentsRestricted(f.project, true).agents[0]!);
+		assert.notEqual(first.projection.find((entry) => entry.kind === "package")!.packageTreeDigest, second.projection.find((entry) => entry.kind === "package")!.packageTreeDigest);
 	});
 
 	it("supports a hoisted dependency and bare-relative manifest entry", () => {

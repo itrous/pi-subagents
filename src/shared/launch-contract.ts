@@ -93,6 +93,8 @@ export interface LaunchBindingInput {
 	skills?: string[];
 	environment?: unknown;
 	packageExtensions?: unknown;
+	piCommandEvidence?: unknown;
+	toolRegistry?: unknown;
 	artifactPolicy?: unknown;
 	tools?: string[];
 	extensions?: string[];
@@ -121,6 +123,8 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		skills: input.skills,
 		environment: input.environment,
 		packageExtensions: input.packageExtensions,
+		piCommandEvidence: input.piCommandEvidence,
+		toolRegistry: input.toolRegistry,
 		artifactPolicy: input.artifactPolicy,
 		tools: input.tools,
 		extensions: input.extensions,

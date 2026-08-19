@@ -91,7 +91,9 @@ export type SubagentDelegationStatus =
 	| "acceptance_failed"
 	| "invalid_request"
 	| "unavailable_context"
-	| "duplicate_node";
+	| "duplicate_node"
+	| "native_tool_registry_mismatch"
+	| "native_tool_registry_protocol_error";
 
 export type SubagentDelegationValue =
 	| { kind: "text"; text: string }
@@ -117,6 +119,11 @@ export interface SubagentDelegationTerminalResponse extends SubagentDelegationSt
 	thinking?: string;
 	exitCode?: number;
 	launchContractDigest?: string;
+	toolRegistry?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProjectionV1;
+	toolsMissing?: string[];
+	toolsExtra?: string[];
+	toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+	transportIncomplete?: boolean;
 	result?: SubagentDelegationValue;
 	usage?: SubagentDelegationUsage;
 }

@@ -37,7 +37,7 @@ function setup(cwd: string): { agent: string; skill: string } {
 function input(cwd: string, req = request(cwd)): ResolveActiveBoundLaunchContractInput {
 	return {
 		request: req, activeCwd: cwd, sessionManager: { getSessionFile: () => path.join(root, "sessions", "parent.jsonl"), getSessionId: () => "pi-session" },
-		projectTrusted: true, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: true }], serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "child-sessions"),
+		projectTrusted: true, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: true }], serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "child-sessions"),
 		runtimePolicy: { foregroundTimeoutMs: 30 * 60 * 1000, waitToolEnabled: true },
 	};
 }
@@ -68,6 +68,11 @@ describe("restricted active-bound resolver", () => {
 		assert.deepEqual(first.contract.modelCandidates, ["test/exact:high"]);
 		assert.equal(first.contract.policy.artifacts, false);
 		assert.equal(first.contract.tools.disableAmbientExtensions, true);
+		assert.equal(first.contract.toolRegistry.modelApi, "openai-responses");
+		assert.equal(first.contract.toolRegistry.piRuntimeVersion, "0.84.2");
+		assert.deepEqual(first.contract.toolRegistry.projection.effectiveCallerTools, ["read"]);
+		assert.deepEqual(first.contract.toolRegistry.projection.missing, []);
+		assert.match(first.contract.toolRegistry.digest, /^[0-9a-f]{64}$/);
 		assert.equal(first.contract.timeoutMs, 30 * 60 * 1000);
 		assert.equal(first.contract.agent.definitionDigest, agentDefinitionDigest(discoverAgents(cwd, "both").agents.find((agent) => agent.name === "bound-worker")!));
 		assert.equal(Object.hasOwn(first.contract.agent, "filePath"), false);
@@ -93,7 +98,7 @@ describe("restricted active-bound resolver", () => {
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), sourceIdentityDigest: "" }), { ok: false, code: "unverified_source" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), serverInstanceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), { ok: false, code: "unverified_source" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), availableModels: [{ provider: "test", id: "other", fullId: "test/other" }] }), { ok: false, code: "unavailable_model" });
-		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }] }), { ok: false, code: "unavailable_model" });
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }] }), { ok: false, code: "unavailable_model" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), activeCwd: root }), { ok: false, code: "invalid_cwd" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), sessionManager: { getSessionFile: () => null, getSessionId: () => "pi" }, defaultSessionDir: undefined }), { ok: false, code: "host_required" });
 		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(cwd), sessionManager: { getSessionFile: () => null, getSessionId: () => null } }), { ok: false, code: "host_required" });

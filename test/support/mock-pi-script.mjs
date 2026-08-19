@@ -1,7 +1,43 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 
 const queueDir = process.env.MOCK_PI_QUEUE_DIR;
+
+function canonicalJson(value) {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+
+function writeBoundToolRegistryProof(response) {
+	if (response.skipBoundToolRegistryProof) return;
+	const encoded = process.env.PI_SUBAGENT_TOOL_REGISTRY_POLICY;
+	const fd = Number(process.env.PI_SUBAGENT_TOOL_REGISTRY_FD);
+	if (!encoded || !Number.isInteger(fd) || fd < 3) return;
+	const policy = JSON.parse(encoded);
+	const actual = Array.isArray(response.boundToolRegistryNames) ? [...response.boundToolRegistryNames].sort() : [...policy.required].sort();
+	const internal = new Set(policy.internalTools);
+	const actualSet = new Set(actual);
+	const base = {
+		version: 1, projectionVersion: 1, required: [...policy.required].sort(),
+		effectiveCallerTools: actual.filter((name) => !internal.has(name)),
+		internalTools: actual.filter((name) => internal.has(name)),
+		missing: Array.isArray(response.boundToolRegistryMissing)
+			? [...response.boundToolRegistryMissing].sort()
+			: [...policy.required].sort().filter((name) => !actualSet.has(name)),
+	};
+	const projection = { ...base, digest: createHash("sha256").update(canonicalJson(base)).digest("hex") };
+	fs.writeSync(fd, `${JSON.stringify({ version: 1, kind: "registry", projection, proofNonce: response.boundToolRegistryNonce ?? policy.proofNonce })}\n`);
+	if (Number.isFinite(response.holdBoundToolRegistryFdMs) && response.holdBoundToolRegistryFdMs > 0) {
+		const holder = spawn(process.execPath, ["-e", `setTimeout(() => {}, ${Math.ceil(response.holdBoundToolRegistryFdMs)})`], {
+			stdio: ["ignore", "ignore", "ignore", fd],
+		});
+		holder.unref();
+	}
+	fs.closeSync(fd);
+}
 
 function exitAfterFlush(code) {
 	// process.exit() can truncate buffered stdout/stderr on slow runners (e.g.
@@ -356,6 +392,7 @@ async function main() {
 	writeDeclaredFiles(response);
 	writeStructuredOutputCapture(response);
 	writeRuntimeAcknowledgedExtensions(response);
+	writeBoundToolRegistryProof(response);
 
 	if (Array.isArray(response.steps) && response.steps.length > 0) {
 		for (const step of response.steps) {

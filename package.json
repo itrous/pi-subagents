@@ -41,6 +41,7 @@
   "files": [
     "index.ts",
     "src/**/*.ts",
+    "src/**/*.cjs",
     "*.mjs",
     "agents/",
     "skills/**/*",

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import type { AgentConfig, ActiveBoundPackageIdentity } from "../agents/agents.ts";
+import { packageEvidenceRoot, packageTreeDigest } from "../runs/shared/package-tree-evidence.ts";
 
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_REFS = 16;
@@ -16,11 +17,15 @@ export interface ActiveBoundPackageExtensionProjectionV1 {
 	package?: { name: string; version: string; manifestDigest: string };
 	entryDigest: string;
 	contentDigest: string;
+	packageTreeDigest: string;
+	evidenceRootDigest: string;
 }
 
 export interface ActiveBoundResolvedPackageExtensions {
 	paths: string[];
 	projection: ActiveBoundPackageExtensionProjectionV1[];
+	/** Private path/digest pairs in factory execution order. */
+	attestations: Array<{ path: string; contentDigest: string; evidenceRoot: string; evidenceRootDigest: string; packageTreeDigest: string }>;
 }
 
 function digest(bytes: Buffer | string): string {
@@ -106,15 +111,21 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 	const refs = agent.subagentOnlyExtensions ?? [];
 	if (agent.source !== "package" || !agent.activeBoundPackageOwner) {
 		if (refs.length) throw new Error("Only package agents may own active-bound extension refs.");
-		return { paths: [], projection: [] };
+		return { paths: [], projection: [], attestations: [] };
 	}
 	if (refs.length > MAX_REFS || new Set(refs).size !== refs.length) throw new Error("Invalid active-bound extension refs.");
-	const owner = agent.activeBoundPackageOwner; const paths: string[] = []; const projection: ActiveBoundPackageExtensionProjectionV1[] = [];
+	const owner = agent.activeBoundPackageOwner; const paths: string[] = []; const projection: ActiveBoundPackageExtensionProjectionV1[] = []; const evidenceRootByPath = new Map<string, string>();
+	const treeDigestByRoot = new Map<string, string>();
+	const treeDigest = (entry: string, evidenceRoot: string): string => {
+		const cached = treeDigestByRoot.get(evidenceRoot); if (cached) return cached;
+		const measured = packageTreeDigest(entry, evidenceRoot); treeDigestByRoot.set(evidenceRoot, measured); return measured;
+	};
 	for (const ref of refs) {
 		if (typeof ref !== "string") throw new Error("Invalid active-bound extension ref.");
 		if (safeRelative(ref)) {
 			const entry = regularCanonicalFile(path.resolve(path.dirname(agent.filePath), ref), owner.rootPath);
-			paths.push(entry.path); projection.push({ kind: "relative", ref, owner: publicIdentity(owner), entryDigest: digest(ref), contentDigest: digest(entry.bytes) });
+			const evidenceRoot = packageEvidenceRoot(owner.rootPath);
+			paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "relative", ref, owner: publicIdentity(owner), entryDigest: digest(ref), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 			continue;
 		}
 		if (!ref.startsWith("package:")) throw new Error("Invalid active-bound extension ref.");
@@ -128,8 +139,19 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 		const entries = (pi as { extensions?: unknown }).extensions;
 		if (!Array.isArray(entries) || entries.length !== 1 || typeof entries[0] !== "string" || !safeManifestEntry(entries[0], dependency.identity.rootPath)) throw new Error("Ambiguous active-bound dependency extension entry.");
 		const entry = regularCanonicalFile(path.resolve(dependency.identity.rootPath, entries[0]), dependency.identity.rootPath);
-		paths.push(entry.path); projection.push({ kind: "package", ref, owner: publicIdentity(owner), package: publicIdentity(dependency.identity), entryDigest: digest(entries[0]), contentDigest: digest(entry.bytes) });
+		const evidenceRoot = packageEvidenceRoot(dependency.identity.rootPath);
+		paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "package", ref, owner: publicIdentity(owner), package: publicIdentity(dependency.identity), entryDigest: digest(entries[0]), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 	}
 	if (new Set(paths).size !== paths.length) throw new Error("Duplicate active-bound extension entry.");
-	return { paths, projection: projection.sort((left, right) => left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0) };
+	const evidenceByPath = new Map(paths.map((entry, index) => {
+		const projected = projection[index]!; const evidenceRoot = evidenceRootByPath.get(entry)!;
+		return [entry, { contentDigest: projected.contentDigest, evidenceRoot, evidenceRootDigest: projected.evidenceRootDigest, packageTreeDigest: projected.packageTreeDigest }];
+	}));
+	const attestations = paths.map((entry) => ({ path: entry, ...evidenceByPath.get(entry)! }));
+	if (Buffer.byteLength(JSON.stringify(attestations), "utf8") > 48 * 1024) throw new Error("Active-bound package evidence policy is too large.");
+	return {
+		paths,
+		projection: projection.sort((left, right) => left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0),
+		attestations,
+	};
 }

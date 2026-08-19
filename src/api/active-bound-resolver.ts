@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
+import { VERSION as PI_RUNTIME_VERSION } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { discoverAgents, discoverProjectAgentsRestricted, resolveAgentName, type AgentConfig } from "../agents/agents.ts";
 import { buildBoundSkillInjection, normalizeSkillInput, resolveProjectSkillsUncached } from "../agents/skills.ts";
 import { getAgentRefinementPath } from "../agents/agent-refinements.ts";
-import { applyThinkingSuffix, resolvePiLaunchToolPlan } from "../runs/shared/pi-args.ts";
+import { applyThinkingSuffix, attestBoundRuntimeExtensions, resolvePiLaunchToolPlan } from "../runs/shared/pi-args.ts";
 import { appendTurnBudgetSystemPrompt, resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { capabilityCeilingAgentRestrictionMessage, type ResolvedSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
@@ -21,6 +22,8 @@ import type { ActiveBoundRootIdentityV1 } from "./active-bound-runtime.ts";
 import { activeBoundPreflightRequestDigest } from "./active-bound-preflight.ts";
 import { projectActiveBoundEnvironment, type ActiveBoundEnvironmentProjectionV1 } from "./active-bound-environment.ts";
 import { resolveActiveBoundPackageExtensions, type ActiveBoundPackageExtensionProjectionV1 } from "./active-bound-package-extensions.ts";
+import { attestPiSpawnCommand } from "../runs/shared/pi-command-evidence.ts";
+import { expectedToolRegistryProjection, SUPPORTED_BOUND_MODEL_APIS, SUPPORTED_BOUND_PI_VERSIONS, type ToolRegistryProjectionV1 } from "../runs/shared/tool-registry-proof.ts";
 
 export const ACTIVE_BOUND_LAUNCH_CONTRACT_VERSION = 1 as const;
 const FIXED_CHILD_TOOLS = new Set([
@@ -83,6 +86,8 @@ export interface ActiveBoundLaunchContractV1 {
 	packageExtensions: ActiveBoundPackageExtensionProjectionV1[];
 	packageExtensionsDigest: string;
 	tools: { effectiveAllowlist: string[]; requiredChildTools: string[]; disableAmbientExtensions: boolean; capabilityCeiling?: ResolvedSubagentCapabilityCeiling };
+	mcpDirectTools: string[];
+	toolRegistry: { modelApi: string; piRuntimeVersion: string; projection: ToolRegistryProjectionV1; runtimeExtensions: import("../runs/shared/pi-args.ts").BoundRuntimeExtensionEvidenceV1; digest: string };
 	roots: { baseRootPathDigest: string; baseRootIdentityDigest?: string; sessionRootDigest: string; sessionDirDigest: string; sessionFileDigest: string; artifactRootDigest?: string };
 	policy: { foregroundOnly: true; async: false; clarify: false; share: false; acceptance: false; mission: false; output: false; outputMode: "inline"; artifacts: boolean; artifactDir?: "session"; watchdog: false; control: false; intercom: false; usageBudget: false; waitToolEnabled: boolean; parentDepth: number; maxSubagentDepth?: number; permissionsDigest?: string; modelScopeDigest: string };
 	result: ActiveBoundPreflightRequestV1["result"];
@@ -154,8 +159,7 @@ function forbiddenAgentMode(agent: AgentConfig): boolean {
 		|| !Array.isArray(agent.tools) || extensionOwnerInvalid
 		|| Boolean(agent.skillPath?.length) || (agent.source === "package" && Boolean(agent.skills?.length)) || agent.inheritProjectContext || agent.inheritSkills || Boolean(agent.memory)
 		|| Boolean(agent.defaultReads?.length) || (agent.source === "package" && agent.defaultContext === "fork") || agent.defaultAsync === true || agent.defaultAcceptance !== undefined || (agent.source === "package" && agent.acceptanceRole !== undefined) || agent.output !== undefined
-		|| Boolean(agent.tools.some((tool) => tool === "subagent" || tool.startsWith("mcp:") || tool.includes("/") || /\.(?:ts|js)$/u.test(tool)))
-		|| Boolean(agent.mcpDirectTools?.length);
+		|| Boolean(agent.tools.some((tool) => tool === "subagent" || tool.startsWith("mcp:") || tool.includes("/") || /\.(?:ts|js)$/u.test(tool)));
 }
 
 /** Synchronous, observational active resolver. It never creates launch paths. */
@@ -254,6 +258,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const exactModel = input.availableModels.find((entry) => `${entry.provider}/${entry.id}` === input.request.model && (entry.fullId === undefined || entry.fullId === input.request.model));
 	if (!exactModel || checkModelScope(input.request.model, discovered.modelScope, "explicit")
 		|| !getSupportedThinkingLevels({ ...exactModel, fullId: input.request.model }).includes(input.request.thinking)) return failure("unavailable_model");
+	if (!exactModel.api || !SUPPORTED_BOUND_MODEL_APIS.has(exactModel.api) || !SUPPORTED_BOUND_PI_VERSIONS.has(PI_RUNTIME_VERSION)) return failure("unsupported_mode");
 	const modelRegistryDigest = canonicalSha256({
 		provider: exactModel.provider, id: exactModel.id,
 		...(exactModel.fullId !== undefined ? { fullId: exactModel.fullId } : {}),
@@ -276,6 +281,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		agent.activeBoundExtensionProjection = packageExtensions.projection;
 	}
 	if (packageExtensions.paths.length > 0 && input.capabilityCeiling?.denyExtensions) return failure("restricted_agent");
+	if ((agent.mcpDirectTools?.length ?? 0) > 0 && !packageExtensions.projection.some((entry) => entry.kind === "package" && entry.package?.name === "pi-mcp-adapter")) return failure("unsupported_mode");
 	const boundCeiling = input.capabilityCeiling;
 	const explicitAgentTools = agent.tools ?? [];
 	if (explicitAgentTools.some((tool) => !FIXED_CHILD_TOOLS.has(tool))) return failure("unsupported_mode");
@@ -284,9 +290,11 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: boundTools, extensions: [], subagentOnlyExtensions: packageExtensions.paths,
+			mcpDirectTools: agent.mcpDirectTools,
 			cwd: requestCwd, requireReadTool: resolvedSkills.resolved.length > 0,
 			structuredOutput: input.request.result.kind === "structured", capabilityCeiling: boundCeiling, agentName: agent.name,
 			disablePermissionSystemExtension: true,
+			activeBoundPackageMediator: true,
 		});
 	} catch { return failure("restricted_agent"); }
 	if (!toolPlan.explicitToolAllowlist || !toolPlan.disableAmbientExtensions || toolPlan.fanoutAuthorized
@@ -326,11 +334,18 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const effectiveMaxSubagentDepth = resolveChildMaxSubagentDepth(runtimeMaxSubagentDepth, agent.maxSubagentDepth);
 	const materializedModel = applyThinkingSuffix(input.request.model, input.request.thinking, true)!;
 	const environment = projectActiveBoundEnvironment(input.request.environment);
+	const toolRegistryProjection = expectedToolRegistryProjection(toolPlan.effectiveToolAllowlist, toolPlan.internalTools);
+	if (!toolRegistryProjection) return failure("unsupported_mode");
+	let runtimeExtensions;
+	try { runtimeExtensions = attestBoundRuntimeExtensions(toolPlan.runtimeExtensions); }
+	catch { return failure("unsupported_mode"); }
+	const toolRegistryDigest = canonicalSha256({ modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions });
+	let piCommandEvidence; try { piCommandEvidence = attestPiSpawnCommand(requestCwd); } catch { return failure("unsupported_mode"); }
 	const launchBindingInput = {
 		definitionDigest, task: input.request.task,
 		modelCandidates: [materializedModel], thinking: input.request.thinking, systemPrompt,
 		systemPromptMode: agent.systemPromptMode, inheritProjectContext: agent.inheritProjectContext, inheritSkills: agent.inheritSkills,
-		skills: skillNames, environment, packageExtensions: packageExtensions.projection, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: packageExtensions.paths, mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
+		skills: skillNames, environment, packageExtensions: packageExtensions.projection, piCommandEvidence, toolRegistry: { modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions, digest: toolRegistryDigest }, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: packageExtensions.paths, mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
 		outputMode: "inline" as const, ...(input.request.result.kind === "structured" ? { structuredOutputSchema: input.request.result.schema } : {}),
 	};
 	const base: Omit<ActiveBoundLaunchContractV1, "digest"> = {
@@ -343,6 +358,8 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		packageExtensions: packageExtensions.projection,
 		packageExtensionsDigest: canonicalSha256(packageExtensions.projection),
 		tools: { effectiveAllowlist: toolPlan.effectiveToolAllowlist, requiredChildTools: toolPlan.requiredChildTools, disableAmbientExtensions: toolPlan.disableAmbientExtensions, ...(boundCeiling ? { capabilityCeiling: boundCeiling } : {}) },
+		mcpDirectTools: toolPlan.effectiveMcpTools,
+		toolRegistry: { modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions, digest: toolRegistryDigest },
 		roots: {
 			baseRootPathDigest: canonicalSha256(baseRoot),
 			...(baseRootIdentityDigest ? { baseRootIdentityDigest } : {}),

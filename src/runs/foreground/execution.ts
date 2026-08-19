@@ -3,6 +3,7 @@
  */
 
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import type { Readable } from "node:stream";
 import { existsSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
@@ -57,10 +58,11 @@ import { buildBoundSkillInjection, buildSkillInjection, resolveProjectSkillsUnca
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
+import { attestPiSpawnCommand } from "../shared/pi-command-evidence.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { resolvePermissionRules } from "../shared/permissions.ts";
-import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
+import { applyThinkingSuffix, attestBoundRuntimeExtensions, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -68,6 +70,9 @@ import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../s
 import { formatProcessSignalError, isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { BOUND_PACKAGE_MUTATION_EXIT, BOUND_TOOL_REGISTRY_ACTIVE_ENV, BOUND_TOOL_REGISTRY_FD_ENV, BOUND_TOOL_REGISTRY_POLICY_ENV } from "../shared/bound-tool-registry-runtime.ts";
+import { createToolRegistryCollector, type ToolRegistryCollected, type ToolRegistryCollector } from "../shared/tool-registry-collector.ts";
+import { expectedToolRegistryProjection } from "../shared/tool-registry-proof.ts";
 import {
 	buildModelCandidates,
 	formatModelAttemptNote,
@@ -97,6 +102,7 @@ import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudget
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
+import { canonicalSha256 } from "../../shared/canonical-json.ts";
 import { buildActiveBoundSpawnEnvironment, projectActiveBoundEnvironment } from "../../api/active-bound-environment.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, PI_AGGREGATE_EVENT_PROJECTOR, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import {
@@ -112,6 +118,51 @@ const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+}
+
+function applyBoundToolRegistryOutcome(result: SingleResult, collection: ToolRegistryCollected, expected: NonNullable<RunSyncOptions["activeBoundToolRegistry"]>): void {
+	const protocol = (code: NonNullable<SingleResult["toolRegistryError"]>): void => {
+		result.exitCode = 1;
+		result.nativeStatus = "native_tool_registry_protocol_error";
+		result.toolRegistryError = code;
+		result.transportIncomplete = true;
+		result.error = `Native tool registry proof failed: ${code}.`;
+	};
+	if (!collection.ok) return protocol(collection.code);
+	const frame = collection.frame;
+	if (frame.kind === "protocol" || frame.kind === "unrepresentable") return protocol(frame.code);
+	const projection = frame.projection;
+	const projectionBase = {
+		version: projection.version,
+		projectionVersion: projection.projectionVersion,
+		required: projection.required,
+		effectiveCallerTools: projection.effectiveCallerTools,
+		internalTools: projection.internalTools,
+		missing: projection.missing,
+	};
+	const actual = [...projection.effectiveCallerTools, ...projection.internalTools].sort();
+	const required = [...expected.required].sort();
+	const internalExpected = new Set(expected.internalTools);
+	if (projection.digest !== canonicalSha256(projectionBase)
+		|| JSON.stringify(projection.required) !== JSON.stringify(required)
+		|| projection.effectiveCallerTools.some((name) => internalExpected.has(name))
+		|| projection.internalTools.some((name) => !internalExpected.has(name))
+		|| actual.length > 128
+		|| new Set(actual).size !== actual.length) return protocol("invalid_frame");
+	const actualSet = new Set(actual);
+	const requiredSet = new Set(required);
+	const missing = required.filter((name) => !actualSet.has(name));
+	const extra = actual.filter((name) => !requiredSet.has(name));
+	if (JSON.stringify(missing) !== JSON.stringify(projection.missing)) return protocol("invalid_frame");
+	result.toolRegistry = projection;
+	if (missing.length || extra.length) {
+		result.exitCode = 1;
+		result.nativeStatus = "native_tool_registry_mismatch";
+		result.toolsMissing = missing;
+		result.toolsExtra = extra;
+		result.transportIncomplete = true;
+		result.error = `Native tool registry mismatch (missing: ${missing.join(", ") || "none"}; extra: ${extra.join(", ") || "none"}).`;
+	}
 }
 
 function withRunContext<T extends SingleResult>(result: T, context: RunSyncOptions["context"]): T {
@@ -154,6 +205,12 @@ function persistSingleResultMetadata(input: {
 		error: target.error,
 		agentContract: target.agentContract,
 		launchContractDigest: target.launchContractDigest,
+		toolRegistry: target.toolRegistry,
+		toolsMissing: target.toolsMissing,
+		toolsExtra: target.toolsExtra,
+		toolRegistryError: target.toolRegistryError,
+		transportIncomplete: target.transportIncomplete,
+		nativeStatus: target.nativeStatus,
 		launchResolvedExtensions: target.launchResolvedExtensions,
 		runtimeAcknowledgedExtensions: target.runtimeAcknowledgedExtensions,
 		execution: target.execution,
@@ -360,6 +417,7 @@ async function runSingleAttempt(
 		waitToolEnabled: options.waitToolEnabled,
 		capabilityCeiling: options.capabilityCeiling,
 		disablePermissionSystemExtension: options.activeBoundProjectSkills,
+		activeBoundPackageMediator: options.activeBoundToolRegistry !== undefined,
 	});
 
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget);
@@ -375,8 +433,31 @@ async function runSingleAttempt(
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agent.name,
 		disablePermissionSystemExtension: options.activeBoundProjectSkills,
+		activeBoundPackageMediator: options.activeBoundToolRegistry !== undefined,
 	});
 	const launchResolvedExtensions = projectLaunchResolvedChildExtensions(toolPlan);
+	const boundToolRegistryProjection = options.activeBoundToolRegistry
+		? expectedToolRegistryProjection(options.activeBoundToolRegistry.required, options.activeBoundToolRegistry.internalTools)
+		: undefined;
+	if (options.activeBoundToolRegistry && !boundToolRegistryProjection) throw new Error("Active-bound tool registry policy is invalid.");
+	const boundRuntimeExtensions = options.activeBoundToolRegistry
+		? attestBoundRuntimeExtensions(toolPlan.runtimeExtensions)
+		: undefined;
+	const boundToolRegistryDigest = options.activeBoundToolRegistry && boundToolRegistryProjection && boundRuntimeExtensions
+		? canonicalSha256({ modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions })
+		: undefined;
+	let piCommandEvidence;
+	try { piCommandEvidence = options.activeBoundToolRegistry ? attestPiSpawnCommand(options.cwd ?? runtimeCwd) : undefined; }
+	catch (error) {
+		cleanupTempDir(tempDir);
+		const message = `Failed to attest Pi command before spawn: ${error instanceof Error ? error.message : String(error)}`;
+		return withRunContext({
+			index: options.index ?? 0, agent: agent.name, task: shared.originalTask ?? task,
+			exitCode: 1, error: message, finalOutput: message, outputState: "absent", messages: [], usage: emptyUsage(), model: modelArg,
+			...(resolvedThinking ? { thinking: resolvedThinking } : {}), skills: shared.resolvedSkillNames,
+			progressSummary: { toolCount: 0, tokens: 0, durationMs: 0 },
+		}, options.context);
+	}
 	const launchContractDigest = launchBindingDigest({
 		definitionDigest: agentDefinitionDigest(agent),
 		task: shared.originalTask ?? task,
@@ -390,6 +471,8 @@ async function runSingleAttempt(
 		skills: shared.resolvedSkillNames ?? [],
 		...(options.activeBoundEnvironment !== undefined ? { environment: projectActiveBoundEnvironment(options.activeBoundEnvironment) } : {}),
 		...(boundPackageExtensions ? { packageExtensions: boundPackageExtensions.projection } : {}),
+		...(piCommandEvidence ? { piCommandEvidence } : {}),
+		...(options.activeBoundToolRegistry && boundToolRegistryProjection && boundToolRegistryDigest ? { toolRegistry: { modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions, digest: boundToolRegistryDigest } } : {}),
 		...(options.activeBoundEnvironment !== undefined ? { artifactPolicy: options.deferArtifactsUntilSpawn ? { enabled: true, dir: "session", root: options.artifactsDir, includeInput: options.artifactConfig?.includeInput !== false, includeOutput: options.artifactConfig?.includeOutput !== false, includeJsonl: options.artifactConfig?.includeJsonl !== false, includeTranscript: options.artifactConfig?.includeTranscript !== false, includeMetadata: options.artifactConfig?.includeMetadata !== false } : { enabled: false } } : {}),
 		tools: toolPlan.effectiveToolAllowlist,
 		extensions: toolPlan.extensionArgs,
@@ -489,12 +572,35 @@ async function runSingleAttempt(
 		? Object.assign(Object.create(null), inheritedSpawnEnv, sharedEnv, getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride))
 		: { ...inheritedSpawnEnv, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride) };
 	for (const [key, value] of Object.entries(spawnEnv)) if (value === undefined) delete spawnEnv[key];
+	delete spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV];
+	delete spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV];
+	delete spawnEnv[BOUND_TOOL_REGISTRY_FD_ENV];
+	if (options.activeBoundToolRegistry) {
+		const deniedExact = new Set(["NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV", "ZDOTDIR"]);
+		for (const key of Object.keys(spawnEnv)) {
+			const normalized = key.toUpperCase();
+			if (deniedExact.has(normalized) || normalized.startsWith("LD_") || normalized.startsWith("DYLD_")) delete spawnEnv[key];
+		}
+	}
+	const toolRegistryProofNonce = options.activeBoundToolRegistry ? randomBytes(32).toString("hex") : undefined;
+	if (options.activeBoundToolRegistry) {
+		spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
+		spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
+			...options.activeBoundToolRegistry,
+			proofNonce: toolRegistryProofNonce,
+			runtimeExtensions: boundRuntimeExtensions,
+			packageExtensions: (boundPackageExtensions?.attestations ?? []).map((entry) => ({ ...entry })),
+		});
+		spawnEnv[BOUND_TOOL_REGISTRY_FD_ENV] = "3";
+	}
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
 
 	let artifactActivationFailed = false;
 	let artifactActivationPending = Boolean(shared.activateDeferredArtifacts);
+	let toolRegistryCollector: ToolRegistryCollector | undefined;
+	let childSpawned = false;
 	const exitCode = await new Promise<number>((resolve, reject) => {
 		const spawnSpec = getPiSpawnCommand(args);
 		try { options.beforeSpawn?.(launchContractDigest); } catch (error) { cleanupTempDir(tempDir); reject(error); return; }
@@ -510,9 +616,14 @@ async function runSingleAttempt(
 			proc = spawn(spawnSpec.command, spawnSpec.args, {
 				cwd: options.cwd ?? runtimeCwd,
 				env: spawnEnv,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: options.activeBoundToolRegistry ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
 				windowsHide: true,
-			});
+			}) as ChildProcessByStdio<null, Readable, Readable>;
+			if (options.activeBoundToolRegistry) {
+				const proofStream = (proc as unknown as { stdio: Array<unknown> }).stdio[3];
+				if (!proofStream || typeof (proofStream as Readable).on !== "function") throw new Error("Bound registry proof pipe was not created.");
+				toolRegistryCollector = createToolRegistryCollector(proofStream as Readable, toolRegistryProofNonce!);
+			}
 		} catch (error) {
 			cleanupTempDir(tempDir);
 			reject(error);
@@ -523,6 +634,7 @@ async function runSingleAttempt(
 		proc.once("spawn", () => {
 			if (spawnObserved) return;
 			spawnObserved = true;
+			childSpawned = true;
 			options.onSpawn?.();
 			if (!shared.activateDeferredArtifacts) return;
 			try {
@@ -1136,10 +1248,16 @@ async function runSingleAttempt(
 		proc.on("exit", () => {
 			childExited = true;
 			clearFinalDrainTimers();
+			if (toolRegistryCollector) {
+				const collector = toolRegistryCollector;
+				const finalizationTimer = setTimeout(() => collector.finalize(), 100);
+				void collector.result.finally(() => clearTimeout(finalizationTimer));
+			}
 		});
 		proc.on("close", async (code, signal) => {
 			if (lifecycleFinished) return;
 			processClosed = true;
+			toolRegistryCollector?.finalize();
 			clearFinalDrainTimers();
 			clearStdioGuard();
 			stdoutReader.end();
@@ -1179,6 +1297,7 @@ async function runSingleAttempt(
 		proc.on("error", (error) => {
 			if (lifecycleFinished) return;
 			processClosed = true;
+			toolRegistryCollector?.finalize();
 			clearFinalDrainTimers();
 			clearStdioGuard();
 			void jsonlWriter.close().catch(() => {
@@ -1242,7 +1361,33 @@ async function runSingleAttempt(
 		}
 	});
 	result.exitCode = exitCode;
-	if (interruptedByControl && !artifactActivationFailed) {
+	if (options.activeBoundToolRegistry && !artifactActivationFailed && childSpawned) {
+		const collection = toolRegistryCollector ? await toolRegistryCollector.result : { ok: false as const, code: "missing_frame" as const };
+		if (exitCode === BOUND_PACKAGE_MUTATION_EXIT) {
+			applyBoundToolRegistryOutcome(result, collection, options.activeBoundToolRegistry);
+			if (result.toolRegistry && result.nativeStatus !== "native_tool_registry_mismatch") {
+				result.toolRegistry = undefined;
+				result.exitCode = 1;
+				result.nativeStatus = "native_tool_registry_protocol_error";
+				result.toolRegistryError = "package_runtime_mutation";
+				result.transportIncomplete = true;
+				result.error = "Native package attempted to mutate the bound runtime contract.";
+			}
+		} else if (!((result.timedOut || options.signal?.aborted || interruptedByControl) && !collection.ok && (collection.code === "missing_frame" || (collection.code === "invalid_frame" && collection.partial === true)))) {
+			applyBoundToolRegistryOutcome(result, collection, options.activeBoundToolRegistry);
+			if (exitCode === 78 && result.toolRegistry && !result.nativeStatus) {
+				result.toolRegistry = undefined;
+				result.toolsMissing = undefined;
+				result.toolsExtra = undefined;
+				result.exitCode = 1;
+				result.nativeStatus = "native_tool_registry_protocol_error";
+				result.toolRegistryError = "invalid_frame";
+				result.transportIncomplete = true;
+				result.error = "Native tool registry gate exited without a measured mismatch.";
+			}
+		}
+	}
+	if (interruptedByControl && !artifactActivationFailed && !result.nativeStatus) {
 		result.exitCode = 0;
 		result.interrupted = true;
 		result.error = undefined;

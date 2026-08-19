@@ -3964,7 +3964,17 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				activeBoundEnvironment: Object.assign(Object.create(null), data.activeBoundProof.request.environment ?? {}),
 				deferArtifactsUntilSpawn: data.activeBoundProof.request.artifacts,
 				parentDepthOverride: data.activeBoundProof.contract.policy.parentDepth,
-				launchToolsOverride: [...(data.activeBoundProof.contract.tools?.effectiveAllowlist ?? agentConfig.tools ?? [])],
+				launchToolsOverride: [...(data.activeBoundProof.contract.tools?.effectiveAllowlist ?? agentConfig.tools ?? [])].filter((tool) =>
+					!(data.activeBoundProof!.contract.mcpDirectTools ?? []).includes(tool)
+					&& !(data.activeBoundProof!.contract.toolRegistry?.projection.internalTools ?? []).includes(tool)),
+				...(data.activeBoundProof.contract.toolRegistry ? { activeBoundToolRegistry: {
+					version: 1 as const,
+					modelApi: data.activeBoundProof.contract.toolRegistry.modelApi,
+					piRuntimeVersion: data.activeBoundProof.contract.toolRegistry.piRuntimeVersion,
+					required: [...data.activeBoundProof.contract.toolRegistry.projection.required],
+					internalTools: [...data.activeBoundProof.contract.toolRegistry.projection.internalTools],
+					packageExtensions: [],
+				} } : {}),
 			} : {}),
 		}));
 	} finally {

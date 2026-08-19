@@ -918,6 +918,12 @@ export interface SingleResult {
 	acceptance?: AcceptanceLedger;
 	agentContract?: AgentContract;
 	launchContractDigest?: string;
+	toolRegistry?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProjectionV1;
+	toolsMissing?: string[];
+	toolsExtra?: string[];
+	toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+	transportIncomplete?: boolean;
+	nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error";
 	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
 	execution?: ExecutionProjection;
@@ -1715,6 +1721,8 @@ export interface RunSyncOptions {
 	parentDepthOverride?: number;
 	/** Private active-bound materialized tool plan without mutating source definition. */
 	launchToolsOverride?: string[];
+	/** Private active-bound final provider tool-registry policy. */
+	activeBoundToolRegistry?: Omit<import("../runs/shared/tool-registry-proof.ts").BoundToolRegistryPolicyV1, "proofNonce">;
 	/** Observes the first successful child spawn event. */
 	onSpawn?: () => void;
 	/** Bound launches disable startup/model retry after the first attempt. */

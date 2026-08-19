@@ -41,16 +41,22 @@ terminal priority. Missing/malformed transport или непредставимы
 
 ## One-shot transport
 
-Active-bound spawn добавляет parent-owned pipe FD 3. Parent принимает один closed
-newline JSON frame максимум 64 KiB; overflow/second frame/invalid UTF-8/unknown key
-— protocol error. Child получает generated `PI_SUBAGENT_TOOL_REGISTRY_FD=3`.
-Mandatory bootstrap первый: читает/удаляет env policy+FD и хранит singleton.
-Generated runtime mediator идёт вторым: import exact attested package factories и
+Active-bound spawn добавляет parent-owned pipe FD 3 и случайный parent nonce.
+Parent принимает один closed newline JSON frame максимум 64 KiB только с exact
+nonce; overflow/second frame/invalid UTF-8/unknown key/неверный nonce — protocol
+error. Child получает generated `PI_SUBAGENT_TOOL_REGISTRY_FD=3` и nonce только
+в private policy. Mandatory bootstrap первый: читает/удаляет env policy+FD и
+хранит singleton в attested package-private state module; package resolution guard
+не позволяет factory импортировать этот модуль. Затем загружается полностью
+аттестованный обязательный policy/prompt runtime (permissions, hard tool budget,
+structured_output). Generated runtime mediator идёт следующим: import exact attested package factories и
 вызывает их по порядку с API proxy. Gate последний. Package paths больше не
 передаются Pi как самостоятельные `--extension`; mediator bytes/imports и exact
-first/mediator/last order входят в launch digest/beforeSpawn recheck.
+first/policy-runtime/mediator/last order входят в launch digest/beforeSpawn recheck.
 
-Gate пишет frame и закрывает FD. Нет child-writable path/MAC/file/public param.
+Gate пишет nonce-bound frame captured primordials и закрывает FD. Нет
+child-writable path/file/public param; знание фиксированного номера FD недостаточно
+для принятого frame.
 Pre-spawn failure proof не требует; lifecycle закрывает ends once, bounded collector
 не удерживает terminal. Legacy stdio прежний.
 
@@ -70,13 +76,28 @@ Gate измеряет tools фактического payload текущего pr
 Mediator никогда не делегирует provider/model/thinking mutators; command/shortcut/
 flag registrations становятся bounded no-op (их callbacks не сохраняются), чтобы
 headless MCP adapter мог загрузиться без UI surface. `on` имеет allowlist только
-`session_start|session_shutdown|tool_result`; payload,
-header и pre-agent hooks запрещены. Event и wrapped tool-execute callbacks получают
+`session_start|session_shutdown|tool_result`; exact attested `pi-mcp-adapter` может
+зарегистрировать `input`, но mediator отбрасывает сам callback и не делегирует hook;
+payload, header и pre-agent hooks запрещены. Event и wrapped tool-execute callbacks получают
 context proxy; `modelRegistry` целиком недоступен, raw context/API не выдаются.
 До barrier разрешены `registerTool|unregisterTool|setActiveTools`; после barrier они
 exit 76 без underlying call. Exact frame + exit 76 даёт parent-generated protocol
 `package_runtime_mutation`, не child frame; registry frozen. A1.2 contract сохраняется; A1.6 не утверждает proof
-остальных Pi-owned payload fields. Process internals вне attested boundary.
+остальных Pi-owned payload fields.
+
+**Threat boundary:** exact owner/package/dependency bytes, проверенные A1.5 trust
+settings, являются частью TCB, а не hostile same-process sandbox tenant. Mediator
+закрывает public Pi API и случайные/неразрешённые registration paths, но A1.6 не
+защищается от намеренного использования аттестованной factory произвольных Node/
+Linux process internals (`node:module`, `require.cache`, `/proc`, monkeypatch всех
+JS intrinsics). Process internals вне attested boundary. Private proof должен быть
+неподделываем public executor params, ambient env/path или неаттестованными bytes;
+он не является криптографической изоляцией от самого TCB package-кода.
+Host-selected Pi command входит в ту же TCB: launch binding и `beforeSpawn`
+повторно хэшируют canonical executable, interpreter/script/package dependency
+closure для закрытых script wrappers; native standalone Pi связывается целиком
+байтами самого executable, без попытки вывести его поведение из формата файла.
+Ambient preload/search-path variables удаляются до передачи private policy.
 
 Policy содержит `modelApi`/`piRuntimeVersion`. Resolver допускает exported Pi
 `VERSION` только `0.84.1|0.84.2` и bind-ит его; gate требует exact match. Иная
@@ -152,7 +173,8 @@ projection/diffs/code и launch digest.
 - event harness: first/mediator/last, mediated package factory, all API extractors,
   Anthropic byte-exact/OAuth rename mismatch, payload/live drift, missing/extra,
   wire=live missing/extra exact diffs и обе асимметрии wire/live как protocol;
-  original versus clone; event allowlist rejects payload/header/pre-agent hooks;
+  original versus clone; event allowlist rejects payload/header/pre-agent hooks,
+  adapter-only `input` registration is discarded without retaining/delegating its callback;
   provider/model/thinking/modelRegistry bypasses exit 76, command/flag callbacks are
   discarded; post-barrier
   register/unregister/active likewise; wrapped contexts, no-second-frame;

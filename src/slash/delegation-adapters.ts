@@ -99,6 +99,13 @@ export interface PromptTemplateBridgeResult {
 			outputSaveError?: string;
 			transcriptError?: string;
 			artifactInitializationFailed?: boolean;
+			launchContractDigest?: string;
+			toolRegistry?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProjectionV1;
+			toolsMissing?: string[];
+			toolsExtra?: string[];
+			toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+			transportIncomplete?: boolean;
+			nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error";
 		}>;
 		progress?: Array<{
 			index?: number;
@@ -345,6 +352,7 @@ function resolveSubagentDelegationStatus(
 ): SubagentDelegationStatus {
 	const child = result.details?.results?.[0];
 	if (child?.artifactInitializationFailed) return "failed";
+	if (child?.nativeStatus) return child.nativeStatus;
 	if (aborted) return "cancelled";
 	if (!child) return "failed";
 	if (result.details?.timedOut || child.timedOut) return "timed_out";
@@ -409,6 +417,11 @@ export function toSubagentDelegationResponse(
 		...(child?.thinking ? { thinking: child.thinking } : {}),
 		...(typeof child?.exitCode === "number" ? { exitCode: child.exitCode } : {}),
 		...(childLaunchContractDigest ? { launchContractDigest: childLaunchContractDigest } : {}),
+		...(child?.toolRegistry ? { toolRegistry: child.toolRegistry } : {}),
+		...(child?.toolsMissing ? { toolsMissing: child.toolsMissing } : {}),
+		...(child?.toolsExtra ? { toolsExtra: child.toolsExtra } : {}),
+		...(child?.toolRegistryError ? { toolRegistryError: child.toolRegistryError } : {}),
+		...(child?.transportIncomplete ? { transportIncomplete: true } : {}),
 		...(projectedResult ? { result: projectedResult } : {}),
 		...(usage ? {
 			usage: {

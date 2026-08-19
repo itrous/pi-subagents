@@ -22,7 +22,7 @@ function fixture(config: Record<string, unknown> = {}) {
 		cwd: project,
 		isProjectTrusted: () => true,
 		sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "pi-session" },
-		modelRegistry: { getAvailable: () => [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }] },
+		modelRegistry: { getAvailable: () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }] },
 	} as any;
 	const runtime = createActiveBoundRuntimeService({
 		serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => ctx,

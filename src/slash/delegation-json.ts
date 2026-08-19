@@ -8,7 +8,7 @@ export type BoundedJsonClone =
 	| { ok: false; reason: "invalid" | "too_large" };
 
 /** Clone plain JSON data without invoking getters or toJSON hooks. */
-export function cloneJsonWithinByteLimit(input: unknown, maxBytes: number): BoundedJsonClone {
+export function cloneJsonWithinByteLimit(input: unknown, maxBytes: number, options: { ignoreNonEnumerable?: boolean; omitUndefinedProperties?: boolean; omitNonJsonProperties?: boolean } = {}): BoundedJsonClone {
 	let minimumBytes = 0;
 	let entries = 0;
 	const active = new WeakSet<object>();
@@ -57,9 +57,11 @@ export function cloneJsonWithinByteLimit(input: unknown, maxBytes: number): Boun
 				addMinimumBytes(2 + Math.max(0, length - 1));
 				const output: unknown[] = [];
 				for (const key of keys) {
-					if (typeof key === "symbol") throw new TypeError("invalid");
 					if (key === "length") continue;
-					if (!/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= length) throw new TypeError("invalid");
+					const descriptor = Object.getOwnPropertyDescriptor(object, key);
+					if (options.ignoreNonEnumerable && descriptor && !descriptor.enumerable) continue;
+					if (typeof key === "symbol" || !descriptor || !descriptor.enumerable
+						|| !/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= length) throw new TypeError("invalid");
 				}
 				for (let index = 0; index < length; index++) {
 					const descriptor = Object.getOwnPropertyDescriptor(object, String(index));
@@ -72,14 +74,18 @@ export function cloneJsonWithinByteLimit(input: unknown, maxBytes: number): Boun
 			}
 
 			if (prototype !== Object.prototype && prototype !== null) throw new TypeError("invalid");
-			addMinimumBytes(2 + Math.max(0, keys.length - 1));
-			const output: Record<string, unknown> = {};
+			addMinimumBytes(2);
+			const output: Record<string, unknown> = {}; let outputEntries = 0;
 			for (const key of keys) {
-				if (typeof key === "symbol") throw new TypeError("invalid");
+				if (typeof key === "symbol") { if (options.ignoreNonEnumerable) continue; throw new TypeError("invalid"); }
 				const descriptor = Object.getOwnPropertyDescriptor(object, key);
+				if (options.ignoreNonEnumerable && descriptor && !descriptor.enumerable) continue;
 				if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) throw new TypeError("invalid");
+				if ((options.omitUndefinedProperties && descriptor.value === undefined)
+					|| (options.omitNonJsonProperties && (typeof descriptor.value === "undefined" || typeof descriptor.value === "function" || typeof descriptor.value === "symbol"))) continue;
 				entries++;
 				if (entries > MAX_JSON_ENTRIES) throw new TypeError("invalid");
+				if (outputEntries++ > 0) addMinimumBytes(1);
 				addMinimumBytes(Buffer.byteLength(JSON.stringify(key), "utf8") + 1);
 				Object.defineProperty(output, key, {
 					value: visit(descriptor.value, depth + 1),

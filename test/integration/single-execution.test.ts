@@ -1379,7 +1379,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		executionCtx.isProjectTrusted = () => true;
 		executionCtx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
 		executionCtx.sessionManager.getSessionId = () => "pi-session";
-		executionCtx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", reasoning: false }];
+		executionCtx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }];
 		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => executionCtx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
 		const runtimeRecheck = runtime.recheck.bind(runtime); let artifactAbsenceChecks = 0;
 		runtime.recheck = (activeProof, options) => { if (activeProof.request.artifacts) { artifactAbsenceChecks++; assert.equal(fs.existsSync(path.join(base, activeProof.request.prospectiveRunId, "artifacts")), false); } return runtimeRecheck(activeProof, options); };
@@ -1416,6 +1416,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		finally { for (const key of poisonedEnv) { const previous = previousEnv[key]; if (previous === undefined) delete process.env[key]; else process.env[key] = previous; } }
 		assert.equal(first.isError, undefined, JSON.stringify(first));
 		assert.equal(first.details.runId, firstId);
+		assert.deepEqual(first.details.results[0]?.toolRegistry?.effectiveCallerTools, ["read"]);
+		assert.deepEqual(first.details.results[0]?.toolRegistry?.missing, []);
 		const childEnv = JSON.parse(first.details.results[0]?.finalOutput ?? "{}") as Record<string, string | null>;
 		assert.equal(childEnv.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE, null);
 		assert.equal(childEnv.PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR, null);
@@ -1450,22 +1452,171 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		runtime.dispose();
 	});
 
-	it("preserves ambient ONECPI keys for legacy unbound children", async () => {
-		const keys = ["ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH"];
+	it("projects measured bound registry mismatch before accepting child output", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: ["extra", "read"] });
+		const previousNodeOptions = process.env.NODE_OPTIONS; process.env.NODE_OPTIONS = "--require=/ambient-preload-must-not-run.cjs";
+		let result;
+		try {
+			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch", {
+				runId: "bound-registry-mismatch", acceptance: false, disableWatchdog: true,
+				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			});
+		} finally { if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previousNodeOptions; }
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.nativeStatus, "native_tool_registry_mismatch");
+		assert.deepEqual(result.toolsMissing, []);
+		assert.deepEqual(result.toolsExtra, ["extra"]);
+		assert.equal(result.transportIncomplete, true);
+		assert.deepEqual(result.toolRegistry?.effectiveCallerTools, ["extra", "read"]);
+	});
+
+	it("rejects a syntactically valid registry frame without the parent nonce", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNonce: "0".repeat(64) });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound forged registry", {
+			runId: "bound-registry-forged", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.equal(result.toolRegistry, undefined);
+	});
+
+	it("rejects a transport projection with more than 128 actual tools", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: Array.from({ length: 129 }, (_, index) => `tool_${index}`) });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound oversized registry", {
+			runId: "bound-registry-actual-bound", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+	});
+
+	it("requires a proof frame before classifying package-mutation exit", async () => {
+		mockPi.onCall({ output: "must not succeed", exitCode: 76, skipBoundToolRegistryProof: true });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound unproved mutation exit", {
+			runId: "bound-registry-unproved-mutation", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "missing_frame");
+	});
+
+	it("keeps a valid measured mismatch ahead of package-mutation exit", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: ["extra", "read"], exitCode: 76 });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch mutation exit", {
+			runId: "bound-registry-mismatch-mutation", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_mismatch");
+		assert.deepEqual(result.toolsExtra, ["extra"]);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("does not publish an exact projection when the gate exits with mismatch code", async () => {
+		mockPi.onCall({ output: "must not succeed", exitCode: 78 });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound exact exit", {
+			runId: "bound-registry-exact-exit", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.equal(result.toolRegistry, undefined);
+	});
+
+	it("does not publish a projection whose measured missing list is invalid", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryMissing: ["read"] });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound invalid projection", {
+			runId: "bound-registry-invalid-projection", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.equal(result.toolRegistry, undefined);
+	});
+
+	it("rejects a proof channel kept open by a descendant writer", async () => {
+		mockPi.onCall({ output: "bounded", holdBoundToolRegistryFdMs: 2_000 });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound inherited fd", {
+			runId: "bound-registry-inherited-fd", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.ok(Date.now() - startedAt < 1_500, "inherited proof writer must not hold terminal completion");
+	});
+
+	it("preserves timeout status when the bound gate has not emitted a frame", async () => {
+		mockPi.onCall({ waitForPath: path.join(tempDir, "never-release-bound-registry") });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound timeout", {
+			runId: "bound-registry-timeout", acceptance: false, disableWatchdog: true, timeoutMs: 20,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.timedOut, true);
+		assert.equal(result.nativeStatus, undefined);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("preserves cancellation before the bound gate emits a frame", async () => {
+		mockPi.onCall({ waitForPath: path.join(tempDir, "never-release-bound-registry-cancel") });
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 20);
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound cancel", {
+			runId: "bound-registry-cancel", acceptance: false, disableWatchdog: true, signal: controller.signal,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(controller.signal.aborted, true);
+		assert.equal(result.nativeStatus, undefined);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("does not require a proof frame when the child fails to spawn", async () => {
+		const previousBinary = process.env.PI_SUBAGENT_PI_BINARY;
+		process.env.PI_SUBAGENT_PI_BINARY = path.join(tempDir, "definitely-missing-pi");
+		let result;
+		try {
+			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound spawn error", {
+				runId: "bound-registry-spawn-error", acceptance: false, disableWatchdog: true,
+				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			});
+		} finally {
+			if (previousBinary === undefined) delete process.env.PI_SUBAGENT_PI_BINARY;
+			else process.env.PI_SUBAGENT_PI_BINARY = previousBinary;
+		}
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.nativeStatus, undefined);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("preserves ambient ONECPI keys but clears bound gate activation for legacy children", async () => {
+		const keys = ["ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH", "PI_SUBAGENT_TOOL_REGISTRY_ACTIVE", "PI_SUBAGENT_TOOL_REGISTRY_POLICY", "PI_SUBAGENT_TOOL_REGISTRY_FD"];
 		const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 		process.env.ONECPI_REVIEW_ROOT = "/legacy/root"; process.env.ONECPI_REVIEW_SUBJECT_PATH = "/legacy/subject";
+		process.env.PI_SUBAGENT_TOOL_REGISTRY_ACTIVE = "1"; process.env.PI_SUBAGENT_TOOL_REGISTRY_POLICY = "poison"; process.env.PI_SUBAGENT_TOOL_REGISTRY_FD = "3";
 		mockPi.onCall({ echoEnv: keys });
 		let result;
 		try { result = await runSync(tempDir, [makeAgent("echo")], "echo", "legacy env", { runId: "legacy-onecpi-env", acceptance: false }); }
 		finally { for (const key of keys) { const value = previous[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
-		assert.equal(result.exitCode, 0); assert.deepEqual(JSON.parse(result.finalOutput ?? "{}"), { ONECPI_REVIEW_ROOT: "/legacy/root", ONECPI_REVIEW_SUBJECT_PATH: "/legacy/subject" });
+		assert.equal(result.exitCode, 0); assert.deepEqual(JSON.parse(result.finalOutput ?? "{}"), { ONECPI_REVIEW_ROOT: "/legacy/root", ONECPI_REVIEW_SUBJECT_PATH: "/legacy/subject", PI_SUBAGENT_TOOL_REGISTRY_ACTIVE: null, PI_SUBAGENT_TOOL_REGISTRY_POLICY: null, PI_SUBAGENT_TOOL_REGISTRY_FD: null });
 	});
 
 	it("keeps bound budget committed when a spawned child fails", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
 		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\nfallbackModels:\n  - test/fallback\n---\nEcho.\n");
 		const base = path.join(tempDir, "bound-sessions"); const runtime = { claimBase: () => true, recheck: () => true } as any;
-		const ctx = makeTrustedCtx(tempDir) as any; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact" }, { provider: "test", id: "fallback" }];
+		const ctx = makeTrustedCtx(tempDir) as any; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", api: "openai-responses" }, { provider: "test", id: "fallback", api: "openai-responses" }];
 		const executor = makeExecutor([makeAgent("echo", { fallbackModels: ["test/fallback"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
 		const params = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: {}, policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
 		mockPi.onCall({ jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "temporary provider failure" }], model: "test/exact", errorMessage: "rate limit exceeded", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }], exitCode: 1 });
@@ -1745,7 +1896,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const ctx = {
 			...makeMinimalCtx(tempDir),
 			modelRegistry: {
-				getAvailable: () => [{ provider: "mock", id: "test-model", reasoning: true }],
+				getAvailable: () => [{ provider: "mock", id: "test-model", api: "openai-responses", reasoning: true }],
 			},
 			sessionManager: {
 				getSessionId: () => "registered-delegation-session",
@@ -1803,7 +1954,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			while (mockPi.callCount() < 2 && responses.length < 2 && Date.now() < callDeadlineAt) {
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
-			assert.equal(mockPi.callCount(), 2, `different logical nodes should use the concurrent delegated execution path: ${JSON.stringify(responses)}`);
+			assert.equal(mockPi.callCount(), 2, `different logical nodes should use the concurrent delegated execution path: ${JSON.stringify({ responses, started })}`);
 			assert.deepEqual(started.map(({ requestId, ownerRunId, nodeId }) => ({ requestId, ownerRunId, nodeId })).sort((a, b) => a.nodeId.localeCompare(b.nodeId)), [
 				{ requestId: "registered-a", ownerRunId: "owner-delegation", nodeId: "node-a" },
 				{ requestId: "registered-b", ownerRunId: "owner-delegation", nodeId: "node-b" },
