@@ -7,6 +7,7 @@ import {
 	type SubagentDelegationValue,
 } from "../api/delegation.ts";
 import type { ActiveBoundExecutionProofV1 } from "../api/active-bound-runtime.ts";
+import { DENIED_TOOL_MAX_CALLS, validDeniedToolCall, type DeniedToolCallV1, type DeniedToolProofErrorCode } from "../runs/shared/denied-tool-proof.ts";
 import type { AcceptanceInput, AgentContract, EffectsProjection, ExecutionProjection, JsonSchemaObject, ReviewProjection, ToolBudgetConfig, TurnBudgetConfig, Usage } from "../shared/types.ts";
 import { cloneJsonWithinByteLimit } from "./delegation-json.ts";
 
@@ -104,8 +105,11 @@ export interface PromptTemplateBridgeResult {
 			toolsMissing?: string[];
 			toolsExtra?: string[];
 			toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+			deniedToolCalls?: import("../runs/shared/denied-tool-proof.ts").DeniedToolCallV1[];
+			deniedToolCallsOverflow?: true;
+			deniedToolCallsError?: import("../runs/shared/denied-tool-proof.ts").DeniedToolProofErrorCode;
 			transportIncomplete?: boolean;
-			nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error";
+			nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error" | "native_denied_tools_protocol_error";
 		}>;
 		progress?: Array<{
 			index?: number;
@@ -376,6 +380,32 @@ export function toSubagentDelegationResponse(
 	const progress = child?.progressSummary ?? result.details?.progress?.[0];
 	let status = resolveSubagentDelegationStatus(result, aborted);
 	let error = child?.error ?? (status === "failed" ? firstTextContent(result.content) : undefined);
+	let deniedToolCalls: DeniedToolCallV1[] | undefined;
+	let deniedToolCallsOverflow: true | undefined;
+	let deniedToolCallsError: DeniedToolProofErrorCode | undefined;
+	let transportIncomplete = child?.transportIncomplete === true;
+	if (request.binding && child && (child.deniedToolCalls !== undefined || child.deniedToolCallsOverflow !== undefined || child.deniedToolCallsError !== undefined)) {
+		const validCalls = Array.isArray(child.deniedToolCalls) && child.deniedToolCalls.length <= DENIED_TOOL_MAX_CALLS
+			&& child.deniedToolCalls.every(validDeniedToolCall)
+			&& (child.deniedToolCallsOverflow === undefined || child.deniedToolCallsOverflow === true)
+			&& (child.deniedToolCallsOverflow !== true || child.deniedToolCalls.length === DENIED_TOOL_MAX_CALLS)
+			&& child.deniedToolCallsError === undefined;
+		const validError = child.deniedToolCalls === undefined && child.deniedToolCallsOverflow === undefined
+			&& typeof child.deniedToolCallsError === "string"
+			&& ["missing_frame", "invalid_frame", "multiple_frames", "frame_too_large"].includes(child.deniedToolCallsError);
+		if (validCalls) {
+			deniedToolCalls = child.deniedToolCalls!.map((call) => ({ ...call }));
+			if (child.deniedToolCallsOverflow === true) deniedToolCallsOverflow = true;
+			if (deniedToolCalls.length > 0 || deniedToolCallsOverflow) transportIncomplete = true;
+		} else if (validError) {
+			deniedToolCallsError = child.deniedToolCallsError;
+			status = "native_denied_tools_protocol_error"; transportIncomplete = true;
+		} else {
+			deniedToolCallsError = "invalid_frame";
+			status = "native_denied_tools_protocol_error"; transportIncomplete = true;
+			error = "Delegated subagent returned a malformed denied-tool proof.";
+		}
+	}
 	let projectedResult: SubagentDelegationValue | undefined;
 	if (status === "completed") {
 		if (request.result.kind === "text") {
@@ -421,7 +451,10 @@ export function toSubagentDelegationResponse(
 		...(child?.toolsMissing ? { toolsMissing: child.toolsMissing } : {}),
 		...(child?.toolsExtra ? { toolsExtra: child.toolsExtra } : {}),
 		...(child?.toolRegistryError ? { toolRegistryError: child.toolRegistryError } : {}),
-		...(child?.transportIncomplete ? { transportIncomplete: true } : {}),
+		...(deniedToolCalls ? { deniedToolCalls } : {}),
+		...(deniedToolCallsOverflow ? { deniedToolCallsOverflow: true } : {}),
+		...(deniedToolCallsError ? { deniedToolCallsError } : {}),
+		...(transportIncomplete ? { transportIncomplete: true } : {}),
 		...(projectedResult ? { result: projectedResult } : {}),
 		...(usage ? {
 			usage: {

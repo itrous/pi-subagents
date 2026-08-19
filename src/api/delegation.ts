@@ -35,6 +35,7 @@ export interface SubagentDelegationBindingV1 {
 	requestDigest: string;
 	expectedLaunchContractDigest: string;
 	receipt: import("./launch-receipt.ts").LaunchReceiptV1;
+	cancellationToken: import("./launch-receipt.ts").LaunchCancellationTokenV1;
 }
 
 export interface SubagentDelegationRequest {
@@ -79,6 +80,11 @@ export interface SubagentDelegationUpdate extends SubagentDelegationStarted {
 	tokens?: number;
 }
 
+export interface SubagentDelegationTargetedCancel extends SubagentDelegationStarted {
+	targetServerInstanceId: string;
+	binding: SubagentDelegationBindingV1;
+}
+
 export type SubagentDelegationStatus =
 	| "completed"
 	| "failed"
@@ -93,7 +99,8 @@ export type SubagentDelegationStatus =
 	| "unavailable_context"
 	| "duplicate_node"
 	| "native_tool_registry_mismatch"
-	| "native_tool_registry_protocol_error";
+	| "native_tool_registry_protocol_error"
+	| "native_denied_tools_protocol_error";
 
 export type SubagentDelegationValue =
 	| { kind: "text"; text: string }
@@ -123,6 +130,9 @@ export interface SubagentDelegationTerminalResponse extends SubagentDelegationSt
 	toolsMissing?: string[];
 	toolsExtra?: string[];
 	toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+	deniedToolCalls?: import("../runs/shared/denied-tool-proof.ts").DeniedToolCallV1[];
+	deniedToolCallsOverflow?: true;
+	deniedToolCallsError?: import("../runs/shared/denied-tool-proof.ts").DeniedToolProofErrorCode;
 	transportIncomplete?: boolean;
 	result?: SubagentDelegationValue;
 	usage?: SubagentDelegationUsage;

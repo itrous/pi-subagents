@@ -35,7 +35,7 @@ describe("bound tool registry projection", () => {
 		assert.equal(validateBoundToolRegistryPolicy({ version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["x", "x"], internalTools: [], packageExtensions: [] }), undefined);
 		assert.equal(expectedToolRegistryProjection(["\ud800"], []), undefined);
 		assert.equal(expectedToolRegistryProjection(["\udc00"], []), undefined);
-		assert.ok(validateBoundToolRegistryPolicy({ version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", proofNonce: "d".repeat(64), required: ["x"], internalTools: [], packageExtensions: [{ path: "/owner/ext.ts", contentDigest: "a".repeat(64), evidenceRoot: "/owner", evidenceRootDigest: "b".repeat(64), packageTreeDigest: "c".repeat(64) }], runtimeExtensions: { version: 1, entries: [] } }));
+		assert.ok(validateBoundToolRegistryPolicy({ version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", proofNonce: "d".repeat(64), denialFd: 4, required: ["x"], internalTools: [], packageExtensions: [{ path: "/owner/ext.ts", contentDigest: "a".repeat(64), evidenceRoot: "/owner", evidenceRootDigest: "b".repeat(64), packageTreeDigest: "c".repeat(64) }], runtimeExtensions: { version: 1, entries: [] } }));
 		const escaped = Array.from({ length: 128 }, (_, index) => `${index.toString().padStart(3, "0")}${"\u0001".repeat(125)}`);
 		assert.equal(expectedToolRegistryProjection(escaped, []), undefined);
 	});

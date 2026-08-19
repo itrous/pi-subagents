@@ -11,7 +11,7 @@ import {
 	type SubagentDelegationRequest,
 	type SubagentDelegationResponse,
 } from "../api/delegation.ts";
-import { parseSubagentDelegationRequest, subagentDelegationBindingTarget } from "./delegation-request.ts";
+import { parseSubagentDelegationBinding, parseSubagentDelegationRequest, subagentDelegationBindingTarget } from "./delegation-request.ts";
 import {
 	parsePromptTemplateRequest,
 	toSubagentDelegationExecutionParams,
@@ -23,6 +23,8 @@ import {
 } from "./delegation-adapters.ts";
 import { getBoundIdentityRegistry, type BoundIdentityRegistryV1 } from "./bound-identity-registry.ts";
 import { getStructuredAttemptCoordinator, type StructuredAttemptCoordinator } from "./structured-attempt-coordinator.ts";
+import { cloneJsonWithinByteLimit } from "./delegation-json.ts";
+import { getBoundPendingCancellationRegistry, type BoundPendingCancellationRegistryV1 } from "./bound-pending-cancellation-registry.ts";
 
 export const PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT = SUBAGENT_DELEGATION_REQUEST_EVENT;
 export const PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT = SUBAGENT_DELEGATION_STARTED_EVENT;
@@ -57,6 +59,7 @@ interface PromptTemplateBridgeOptions<Ctx extends { cwd?: string }> {
 	activeBoundRuntime?: ActiveBoundRuntimeService;
 	serverInstanceId?: string;
 	boundIdentityRegistry?: BoundIdentityRegistryV1;
+	pendingCancellationRegistry?: BoundPendingCancellationRegistryV1;
 }
 
 function hasStructuredDelegationMarker(data: unknown): boolean {
@@ -90,6 +93,7 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 } {
 	const coordinator = options.coordinator ?? getStructuredAttemptCoordinator();
 	const boundRegistry = options.activeBoundRuntime ? options.boundIdentityRegistry ?? getBoundIdentityRegistry() : undefined;
+	const pendingCancellations = options.activeBoundRuntime ? options.pendingCancellationRegistry ?? getBoundPendingCancellationRegistry() : undefined;
 	const runtimeId = options.runtimeId ?? randomUUID();
 	const subscriptions: Array<() => void> = [];
 	let active = false;
@@ -101,11 +105,20 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 	};
 
 	subscribe(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, (data) => {
-		if (!active || stopped || !data || typeof data !== "object" || Array.isArray(data)) return;
-		const value = data as Record<string, unknown>;
-		if (!validId(value.requestId) || !validId(value.ownerRunId) || !validId(value.nodeId)) return;
-		if (Object.keys(value).some((key) => key !== "requestId" && key !== "ownerRunId" && key !== "nodeId")) return;
-		coordinator.cancel(value.requestId, value.ownerRunId, value.nodeId);
+		if (!active || stopped) return;
+		const inspected = cloneJsonWithinByteLimit(data, 64 * 1024);
+		if (!inspected.ok || !inspected.value || typeof inspected.value !== "object" || Array.isArray(inspected.value)) return;
+		const value = inspected.value as Record<string, unknown>; const tuple = { requestId: value.requestId, ownerRunId: value.ownerRunId, nodeId: value.nodeId };
+		if (!validId(tuple.requestId) || !validId(tuple.ownerRunId) || !validId(tuple.nodeId)) return;
+		const keys = Object.keys(value).sort().join(",");
+		if (keys === "nodeId,ownerRunId,requestId") { coordinator.cancel(tuple.requestId, tuple.ownerRunId, tuple.nodeId); return; }
+		if (keys !== "binding,nodeId,ownerRunId,requestId,targetServerInstanceId" || !options.activeBoundRuntime || !pendingCancellations
+			|| value.targetServerInstanceId !== options.activeBoundRuntime.serverInstanceId) return;
+		const binding = parseSubagentDelegationBinding(value.binding);
+		if (!binding || binding.targetServerInstanceId !== value.targetServerInstanceId
+			|| !options.activeBoundRuntime.verifyPendingCancellation(tuple as { requestId: string; ownerRunId: string; nodeId: string }, binding)) return;
+		if (coordinator.cancel(tuple.requestId, tuple.ownerRunId, tuple.nodeId)) return;
+		pendingCancellations.remember(tuple as { requestId: string; ownerRunId: string; nodeId: string }, binding);
 	});
 
 	subscribe(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, (data) => {
@@ -225,6 +238,11 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 		}
 		if (prospectiveReservation && !boundRegistry!.commit(prospectiveReservation.serverInstanceId, prospectiveReservation.prospectiveRunId)) {
 			admission.settle({ requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: "duplicate_node" });
+			return;
+		}
+		if (request.binding && pendingCancellations?.consume(request, request.binding)) {
+			coordinator.cancel(request.requestId, request.ownerRunId, request.nodeId);
+			admission.settle({ requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: "cancelled" });
 			return;
 		}
 		void (async () => {

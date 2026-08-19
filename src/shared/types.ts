@@ -922,8 +922,11 @@ export interface SingleResult {
 	toolsMissing?: string[];
 	toolsExtra?: string[];
 	toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+	deniedToolCalls?: import("../runs/shared/denied-tool-proof.ts").DeniedToolCallV1[];
+	deniedToolCallsOverflow?: true;
+	deniedToolCallsError?: import("../runs/shared/denied-tool-proof.ts").DeniedToolProofErrorCode;
 	transportIncomplete?: boolean;
-	nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error";
+	nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error" | "native_denied_tools_protocol_error";
 	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
 	execution?: ExecutionProjection;
@@ -1722,7 +1725,7 @@ export interface RunSyncOptions {
 	/** Private active-bound materialized tool plan without mutating source definition. */
 	launchToolsOverride?: string[];
 	/** Private active-bound final provider tool-registry policy. */
-	activeBoundToolRegistry?: Omit<import("../runs/shared/tool-registry-proof.ts").BoundToolRegistryPolicyV1, "proofNonce">;
+	activeBoundToolRegistry?: Omit<import("../runs/shared/tool-registry-proof.ts").BoundToolRegistryPolicyV1, "proofNonce" | "denialFd">;
 	/** Observes the first successful child spawn event. */
 	onSpawn?: () => void;
 	/** Bound launches disable startup/model retry after the first attempt. */

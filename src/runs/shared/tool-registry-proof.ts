@@ -30,6 +30,7 @@ export interface BoundToolRegistryPolicyV1 {
 	modelApi: string;
 	piRuntimeVersion: string;
 	proofNonce: string;
+	denialFd: 4;
 	required: string[];
 	internalTools: string[];
 	packageExtensions: Array<{ path: string; contentDigest: string; evidenceRoot: string; evidenceRootDigest: string; packageTreeDigest: string }>;
@@ -105,8 +106,8 @@ export function expectedToolRegistryProjection(required: readonly string[], inte
 export function validateBoundToolRegistryPolicy(value: unknown): BoundToolRegistryPolicyV1 | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const record = value as Record<string, unknown>;
-	if (Object.keys(record).sort().join(",") !== "internalTools,modelApi,packageExtensions,piRuntimeVersion,proofNonce,required,runtimeExtensions,version"
-		|| record.version !== 1 || typeof record.modelApi !== "string" || typeof record.piRuntimeVersion !== "string" || typeof record.proofNonce !== "string" || !/^[0-9a-f]{64}$/u.test(record.proofNonce)
+	if (Object.keys(record).sort().join(",") !== "denialFd,internalTools,modelApi,packageExtensions,piRuntimeVersion,proofNonce,required,runtimeExtensions,version"
+		|| record.version !== 1 || record.denialFd !== 4 || typeof record.modelApi !== "string" || typeof record.piRuntimeVersion !== "string" || typeof record.proofNonce !== "string" || !/^[0-9a-f]{64}$/u.test(record.proofNonce)
 		|| !SUPPORTED_BOUND_MODEL_APIS.has(record.modelApi) || !SUPPORTED_BOUND_PI_VERSIONS.has(record.piRuntimeVersion)
 		|| !Array.isArray(record.required) || !Array.isArray(record.internalTools) || !Array.isArray(record.packageExtensions)
 		|| !record.runtimeExtensions || typeof record.runtimeExtensions !== "object" || Array.isArray(record.runtimeExtensions)
@@ -133,7 +134,7 @@ export function validateBoundToolRegistryPolicy(value: unknown): BoundToolRegist
 	if (!required || !internalTools || required.length !== record.required.length || internalTools.length !== record.internalTools.length
 		|| internalTools.some((name) => !required.includes(name)) || !expectedToolRegistryProjection(required, internalTools)) return undefined;
 	return {
-		version: 1, modelApi: record.modelApi, piRuntimeVersion: record.piRuntimeVersion, proofNonce: record.proofNonce,
+		version: 1, modelApi: record.modelApi, piRuntimeVersion: record.piRuntimeVersion, proofNonce: record.proofNonce, denialFd: 4,
 		required, internalTools,
 		packageExtensions: (record.packageExtensions as Array<{ path: string; contentDigest: string; evidenceRoot: string; evidenceRootDigest: string; packageTreeDigest: string }>).map((entry) => ({ ...entry })),
 		runtimeExtensions: { version: 1, entries: (runtimeExtensions.entries as Array<{ name: string; contentDigest: string }>).map((entry) => ({ ...entry })) },

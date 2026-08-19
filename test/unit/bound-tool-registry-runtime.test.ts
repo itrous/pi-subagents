@@ -28,7 +28,7 @@ function policy(packageExtensionPaths: string[] = [], modelApi = "openai-respons
 	const runtimeExtensions = attestBoundRuntimeExtensions([
 		path.join(sharedDir, "bound-tool-registry-bootstrap.ts"), path.join(sharedDir, "subagent-prompt-runtime.ts"), path.join(sharedDir, "bound-package-mediator.ts"), path.join(sharedDir, "bound-tool-registry-gate.ts"),
 	]);
-	return { version: 1, modelApi, piRuntimeVersion: "0.84.2", proofNonce: "d".repeat(64), required: ["a"], internalTools: [], packageExtensions, runtimeExtensions };
+	return { version: 1, modelApi, piRuntimeVersion: "0.84.2", proofNonce: "d".repeat(64), denialFd: 4, required: ["a"], internalTools: [], packageExtensions, runtimeExtensions };
 }
 
 function openAiPayload() {

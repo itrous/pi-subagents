@@ -1388,7 +1388,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: `request-${runId}`, ownerRunId: "owner", nodeId: `node-${runId}`, prospectiveRunId: runId, agent: "echo", task: "Bound", cwd: aliasCwd, context: "fresh", model: "test/exact", thinking: "off", skill: ["bound-skill", "bound-skill"], environment: { ONECPI_REVIEW_ROOT: "/requested/root", ONECPI_REVIEW_SUBJECT_PATH: "/requested/subject" }, artifacts: true, artifactDir: "session", result: { kind: "text" } });
 			assert.equal(parsed.ok, true); if (!parsed.ok) throw new Error("invalid fixture");
 			const response = runtime.preflight(parsed.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) throw new Error("preflight failed");
-			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: parsed.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt };
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: parsed.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken };
 			const admitted = runtime.admit(parsed.request, binding); assert.equal(admitted.ok, true, JSON.stringify(admitted)); if (!admitted.ok) throw new Error("admission failed");
 			assert.match(admitted.proof.contract.launchInputsDigest, /^[0-9a-f]{64}$/);
 			return admitted.proof;
@@ -1418,6 +1418,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(first.details.runId, firstId);
 		assert.deepEqual(first.details.results[0]?.toolRegistry?.effectiveCallerTools, ["read"]);
 		assert.deepEqual(first.details.results[0]?.toolRegistry?.missing, []);
+		assert.deepEqual(first.details.results[0]?.deniedToolCalls, []);
 		const childEnv = JSON.parse(first.details.results[0]?.finalOutput ?? "{}") as Record<string, string | null>;
 		assert.equal(childEnv.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE, null);
 		assert.equal(childEnv.PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR, null);
@@ -1469,6 +1470,64 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.deepEqual(result.toolsExtra, ["extra"]);
 		assert.equal(result.transportIncomplete, true);
 		assert.deepEqual(result.toolRegistry?.effectiveCallerTools, ["extra", "read"]);
+	});
+
+	it("projects redacted denied-tool proof without replacing successful output", async () => {
+		mockPi.onCall({ output: "bounded", deniedToolCalls: [{ tool: "read", reason: "permission_rule" }] });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denied tool", {
+			runId: "bound-denied-tool", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 0); assert.equal(result.finalOutput, "bounded");
+		assert.deepEqual(result.deniedToolCalls, [{ tool: "read", reason: "permission_rule" }]);
+		assert.equal(result.transportIncomplete, true); assert.equal(JSON.stringify(result.deniedToolCalls).includes("args"), false);
+	});
+
+	it("waits for active-bound agent settlement before final drain", async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [events.assistantMessage("waiting"), { type: "agent_end", willRetry: false }] },
+			{ delay: 1400, jsonl: [{ type: "agent_settled" }] },
+		] });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound settle", {
+			runId: "bound-denial-settle", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 0); assert.ok(Date.now() - startedAt >= 1200); assert.deepEqual(result.deniedToolCalls, []);
+	});
+
+	it("starts active-bound final drain from a valid fallback denial frame", async () => {
+		mockPi.onCall({ jsonl: [events.assistantMessage("fallback proof"), { type: "agent_end", willRetry: false }], deniedToolProofBeforeKeepAlive: true, keepAliveAfterFinalMessageMs: 5_000 });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fallback", {
+			runId: "bound-denial-fallback", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 0); assert.deepEqual(result.deniedToolCalls, []);
+		assert.ok(Date.now() - startedAt < 4_000, "valid fallback proof must release final drain before process keep-alive");
+	});
+
+	it("fails normal active-bound completion without a denial proof", async () => {
+		mockPi.onCall({ output: "must not succeed", skipDeniedToolProof: true });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound missing denial proof", {
+			runId: "bound-missing-denial", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.deniedToolCalls, undefined);
+	});
+
+	it("classifies denial fail-stop after exact registry proof as denial protocol", async () => {
+		mockPi.onCall({ output: "must not succeed", skipDeniedToolProof: true, exitCode: 78 });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fail-stop", {
+			runId: "bound-denial-fail-stop", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.toolRegistryError, undefined);
 	});
 
 	it("rejects a syntactically valid registry frame without the parent nonce", async () => {
@@ -1568,15 +1627,16 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 	});
 
 	it("preserves cancellation before the bound gate emits a frame", async () => {
-		mockPi.onCall({ waitForPath: path.join(tempDir, "never-release-bound-registry-cancel") });
-		const controller = new AbortController();
-		setTimeout(() => controller.abort(), 20);
+		mockPi.onCall({ waitForPath: path.join(tempDir, "never-release-bound-registry-cancel"), ignoreSigterm: true });
+		const controller = new AbortController(); const startedAt = Date.now();
+		setTimeout(() => controller.abort(), 500);
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound cancel", {
 			runId: "bound-registry-cancel", acceptance: false, disableWatchdog: true, signal: controller.signal,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
 			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(controller.signal.aborted, true);
+		assert.ok(Date.now() - startedAt >= 2_800, "active-bound cancellation must wait for SIGKILL and observed close");
 		assert.equal(result.nativeStatus, undefined);
 		assert.equal(result.toolRegistryError, undefined);
 	});

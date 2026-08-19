@@ -1,4 +1,4 @@
-import type { SubagentDelegationRequest, SubagentDelegationResponse } from "../api/delegation.ts";
+import type { SubagentDelegationRequest, SubagentDelegationResponse, SubagentDelegationTerminalResponse } from "../api/delegation.ts";
 
 const DEFAULT_IDENTITY_CAPACITY = 8_192;
 const GLOBAL_COORDINATOR_KEY = "__piSubagentStructuredAttemptCoordinatorV1";
@@ -23,7 +23,26 @@ export type StructuredAttemptAdmission =
 	| { accepted: true; signal: AbortSignal; isRunning: () => boolean; settle: (terminal: SubagentDelegationResponse) => void }
 	| { accepted: false; reason: "duplicate_tuple" | "duplicate_node" | "capacity" };
 
+function effectiveTerminal(record: AttemptRecord, terminal: SubagentDelegationResponse): SubagentDelegationResponse {
+	const native = terminal as SubagentDelegationTerminalResponse;
+	const proofFailure = native.status === "native_tool_registry_mismatch" || native.status === "native_tool_registry_protocol_error" || native.status === "native_denied_tools_protocol_error";
+	if ((!record.stopped && !record.controller.signal.aborted) || proofFailure) return terminal;
+	return {
+		requestId: record.request.requestId, ownerRunId: record.request.ownerRunId, nodeId: record.request.nodeId, status: "cancelled",
+		...(native.launchContractDigest ? { launchContractDigest: native.launchContractDigest } : {}),
+		...(native.toolRegistry ? { toolRegistry: native.toolRegistry } : {}),
+		...(native.toolsMissing ? { toolsMissing: native.toolsMissing } : {}),
+		...(native.toolsExtra ? { toolsExtra: native.toolsExtra } : {}),
+		...(native.toolRegistryError ? { toolRegistryError: native.toolRegistryError } : {}),
+		...(native.deniedToolCalls ? { deniedToolCalls: native.deniedToolCalls } : {}),
+		...(native.deniedToolCallsOverflow ? { deniedToolCallsOverflow: true } : {}),
+		...(native.deniedToolCallsError ? { deniedToolCallsError: native.deniedToolCallsError } : {}),
+		...(native.transportIncomplete ? { transportIncomplete: true } : {}),
+	};
+}
+
 export class StructuredAttemptCoordinator {
+	readonly contractVersion = 2 as const;
 	private readonly attemptsByTuple = new Map<string, AttemptRecord>();
 	private readonly nodeOwners = new Map<string, AttemptRecord>();
 	private readonly terminalOutbox: Array<{ record: AttemptRecord; terminal: SubagentDelegationResponse }> = [];
@@ -157,16 +176,9 @@ export class StructuredAttemptCoordinator {
 	private settle(record: AttemptRecord, terminal: SubagentDelegationResponse): void {
 		if (record.settled || this.attemptsByTuple.get(record.tupleKey) !== record) return;
 		record.settled = true;
-		const effectiveTerminal: SubagentDelegationResponse = record.stopped || record.controller.signal.aborted
-			? {
-				requestId: record.request.requestId,
-				ownerRunId: record.request.ownerRunId,
-				nodeId: record.request.nodeId,
-				status: "cancelled",
-			}
-			: terminal;
+		const projected = effectiveTerminal(record, terminal);
 		record.resolveSettled();
-		this.terminalOutbox.push({ record, terminal: effectiveTerminal });
+		this.terminalOutbox.push({ record, terminal: projected });
 		this.flush();
 	}
 
@@ -200,7 +212,20 @@ export function getStructuredAttemptCoordinator(): StructuredAttemptCoordinator 
 	if (existing && typeof existing === "object"
 		&& typeof (existing as StructuredAttemptCoordinator).admit === "function"
 		&& typeof (existing as StructuredAttemptCoordinator).activateSink === "function") {
-		return existing as StructuredAttemptCoordinator;
+		const legacy = existing as { contractVersion?: number; settle?: (record: AttemptRecord, terminal: SubagentDelegationResponse) => void };
+		if (legacy.contractVersion !== 2) {
+			const originalSettle = legacy.settle;
+			if (typeof originalSettle !== "function") throw new Error("Incompatible process-global structured attempt coordinator.");
+			legacy.settle = function (this: unknown, record: AttemptRecord, terminal: SubagentDelegationResponse) {
+				const projected = effectiveTerminal(record, terminal);
+				const stopped = record.stopped; const controller = record.controller;
+				if (stopped || controller.signal.aborted) { record.stopped = false; record.controller = new AbortController(); }
+				try { return originalSettle.call(this, record, projected); }
+				finally { record.stopped = stopped; record.controller = controller; }
+			};
+			Object.defineProperty(legacy, "contractVersion", { value: 2, enumerable: false, configurable: false, writable: false });
+		}
+		return legacy as unknown as StructuredAttemptCoordinator;
 	}
 	const coordinator = new StructuredAttemptCoordinator();
 	store[GLOBAL_COORDINATOR_KEY] = coordinator;

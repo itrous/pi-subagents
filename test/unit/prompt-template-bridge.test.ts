@@ -13,6 +13,7 @@ import {
 import type { PromptTemplateBridgeResult } from "../../src/slash/delegation-adapters.ts";
 import { BOUND_IDENTITY_REGISTRY_GLOBAL_KEY, BoundIdentityRegistry, getBoundIdentityRegistry } from "../../src/slash/bound-identity-registry.ts";
 import { StructuredAttemptCoordinator } from "../../src/slash/structured-attempt-coordinator.ts";
+import { BoundPendingCancellationRegistryV1 } from "../../src/slash/bound-pending-cancellation-registry.ts";
 
 class FakeEvents implements PromptTemplateBridgeEvents {
 	private handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -66,6 +67,7 @@ function boundRequest(overrides: Record<string, unknown> = {}): Record<string, u
 			expectedSourceIdentityDigest: "a".repeat(64), expectedActiveSessionDigest: "b".repeat(64),
 			requestDigest: "c".repeat(64), expectedLaunchContractDigest: "d".repeat(64),
 			receipt: { version: 1, algorithm: "HMAC-SHA256", payload: { version: 1, serverInstanceId: target, sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: run, requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 30001 }, mac: "e".repeat(64) },
+			cancellationToken: { version: 1, algorithm: "HMAC-SHA256", payload: { version: 1, serverInstanceId: target, sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: run, requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 30001, requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1" }, mac: "f".repeat(64) },
 		},
 		...overrides,
 	});
@@ -275,6 +277,36 @@ describe("prompt-template delegation bridge", () => {
 		assert.equal(response.status, "completed");
 		assert.equal(executeCalls, 1);
 
+		bridge.dispose();
+	});
+
+	it("authenticates and consumes a bound cancel before synchronous started", () => {
+		const events = new FakeEvents(); const responses: any[] = []; const started: any[] = []; let executes = 0;
+		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, (value) => responses.push(value)); events.on(PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT, (value) => started.push(value));
+		const request = boundRequest(); const binding = request.binding as any;
+		const runtime = { version: 1 as const, serverInstanceId: binding.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), preflight: () => ({ version: 1 as const, code: "invalid_request" as const }), admit: () => ({ ok: true as const, proof: {} as any }), verifyPendingCancellation: () => true, recheck: () => true, claimBase: () => true, dispose: () => {} };
+		const bridge = registerPromptTemplateDelegationBridge({ events, coordinator: new StructuredAttemptCoordinator(), activeBoundRuntime: runtime, boundIdentityRegistry: new BoundIdentityRegistry(), pendingCancellationRegistry: new BoundPendingCancellationRegistryV1(() => 1, 8), getContext: () => ({ cwd: "/repo" }), executeStructured: async () => { executes++; return {} as any; }, execute: async () => assert.fail() });
+		bridge.activate(); bridge.activateTerminalSink();
+		let accessorRead = false; const maliciousCancel = { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId } as Record<string, unknown>;
+		Object.defineProperty(maliciousCancel, "binding", { enumerable: true, get() { accessorRead = true; throw new Error("must not read"); } });
+		assert.doesNotThrow(() => events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, maliciousCancel)); assert.equal(accessorRead, false);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId, binding });
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, request);
+		assert.equal(executes, 0); assert.deepEqual(started, []); assert.equal(responses.length, 1); assert.equal(responses[0].status, "cancelled");
+		bridge.dispose();
+	});
+
+	it("validates a targeted cancel before aborting an admitted bound request", async () => {
+		const events = new FakeEvents(); const request = boundRequest(); const binding = request.binding as any; let admittedSignal: AbortSignal | undefined;
+		const runtime = { version: 1 as const, serverInstanceId: binding.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), preflight: () => ({ version: 1 as const, code: "invalid_request" as const }), admit: () => ({ ok: true as const, proof: {} as any }), verifyPendingCancellation: (_tuple: unknown, candidate: any) => candidate?.cancellationToken?.mac === binding.cancellationToken.mac, recheck: () => true, claimBase: () => true, dispose: () => {} };
+		const bridge = registerPromptTemplateDelegationBridge({ events, coordinator: new StructuredAttemptCoordinator(), activeBoundRuntime: runtime, boundIdentityRegistry: new BoundIdentityRegistry(), pendingCancellationRegistry: new BoundPendingCancellationRegistryV1(() => 1, 8), getContext: () => ({ cwd: "/repo" }), executeStructured: async (_id, _params, signal) => await new Promise((_resolve, reject) => { admittedSignal = signal; signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }); }), execute: async () => assert.fail() });
+		bridge.activate(); bridge.activateTerminalSink(); const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, request);
+		const forged = structuredClone(binding); forged.cancellationToken.mac = "0".repeat(64);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId, binding: forged });
+		assert.equal(admittedSignal?.aborted, false);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId, binding });
+		assert.equal((await responsePromise as { status: string }).status, "cancelled");
 		bridge.dispose();
 	});
 

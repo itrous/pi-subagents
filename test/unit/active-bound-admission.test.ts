@@ -39,12 +39,14 @@ describe("active-bound runtime admission", () => {
 			const response = f.runtime.preflight(f.request);
 			assert.equal("code" in response, false, JSON.stringify(response));
 			if ("code" in response) return;
-			assert.deepEqual(Object.keys(response), ["version", "serverInstanceId", "sourceIdentityDigest", "activeSessionDigest", "canonicalCwd", "requestDigest", "launchContract", "launchContractDigest", "receipt"]);
+			assert.deepEqual(Object.keys(response), ["version", "serverInstanceId", "sourceIdentityDigest", "activeSessionDigest", "canonicalCwd", "requestDigest", "launchContract", "launchContractDigest", "receipt", "cancellationToken"]);
 			const binding = {
 				version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: f.request.prospectiveRunId,
 				expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest,
-				requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt,
+				requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken,
 			};
+			assert.equal(f.runtime.verifyPendingCancellation({ requestId: f.request.requestId, ownerRunId: f.request.ownerRunId, nodeId: f.request.nodeId }, binding), true);
+			assert.equal(f.runtime.verifyPendingCancellation({ requestId: "wrong", ownerRunId: f.request.ownerRunId, nodeId: f.request.nodeId }, binding), false);
 			const admitted = f.runtime.admit(f.request, binding);
 			assert.equal(admitted.ok, true);
 			if (!admitted.ok) return;
@@ -69,7 +71,7 @@ describe("active-bound runtime admission", () => {
 			const response = f.runtime.preflight(f.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) return;
 			assert.equal(fs.existsSync(f.sessionRoot), false);
 			assert.deepEqual(fs.readdirSync(f.root, { recursive: true }).map(String).sort(), beforeEntries);
-			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: f.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt };
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: f.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken };
 			const admitted = f.runtime.admit(f.request, binding); assert.equal(admitted.ok, true); if (!admitted.ok) return;
 			assert.equal(fs.existsSync(f.sessionRoot), false);
 			assert.deepEqual(fs.readdirSync(f.root, { recursive: true }).map(String).sort(), beforeEntries);
@@ -101,7 +103,7 @@ describe("active-bound runtime admission", () => {
 		const f = fixture();
 		try {
 			const response = f.runtime.preflight(f.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) return;
-			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: f.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt };
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: f.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken };
 			fs.mkdirSync(path.join(f.sessionRoot, f.request.prospectiveRunId));
 			assert.equal(f.runtime.admit(f.request, binding).ok, false);
 			fs.rmSync(path.join(f.sessionRoot, f.request.prospectiveRunId), { recursive: true });

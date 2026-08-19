@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { SubagentDelegationRequest, SubagentDelegationResponse } from "../../src/api/delegation.ts";
-import { StructuredAttemptCoordinator } from "../../src/slash/structured-attempt-coordinator.ts";
+import { StructuredAttemptCoordinator, getStructuredAttemptCoordinator } from "../../src/slash/structured-attempt-coordinator.ts";
 
 function request(requestId = "r1", nodeId = "n1"): SubagentDelegationRequest {
 	return { requestId, ownerRunId: "owner", nodeId, agent: "worker", task: "work", context: "fresh", cwd: "/repo", result: { kind: "text" } };
@@ -45,6 +45,27 @@ describe("structured attempt coordinator", () => {
 		assert.equal(secondSignal?.aborted, true);
 	});
 
+	it("preserves validated native proof fields when cancellation owns terminal status", () => {
+		const coordinator = new StructuredAttemptCoordinator(); const value = request(); const admitted = coordinator.admit(value, "A"); assert.equal(admitted.accepted, true);
+		const delivered: SubagentDelegationResponse[] = []; coordinator.activateSink("A", (payload) => delivered.push(payload)); coordinator.cancel(value.requestId, value.ownerRunId, value.nodeId);
+		if (admitted.accepted) admitted.settle({ ...terminal(value), deniedToolCalls: [], toolRegistry: { version: 1, projectionVersion: 1, required: [], effectiveCallerTools: [], internalTools: [], missing: [], digest: "0".repeat(64) } } as any);
+		assert.equal(delivered[0]?.status, "cancelled"); assert.deepEqual((delivered[0] as any).deniedToolCalls, []); assert.ok((delivered[0] as any).toolRegistry);
+	});
+
+	it("keeps registry failure status ahead of a racing cancellation", () => {
+		const coordinator = new StructuredAttemptCoordinator(); const value = request(); const admitted = coordinator.admit(value, "A"); const delivered: SubagentDelegationResponse[] = [];
+		coordinator.activateSink("A", (payload) => delivered.push(payload)); coordinator.cancel(value.requestId, value.ownerRunId, value.nodeId);
+		if (admitted.accepted) admitted.settle({ ...terminal(value), status: "native_tool_registry_mismatch", toolsExtra: ["extra"], transportIncomplete: true } as any);
+		assert.equal(delivered[0]?.status, "native_tool_registry_mismatch"); assert.deepEqual((delivered[0] as any).toolsExtra, ["extra"]);
+	});
+
+	it("keeps complete denied-proof protocol failure ahead of cancellation", () => {
+		const coordinator = new StructuredAttemptCoordinator(); const value = request(); const admitted = coordinator.admit(value, "A"); const delivered: SubagentDelegationResponse[] = [];
+		coordinator.activateSink("A", (payload) => delivered.push(payload)); coordinator.cancel(value.requestId, value.ownerRunId, value.nodeId);
+		if (admitted.accepted) admitted.settle({ ...terminal(value), status: "native_denied_tools_protocol_error", deniedToolCallsError: "multiple_frames", transportIncomplete: true } as any);
+		assert.equal(delivered[0]?.status, "native_denied_tools_protocol_error"); assert.equal((delivered[0] as any).deniedToolCallsError, "multiple_frames");
+	});
+
 	it("commits delivery before a throwing listener and never replays it", () => {
 		const coordinator = new StructuredAttemptCoordinator();
 		const value = request();
@@ -75,6 +96,17 @@ describe("structured attempt coordinator", () => {
 		coordinator.activateSink("A", () => {});
 		if (one.accepted) one.settle(terminal(request("one", "one")));
 		assert.deepEqual(coordinator.admit(request("four", "four"), "A"), { accepted: false, reason: "capacity" });
+	});
+
+	it("upgrades a process-global previous-generation settle contract in place", () => {
+		const key = "__piSubagentStructuredAttemptCoordinatorV1"; const prior = (globalThis as any)[key]; let seen: any;
+		const legacy: any = { admit() {}, activateSink() {}, settle(record: any, terminalValue: any) { seen = record.stopped || record.controller.signal.aborted ? { status: "cancelled" } : terminalValue; } };
+		(globalThis as any)[key] = legacy;
+		try {
+			const upgraded = getStructuredAttemptCoordinator() as any; const controller = new AbortController(); controller.abort();
+			upgraded.settle({ stopped: false, controller, request: { requestId: "r", ownerRunId: "o", nodeId: "n" } }, { requestId: "r", ownerRunId: "o", nodeId: "n", status: "native_tool_registry_mismatch", toolsExtra: ["extra"] });
+			assert.equal(upgraded, legacy); assert.equal(upgraded.contractVersion, 2); assert.equal(seen.status, "native_tool_registry_mismatch");
+		} finally { if (prior === undefined) delete (globalThis as any)[key]; else (globalThis as any)[key] = prior; }
 	});
 
 	it("drains only attempts owned by the stopped runtime", async () => {

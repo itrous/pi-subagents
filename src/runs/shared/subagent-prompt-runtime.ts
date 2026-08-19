@@ -26,6 +26,7 @@ import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
 import { resolveWaitToolConfig } from "../background/wait-config.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
+import { recordBoundDeniedTool, registerBoundDeniedToolLifecycle } from "./bound-denied-tool-runtime.ts";
 
 const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV = "PI_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 const SUBAGENT_INHERIT_SKILLS_ENV = "PI_SUBAGENT_INHERIT_SKILLS";
@@ -293,7 +294,7 @@ export function registerPermissionGate(
 		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
 		const decision = permissionDecision(rules, toolName);
 		if (decision === "allow") return undefined;
-		if (decision === "deny") return { block: true, reason: `Blocked by pi-subagents permission rule: '${toolName}' is denied.` };
+		if (decision === "deny") { recordBoundDeniedTool(toolName, "permission_rule"); return { block: true, reason: `Blocked by pi-subagents permission rule: '${toolName}' is denied.` }; }
 		const result = await requestPermission({
 			ctx,
 			toolName,
@@ -325,6 +326,7 @@ function registerToolBudget(pi: ExtensionAPI, budget: ResolvedToolBudget | undef
 			}
 		}
 		if (!shouldBlockToolForBudget(budget, toolName, toolCount)) return undefined;
+		recordBoundDeniedTool(toolName, "tool_budget");
 		return { block: true, reason: toolBudgetBlockedMessage(budget, toolName, toolCount) };
 	});
 }
@@ -539,6 +541,7 @@ export function registerSteeringInbox(
 }
 
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
+	registerBoundDeniedToolLifecycle(pi);
 	registerRuntimeExtensionAcknowledgements(pi);
 	registerSteeringInbox(pi);
 	registerPermissionGate(pi);

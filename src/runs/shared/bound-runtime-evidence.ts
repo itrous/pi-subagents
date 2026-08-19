@@ -59,8 +59,10 @@ export function attestBoundRuntimeExtensions(paths: readonly string[]): BoundRun
 		...paths,
 		...(hasRegistryGate ? [
 			path.join(sharedDir, "bound-tool-registry-runtime.ts"),
+			path.join(sharedDir, "bound-denied-tool-runtime.ts"),
 			path.join(sharedDir, "bound-tool-registry-state.cjs"),
 			path.join(sharedDir, "tool-registry-proof.ts"),
+			path.join(sharedDir, "denied-tool-proof.ts"),
 			path.join(sharedDir, "bound-runtime-evidence.ts"),
 			path.join(sharedDir, "package-tree-evidence.ts"),
 			path.join(sharedDir, "../../slash/delegation-json.ts"),

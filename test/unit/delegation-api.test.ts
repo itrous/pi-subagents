@@ -61,6 +61,7 @@ const boundBinding = {
 	version: 1 as const, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000",
 	expectedSourceIdentityDigest: "a".repeat(64), expectedActiveSessionDigest: "b".repeat(64), requestDigest: "c".repeat(64), expectedLaunchContractDigest: "d".repeat(64),
 	receipt: { version: 1 as const, algorithm: "HMAC-SHA256" as const, payload: { version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 2 }, mac: "e".repeat(64) },
+	cancellationToken: { version: 1 as const, algorithm: "HMAC-SHA256" as const, payload: { version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 2, requestId: "attempt-1", ownerRunId: "owner-1", nodeId: "node-1" }, mac: "f".repeat(64) },
 };
 
 const request: SubagentDelegationRequest = {

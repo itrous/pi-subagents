@@ -39,6 +39,16 @@ function writeBoundToolRegistryProof(response) {
 	fs.closeSync(fd);
 }
 
+function writeDeniedToolProof(response) {
+	if (response.skipDeniedToolProof) return;
+	const encoded = process.env.PI_SUBAGENT_TOOL_REGISTRY_POLICY;
+	if (!encoded) return;
+	const policy = JSON.parse(encoded); const fd = Number(policy.denialFd);
+	if (!Number.isInteger(fd) || fd !== 4) return;
+	const frame = { version: 1, kind: "denied_tool_calls", calls: response.deniedToolCalls ?? [], overflow: response.deniedToolCallsOverflow === true, proofNonce: response.deniedToolProofNonce ?? policy.proofNonce };
+	fs.writeSync(fd, `${JSON.stringify(frame)}\n`); fs.closeSync(fd);
+}
+
 function exitAfterFlush(code) {
 	// process.exit() can truncate buffered stdout/stderr on slow runners (e.g.
 	// GitHub Actions), dropping the final lines the parent executor needs to see
@@ -428,10 +438,12 @@ async function main() {
 		process.stderr.write(response.stderr);
 	}
 
+	if (response.deniedToolProofBeforeKeepAlive === true) writeDeniedToolProof(response);
 	if (typeof response.keepAliveAfterFinalMessageMs === "number" && response.keepAliveAfterFinalMessageMs > 0) {
 		await new Promise((resolve) => setTimeout(resolve, response.keepAliveAfterFinalMessageMs));
 	}
 
+	if (response.deniedToolProofBeforeKeepAlive !== true) writeDeniedToolProof(response);
 	if (typeof response.signal === "string") {
 		process.kill(process.pid, response.signal);
 		return;

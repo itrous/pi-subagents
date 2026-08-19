@@ -73,6 +73,7 @@ import { captureSingleOutputSnapshot, extractChildWrittenOutput, formatSavedOutp
 import { BOUND_PACKAGE_MUTATION_EXIT, BOUND_TOOL_REGISTRY_ACTIVE_ENV, BOUND_TOOL_REGISTRY_FD_ENV, BOUND_TOOL_REGISTRY_POLICY_ENV } from "../shared/bound-tool-registry-runtime.ts";
 import { createToolRegistryCollector, type ToolRegistryCollected, type ToolRegistryCollector } from "../shared/tool-registry-collector.ts";
 import { expectedToolRegistryProjection } from "../shared/tool-registry-proof.ts";
+import { createDeniedToolCollector, type DeniedToolCollected, type DeniedToolCollector } from "../shared/denied-tool-proof.ts";
 import {
 	buildModelCandidates,
 	formatModelAttemptNote,
@@ -163,6 +164,16 @@ function applyBoundToolRegistryOutcome(result: SingleResult, collection: ToolReg
 		result.transportIncomplete = true;
 		result.error = `Native tool registry mismatch (missing: ${missing.join(", ") || "none"}; extra: ${extra.join(", ") || "none"}).`;
 	}
+}
+
+function applyDeniedToolOutcome(result: SingleResult, collection: DeniedToolCollected): void {
+	if (!collection.ok) {
+		result.exitCode = 1; result.nativeStatus = "native_denied_tools_protocol_error"; result.deniedToolCallsError = collection.code;
+		result.transportIncomplete = true; result.error = `Native denied-tool proof failed: ${collection.code}.`; return;
+	}
+	result.deniedToolCalls = collection.frame.calls.map((call) => ({ ...call }));
+	if (collection.frame.overflow) result.deniedToolCallsOverflow = true;
+	if (collection.frame.calls.length > 0 || collection.frame.overflow) result.transportIncomplete = true;
 }
 
 function withRunContext<T extends SingleResult>(result: T, context: RunSyncOptions["context"]): T {
@@ -588,6 +599,7 @@ async function runSingleAttempt(
 		spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
 			...options.activeBoundToolRegistry,
 			proofNonce: toolRegistryProofNonce,
+			denialFd: 4,
 			runtimeExtensions: boundRuntimeExtensions,
 			packageExtensions: (boundPackageExtensions?.attestations ?? []).map((entry) => ({ ...entry })),
 		});
@@ -600,6 +612,8 @@ async function runSingleAttempt(
 	let artifactActivationFailed = false;
 	let artifactActivationPending = Boolean(shared.activateDeferredArtifacts);
 	let toolRegistryCollector: ToolRegistryCollector | undefined;
+	let deniedToolCollector: DeniedToolCollector | undefined;
+	let deniedToolProofReceived = false;
 	let childSpawned = false;
 	const exitCode = await new Promise<number>((resolve, reject) => {
 		const spawnSpec = getPiSpawnCommand(args);
@@ -616,13 +630,16 @@ async function runSingleAttempt(
 			proc = spawn(spawnSpec.command, spawnSpec.args, {
 				cwd: options.cwd ?? runtimeCwd,
 				env: spawnEnv,
-				stdio: options.activeBoundToolRegistry ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+				stdio: options.activeBoundToolRegistry ? ["ignore", "pipe", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
 				windowsHide: true,
 			}) as ChildProcessByStdio<null, Readable, Readable>;
 			if (options.activeBoundToolRegistry) {
 				const proofStream = (proc as unknown as { stdio: Array<unknown> }).stdio[3];
 				if (!proofStream || typeof (proofStream as Readable).on !== "function") throw new Error("Bound registry proof pipe was not created.");
 				toolRegistryCollector = createToolRegistryCollector(proofStream as Readable, toolRegistryProofNonce!);
+				const denialStream = (proc as unknown as { stdio: Array<unknown> }).stdio[4];
+				if (!denialStream || typeof (denialStream as Readable).on !== "function") throw new Error("Bound denial proof pipe was not created.");
+				deniedToolCollector = createDeniedToolCollector(denialStream as Readable, toolRegistryProofNonce!);
 			}
 		} catch (error) {
 			cleanupTempDir(tempDir);
@@ -766,6 +783,7 @@ async function runSingleAttempt(
 			}
 		};
 		const startFinalDrain = () => {
+			if (options.activeBoundToolRegistry && !agentSettledReceived && !deniedToolProofReceived) return;
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
@@ -787,6 +805,11 @@ async function runSingleAttempt(
 			}, FINAL_STOP_GRACE_MS);
 			finalDrainTimer.unref?.();
 		};
+		if (deniedToolCollector) void deniedToolCollector.result.then((collection) => {
+			if (!collection.ok) return;
+			deniedToolProofReceived = true;
+			startFinalDrain();
+		});
 		function armWatchdogTail(): void {
 			if ((!cleanTerminalAssistantStopReceived && !agentSettledReceived) || watchdogTailTimer || lifecycleFinished || processClosed) return;
 			watchdogTailTimer = setTimeout(() => {
@@ -1248,8 +1271,7 @@ async function runSingleAttempt(
 		proc.on("exit", () => {
 			childExited = true;
 			clearFinalDrainTimers();
-			if (toolRegistryCollector) {
-				const collector = toolRegistryCollector;
+			for (const collector of [toolRegistryCollector, deniedToolCollector]) if (collector) {
 				const finalizationTimer = setTimeout(() => collector.finalize(), 100);
 				void collector.result.finally(() => clearTimeout(finalizationTimer));
 			}
@@ -1258,6 +1280,7 @@ async function runSingleAttempt(
 			if (lifecycleFinished) return;
 			processClosed = true;
 			toolRegistryCollector?.finalize();
+			deniedToolCollector?.finalize();
 			clearFinalDrainTimers();
 			clearStdioGuard();
 			stdoutReader.end();
@@ -1298,6 +1321,7 @@ async function runSingleAttempt(
 			if (lifecycleFinished) return;
 			processClosed = true;
 			toolRegistryCollector?.finalize();
+			deniedToolCollector?.finalize();
 			clearFinalDrainTimers();
 			clearStdioGuard();
 			void jsonlWriter.close().catch(() => {
@@ -1315,8 +1339,9 @@ async function runSingleAttempt(
 		if (options.signal) {
 			const kill = () => {
 				if (processClosed || lifecycleFinished) return;
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				trySignalChild(proc, "SIGTERM");
+				const cancellationHardKill = setTimeout(() => { if (options.activeBoundToolRegistry || !proc.killed) trySignalChild(proc, "SIGKILL"); }, 3000);
+				cancellationHardKill.unref?.();
 			};
 			if (options.signal.aborted) kill();
 			else {
@@ -1375,17 +1400,22 @@ async function runSingleAttempt(
 			}
 		} else if (!((result.timedOut || options.signal?.aborted || interruptedByControl) && !collection.ok && (collection.code === "missing_frame" || (collection.code === "invalid_frame" && collection.partial === true)))) {
 			applyBoundToolRegistryOutcome(result, collection, options.activeBoundToolRegistry);
-			if (exitCode === 78 && result.toolRegistry && !result.nativeStatus) {
-				result.toolRegistry = undefined;
-				result.toolsMissing = undefined;
-				result.toolsExtra = undefined;
-				result.exitCode = 1;
-				result.nativeStatus = "native_tool_registry_protocol_error";
-				result.toolRegistryError = "invalid_frame";
-				result.transportIncomplete = true;
-				result.error = "Native tool registry gate exited without a measured mismatch.";
-			}
 		}
+	}
+	if (options.activeBoundToolRegistry && !artifactActivationFailed && childSpawned && !result.nativeStatus) {
+		const denial = deniedToolCollector ? await deniedToolCollector.result : { ok: false as const, code: "missing_frame" as const };
+		const interrupted = result.timedOut || options.signal?.aborted || interruptedByControl;
+		if (!(interrupted && !denial.ok && (denial.code === "missing_frame" || (denial.code === "invalid_frame" && denial.partial === true)))) applyDeniedToolOutcome(result, denial);
+	}
+	if (options.activeBoundToolRegistry && exitCode === 78 && result.toolRegistry && !result.nativeStatus) {
+		result.toolRegistry = undefined;
+		result.toolsMissing = undefined;
+		result.toolsExtra = undefined;
+		result.exitCode = 1;
+		result.nativeStatus = "native_tool_registry_protocol_error";
+		result.toolRegistryError = "invalid_frame";
+		result.transportIncomplete = true;
+		result.error = "Native tool registry gate exited without a measured mismatch.";
 	}
 	if (interruptedByControl && !artifactActivationFailed && !result.nativeStatus) {
 		result.exitCode = 0;

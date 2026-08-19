@@ -70,11 +70,11 @@ export function subagentDelegationBindingTarget(input: unknown): string | undefi
 	return target && "value" in target && typeof target.value === "string" && UUID.test(target.value) ? target.value : undefined;
 }
 
-function parseBinding(input: unknown): SubagentDelegationBindingV1 | undefined {
+export function parseSubagentDelegationBinding(input: unknown): SubagentDelegationBindingV1 | undefined {
 	const inspected = cloneJsonWithinByteLimit(input, 32 * 1024);
 	if (!inspected.ok || !record(inspected.value)) return undefined;
 	const value = inspected.value;
-	if (!exactKeys(value, ["version", "targetServerInstanceId", "prospectiveRunId", "expectedSourceIdentityDigest", "expectedActiveSessionDigest", "requestDigest", "expectedLaunchContractDigest", "receipt"])) return undefined;
+	if (!exactKeys(value, ["version", "targetServerInstanceId", "prospectiveRunId", "expectedSourceIdentityDigest", "expectedActiveSessionDigest", "requestDigest", "expectedLaunchContractDigest", "receipt", "cancellationToken"])) return undefined;
 	if (value.version !== 1 || typeof value.targetServerInstanceId !== "string" || !UUID.test(value.targetServerInstanceId)
 		|| typeof value.prospectiveRunId !== "string" || !UUID.test(value.prospectiveRunId)
 		|| ![value.expectedSourceIdentityDigest, value.expectedActiveSessionDigest, value.requestDigest, value.expectedLaunchContractDigest].every((entry) => typeof entry === "string" && DIGEST.test(entry))) return undefined;
@@ -82,6 +82,10 @@ function parseBinding(input: unknown): SubagentDelegationBindingV1 | undefined {
 	if (!record(receipt) || !exactKeys(receipt, ["version", "algorithm", "payload", "mac"])
 		|| receipt.version !== 1 || receipt.algorithm !== "HMAC-SHA256" || typeof receipt.mac !== "string" || !DIGEST.test(receipt.mac)
 		|| !record(receipt.payload) || !exactKeys(receipt.payload, ["version", "serverInstanceId", "sourceIdentityDigest", "activeSessionDigest", "prospectiveRunId", "requestDigest", "launchContractDigest", "issuedAt", "expiresAt"])) return undefined;
+	const cancellationToken = value.cancellationToken;
+	if (!record(cancellationToken) || !exactKeys(cancellationToken, ["version", "algorithm", "payload", "mac"])
+		|| cancellationToken.version !== 1 || cancellationToken.algorithm !== "HMAC-SHA256" || typeof cancellationToken.mac !== "string" || !DIGEST.test(cancellationToken.mac)
+		|| !record(cancellationToken.payload) || !exactKeys(cancellationToken.payload, ["version", "serverInstanceId", "sourceIdentityDigest", "activeSessionDigest", "prospectiveRunId", "requestDigest", "launchContractDigest", "issuedAt", "expiresAt", "requestId", "ownerRunId", "nodeId"])) return undefined;
 	return {
 		version: 1,
 		targetServerInstanceId: value.targetServerInstanceId,
@@ -91,6 +95,7 @@ function parseBinding(input: unknown): SubagentDelegationBindingV1 | undefined {
 		requestDigest: value.requestDigest as string,
 		expectedLaunchContractDigest: value.expectedLaunchContractDigest as string,
 		receipt: receipt as unknown as LaunchReceiptV1,
+		cancellationToken: cancellationToken as unknown as import("../api/launch-receipt.ts").LaunchCancellationTokenV1,
 	};
 }
 
@@ -213,7 +218,7 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 		return { ok: false, ...identity, error: "artifacts must be a boolean." };
 	}
 	if (value.artifactDir !== undefined && value.artifactDir !== "session") return { ok: false, ...identity, error: "artifactDir must be session when provided." };
-	const binding = value.binding === undefined ? undefined : parseBinding(value.binding);
+	const binding = value.binding === undefined ? undefined : parseSubagentDelegationBinding(value.binding);
 	if (value.binding !== undefined && !binding) return { ok: false, ...identity, error: "binding must be a closed active-bound v1 proof." };
 	if (!binding && value.environment !== undefined) return { ok: false, ...identity, error: "environment is supported only for bound delegation." };
 	if (!binding && value.artifactDir !== undefined) return { ok: false, ...identity, error: "artifactDir is supported only for bound delegation." };

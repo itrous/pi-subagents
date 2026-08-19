@@ -14,12 +14,12 @@ import { SUPPORTED_BOUND_PI_VERSIONS } from "../../src/runs/shared/tool-registry
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const piBinary = process.env.PI_SUBAGENT_PI_BINARY || "pi";
 
-function runPi(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; fd3: number }): Promise<{ status: number | null; stderr: string }> {
+function runPi(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; fd3: number; fd4: number }): Promise<{ status: number | null; stderr: string }> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(piBinary, args, {
 			cwd: options.cwd,
 			env: { ...options.env, PI_OFFLINE: "1" },
-			stdio: ["ignore", "ignore", "pipe", options.fd3],
+			stdio: ["ignore", "ignore", "pipe", options.fd3, options.fd4],
 		});
 		let stderr = "";
 		child.stderr.setEncoding("utf8"); child.stderr.on("data", (chunk) => { stderr += chunk; });
@@ -73,12 +73,12 @@ test("installed Pi loads an exact mediated registry before one loopback provider
 		];
 		const evidenceRoot = packageEvidenceRoot(packageDir);
 		const policy = {
-			version: 1, modelApi: "openai-completions", piRuntimeVersion: version, proofNonce: "e".repeat(64), required: ["probe_tool"], internalTools: [],
+			version: 1, modelApi: "openai-completions", piRuntimeVersion: version, proofNonce: "e".repeat(64), denialFd: 4, required: ["probe_tool"], internalTools: [],
 			runtimeExtensions: attestBoundRuntimeExtensions(runtimeExtensionPaths),
 			packageExtensions: [{ path: packageExtension, contentDigest: createHash("sha256").update(fs.readFileSync(packageExtension)).digest("hex"), evidenceRoot, evidenceRootDigest: createHash("sha256").update(evidenceRoot).digest("hex"), packageTreeDigest: packageTreeDigest(packageExtension, evidenceRoot) }],
 		};
 		const proofPath = path.join(root, "proof");
-		const proofFd = fs.openSync(proofPath, "w");
+		const proofFd = fs.openSync(proofPath, "w"); const denialPath = path.join(root, "denial-proof"); const denialFd = fs.openSync(denialPath, "w");
 		let gated;
 		try {
 			gated = await runPi([
@@ -92,9 +92,9 @@ test("installed Pi loads an exact mediated registry before one loopback provider
 					...process.env, PI_CODING_AGENT_DIR: agentDir, BOUND_MARKER: marker,
 					PI_SUBAGENT_TOOL_REGISTRY_ACTIVE: "1", PI_SUBAGENT_TOOL_REGISTRY_POLICY: JSON.stringify(policy), PI_SUBAGENT_TOOL_REGISTRY_FD: "3",
 				},
-				fd3: proofFd,
+				fd3: proofFd, fd4: denialFd,
 			});
-		} finally { fs.closeSync(proofFd); }
+		} finally { fs.closeSync(proofFd); fs.closeSync(denialFd); }
 		assert.equal(gated.status, 0, gated.stderr);
 		assert.equal(providerRequests, 1);
 		assert.deepEqual(wireNames, ["probe_tool"], wireBody);
@@ -103,6 +103,7 @@ test("installed Pi loads an exact mediated registry before one loopback provider
 		assert.equal(frame.kind, "registry");
 		assert.deepEqual(frame.projection.required, ["probe_tool"]);
 		assert.deepEqual(frame.projection.effectiveCallerTools, ["probe_tool"]);
+		assert.deepEqual(JSON.parse(fs.readFileSync(denialPath, "utf8")), { version: 1, kind: "denied_tool_calls", calls: [], overflow: false, proofNonce: "e".repeat(64) });
 	} finally {
 		server.close(); server.closeAllConnections(); for (const socket of sockets) socket.destroy();
 		fs.rmSync(root, { recursive: true, force: true });

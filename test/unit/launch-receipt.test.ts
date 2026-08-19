@@ -36,6 +36,15 @@ describe("launch receipt service", () => {
 		assert.equal(service.verify({ ...receipt, payload: { ...receipt.payload, expiresAt: 31_001 } }), false);
 	});
 
+	it("issues a domain-separated cancellation token bound to the exact tuple", () => {
+		const service = createLaunchReceiptService({ secret: Buffer.alloc(32, 9), clock: () => 1000 });
+		const receipt = service.issue(INPUT); const tuple = { requestId: "r", ownerRunId: "o", nodeId: "n" };
+		const token = service.issueCancellation(receipt, tuple);
+		assert.equal(service.verifyCancellation(token), true); assert.notEqual(token.mac, receipt.mac);
+		for (const field of ["requestId", "ownerRunId", "nodeId"] as const) assert.equal(service.verifyCancellation({ ...token, payload: { ...token.payload, [field]: `${token.payload[field]}x` } }), false);
+		assert.equal(service.verifyCancellation({ ...token, payload: { ...token.payload, requestDigest: "f".repeat(64) } }), false);
+	});
+
 	it("uses distinct default secrets for an identical payload", () => {
 		const one = createLaunchReceiptService({ clock: () => 50 });
 		const two = createLaunchReceiptService({ clock: () => 50 });

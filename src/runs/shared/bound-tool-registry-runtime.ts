@@ -34,6 +34,9 @@ interface RuntimeState {
 	fd: number;
 	frameWritten: boolean;
 	barrierCommitted: boolean;
+	denialCalls: import("./denied-tool-proof.ts").DeniedToolCallV1[];
+	denialOverflow: boolean;
+	denialWritten: boolean;
 	restoreResolver?: () => void;
 	allowInputRegistrationNoop?: boolean;
 	exit: (code: number) => never;
@@ -53,7 +56,7 @@ export function initializeBoundToolRegistryBootstrap(): void {
 	try { parsed = JSON.parse(encoded!); } catch { process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT); }
 	const policy = validateBoundToolRegistryPolicy(parsed);
 	if (!policy) process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT);
-	runtimeHolder.state = { policy, fd: Number(fdText), frameWritten: false, barrierCommitted: false, exit: process.exit.bind(process) };
+	runtimeHolder.state = { policy, fd: Number(fdText), frameWritten: false, barrierCommitted: false, denialCalls: [], denialOverflow: false, denialWritten: false, exit: process.exit.bind(process) };
 }
 
 function writeFrame(frame: ToolRegistryChildFrameV1): void {

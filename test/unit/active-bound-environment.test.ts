@@ -36,7 +36,7 @@ describe("active-bound child environment", () => {
 
 	it("copies the bound wire environment into the admitted request", () => {
 		const environment = { ONECPI_REVIEW_ROOT: "/root" } as const;
-		const request = activeBoundRequestFromDelegation({ requestId: "r", ownerRunId: "o", nodeId: "n", agent: "worker", task: "task", context: "fresh", cwd: "/repo", model: "test/exact", thinking: "off", environment, artifacts: false, result: { kind: "text" } }, { version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", expectedSourceIdentityDigest: "a".repeat(64), expectedActiveSessionDigest: "b".repeat(64), requestDigest: "c".repeat(64), expectedLaunchContractDigest: "d".repeat(64), receipt: {} as never });
+		const request = activeBoundRequestFromDelegation({ requestId: "r", ownerRunId: "o", nodeId: "n", agent: "worker", task: "task", context: "fresh", cwd: "/repo", model: "test/exact", thinking: "off", environment, artifacts: false, result: { kind: "text" } }, { version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", expectedSourceIdentityDigest: "a".repeat(64), expectedActiveSessionDigest: "b".repeat(64), requestDigest: "c".repeat(64), expectedLaunchContractDigest: "d".repeat(64), receipt: {} as never, cancellationToken: {} as never });
 		assert.deepEqual({ ...request.environment }, environment); assert.notEqual(request.environment, environment); assert.equal(Object.getPrototypeOf(request.environment!), null);
 	});
 

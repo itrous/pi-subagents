@@ -13,7 +13,7 @@ import {
 	type ActiveBoundLaunchContractV1,
 	type ResolveActiveBoundLaunchContractResult,
 } from "./active-bound-resolver.ts";
-import { createLaunchReceiptService, type LaunchReceiptService, type LaunchReceiptV1 } from "./launch-receipt.ts";
+import { createLaunchReceiptService, type LaunchCancellationTokenV1, type LaunchReceiptService, type LaunchReceiptV1 } from "./launch-receipt.ts";
 
 export interface ActiveBoundRuntimeContext extends Pick<ExtensionContext, "cwd" | "sessionManager" | "modelRegistry"> {
 	isProjectTrusted?: () => boolean;
@@ -28,6 +28,7 @@ export interface ActiveBoundBindingV1 {
 	requestDigest: string;
 	expectedLaunchContractDigest: string;
 	receipt: LaunchReceiptV1;
+	cancellationToken: LaunchCancellationTokenV1;
 }
 
 export interface ActiveBoundRootIdentityV1 { dev: number; ino: number }
@@ -46,6 +47,7 @@ export interface ActiveBoundRuntimeService {
 	readonly sourceIdentityDigest: string;
 	preflight(input: unknown): ActiveBoundPreflightResponseV1;
 	admit(request: ActiveBoundPreflightRequestV1, binding: ActiveBoundBindingV1): ActiveBoundAdmissionResult;
+	verifyPendingCancellation(tuple: { requestId: string; ownerRunId: string; nodeId: string }, binding: ActiveBoundBindingV1): boolean;
 	claimBase(proof: ActiveBoundExecutionProofV1, identity: ActiveBoundRootIdentityV1, created: boolean): boolean;
 	recheck(proof: ActiveBoundExecutionProofV1, options?: { ownedBaseRootIdentity?: ActiveBoundRootIdentityV1; ownedRootIdentity?: ActiveBoundRootIdentityV1; ownedSessionDirIdentity?: ActiveBoundRootIdentityV1 }): boolean;
 	dispose(): void;
@@ -63,6 +65,7 @@ export type ActiveBoundPreflightResponseV1 =
 		launchContract: ActiveBoundLaunchContractV1;
 		launchContractDigest: string;
 		receipt: LaunchReceiptV1;
+		cancellationToken: LaunchCancellationTokenV1;
 	}
 	| { version: 1; code: ActiveBoundPreflightErrorCode };
 export type ActiveBoundAdmissionResult =
@@ -163,6 +166,19 @@ export function createActiveBoundRuntimeService(options: CreateActiveBoundRuntim
 			});
 		} catch { return { ok: false, code: "host_required" }; }
 	};
+	const verifyCancellation = (tuple: { requestId: string; ownerRunId: string; nodeId: string }, binding: ActiveBoundBindingV1): boolean => {
+		if (disposed || binding.version !== 1 || binding.targetServerInstanceId !== options.serverInstanceId
+			|| binding.expectedSourceIdentityDigest !== options.sourceIdentityDigest || !receipts.verify(binding.receipt)
+			|| !receipts.verifyCancellation(binding.cancellationToken)) return false;
+		const receipt = binding.receipt.payload; const token = binding.cancellationToken.payload;
+		return receipt.serverInstanceId === options.serverInstanceId && token.serverInstanceId === receipt.serverInstanceId && token.sourceIdentityDigest === receipt.sourceIdentityDigest
+			&& token.activeSessionDigest === receipt.activeSessionDigest && token.prospectiveRunId === receipt.prospectiveRunId
+			&& token.requestDigest === receipt.requestDigest && token.launchContractDigest === receipt.launchContractDigest
+			&& token.issuedAt === receipt.issuedAt && token.expiresAt === receipt.expiresAt
+			&& token.requestId === tuple.requestId && token.ownerRunId === tuple.ownerRunId && token.nodeId === tuple.nodeId
+			&& receipt.activeSessionDigest === binding.expectedActiveSessionDigest && receipt.prospectiveRunId === binding.prospectiveRunId
+			&& receipt.requestDigest === binding.requestDigest && receipt.launchContractDigest === binding.expectedLaunchContractDigest;
+	};
 	return {
 		version: 1,
 		serverInstanceId: options.serverInstanceId,
@@ -183,6 +199,7 @@ export function createActiveBoundRuntimeService(options: CreateActiveBoundRuntim
 				requestDigest: resolved.requestDigest,
 				launchContractDigest: resolved.launchContractDigest,
 			});
+			const cancellationToken = receipts.issueCancellation(receipt, { requestId: parsed.request.requestId, ownerRunId: parsed.request.ownerRunId, nodeId: parsed.request.nodeId });
 			return {
 				version: 1,
 				serverInstanceId: options.serverInstanceId,
@@ -193,10 +210,12 @@ export function createActiveBoundRuntimeService(options: CreateActiveBoundRuntim
 				launchContract: resolved.contract,
 				launchContractDigest: resolved.launchContractDigest,
 				receipt,
+				cancellationToken,
 			};
 		},
+		verifyPendingCancellation(tuple, binding) { return verifyCancellation(tuple, binding); },
 		admit(request, binding) {
-			if (disposed || binding.version !== 1 || binding.targetServerInstanceId !== options.serverInstanceId
+			if (!verifyCancellation(request, binding) || disposed || binding.version !== 1 || binding.targetServerInstanceId !== options.serverInstanceId
 				|| binding.prospectiveRunId !== request.prospectiveRunId
 				|| binding.expectedSourceIdentityDigest !== options.sourceIdentityDigest
 				|| binding.requestDigest !== activeBoundPreflightRequestDigest(request)
