@@ -3,6 +3,7 @@
  */
 
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { parse as parseYaml } from "yaml";
 import * as os from "node:os";
@@ -112,6 +113,13 @@ export interface AgentModelSourceInfo {
 	model: string;
 }
 
+export interface ActiveBoundPackageIdentity {
+	name: string;
+	version: string;
+	manifestDigest: string;
+	rootPath: string;
+}
+
 export interface AgentConfig {
 	name: string;
 	runner?: AgentRunnerConfig;
@@ -151,6 +159,11 @@ export interface AgentConfig {
 	permissions?: PermissionRules;
 	memory?: AgentMemoryConfig;
 	disabled?: boolean;
+	/** Private active-bound package owner metadata; never project directly. */
+	activeBoundPackageOwner?: ActiveBoundPackageIdentity;
+	/** Private canonical entries resolved from package-owned refs. */
+	activeBoundResolvedExtensions?: string[];
+	activeBoundExtensionProjection?: ReadonlyArray<object>;
 	extraFields?: Record<string, string>;
 	override?: BuiltinAgentOverrideInfo;
 	modelSource?: AgentModelSourceInfo;
@@ -654,7 +667,31 @@ export function findNearestProjectRoot(cwd: string): string | null {
 	return findProjectRootCandidates(cwd)[0] ?? null;
 }
 
-function findConfiguredProjectRoot(cwd: string): string | null {
+/** Fixed .pi project root lookup without package-root configuration reads. */
+function isWithinProjectRoot(candidate: string, root: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function findNearestStandardProjectRoot(cwd: string): string | null {
+	let currentDir = path.resolve(cwd);
+	while (true) {
+		const candidate = path.join(currentDir, ".pi");
+		try {
+			const stat = fs.lstatSync(candidate);
+			if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe-marker");
+			return currentDir;
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+			if (code !== "ENOENT") throw error;
+		}
+		const parentDir = path.dirname(currentDir);
+		if (parentDir === currentDir) return null;
+		currentDir = parentDir;
+	}
+}
+
+export function findConfiguredProjectRoot(cwd: string): string | null {
 	const candidates = findProjectRootCandidates(cwd);
 	const nearestRoot = candidates[0];
 	if (!nearestRoot) return null;
@@ -1488,18 +1525,38 @@ function parseAgentAcceptanceFrontmatter(raw: string | undefined, agentName: str
 	return parsed as AcceptanceInput;
 }
 
-function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
+function readActiveBoundRegularFile(filePath: string, limit: number): Buffer {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+		const before = fs.fstatSync(fd);
+		if (!before.isFile() || before.size > limit) throw new Error("Unsupported active-bound file.");
+		const bytes = fs.readFileSync(fd);
+		const after = fs.fstatSync(fd); const lexical = fs.lstatSync(filePath);
+		if (!after.isFile() || lexical.isSymbolicLink() || !lexical.isFile() || bytes.length !== before.size
+			|| before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs
+			|| lexical.dev !== before.dev || lexical.ino !== before.ino) throw new Error("Active-bound file changed while reading.");
+		return bytes;
+	} finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+export function loadAgentsFromDir(dir: string, source: AgentSource, strictRegularFiles = false): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
-	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
+	const filePaths = listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"));
+	if (strictRegularFiles) filePaths.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+	for (const filePath of filePaths) {
 		if (isLegacyAgentSkillPath(dir, filePath)) {
 			continue;
 		}
 
 		let content: string;
 		try {
-			content = fs.readFileSync(filePath, "utf-8");
+			content = strictRegularFiles
+				? readActiveBoundRegularFile(filePath, 1024 * 1024).toString("utf8")
+				: fs.readFileSync(filePath, "utf-8");
 		} catch {
+			if (strictRegularFiles) throw new Error("Unsupported active-bound agent definition.");
 			continue;
 		}
 
@@ -1731,6 +1788,215 @@ function extraUserAgentDirs(): string[] {
 		.split(path.delimiter)
 		.map((dir) => dir.trim())
 		.filter((dir) => dir.length > 0);
+}
+
+const ACTIVE_BOUND_FILE_LIMIT = 1024 * 1024;
+const ACTIVE_BOUND_PACKAGE_LIMIT = 64;
+const ACTIVE_BOUND_AGENT_DEPTH = 4;
+const ACTIVE_BOUND_EXTENSION_REF_LIMIT = 16;
+const SAFE_PACKAGE_VERSION = /^(?=.*[A-Za-z0-9])[A-Za-z0-9.+_-]+$/u;
+const SAFE_NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/[a-z0-9][a-z0-9._~-]*|[a-z0-9][a-z0-9._~-]*)$/u;
+
+interface ActiveBoundPackageManifest extends Record<string, unknown> {
+	name: string;
+	version: string;
+	dependencies?: Record<string, unknown>;
+	pi?: { extensions?: unknown; subagents?: { agents?: unknown } };
+	"pi-subagents"?: { agents?: unknown };
+}
+
+const activeBoundJsonDigests = new WeakMap<object, string>();
+function readActiveBoundJson(filePath: string): Record<string, unknown> {
+	const bytes = readActiveBoundRegularFile(filePath, ACTIVE_BOUND_FILE_LIMIT);
+	const parsed = JSON.parse(bytes.toString("utf8")) as unknown;
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Unsupported active-bound JSON object.");
+	activeBoundJsonDigests.set(parsed, createHash("sha256").update(bytes).digest("hex"));
+	return parsed as Record<string, unknown>;
+}
+
+function activeBoundPackageManifest(rootPath: string): ActiveBoundPackageManifest {
+	const absolute = path.resolve(rootPath);
+	const rootStat = fs.lstatSync(absolute);
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || fs.realpathSync(absolute) !== absolute) throw new Error("Unsupported active-bound package root.");
+	const raw = readActiveBoundJson(path.join(absolute, "package.json"));
+	const name = raw.name; const version = raw.version;
+	const packageBaseName = typeof name === "string" ? name.split("/").at(-1)?.toLowerCase() : undefined;
+	if (typeof name !== "string" || name.trim() !== name || /[\r\n]/u.test(name) || !SAFE_NPM_PACKAGE_NAME.test(name) || packageBaseName === "node_modules" || packageBaseName === "favicon.ico" || Buffer.byteLength(name, "utf8") > 214
+		|| typeof version !== "string" || version.trim() !== version || /[\r\n]/u.test(version) || !SAFE_PACKAGE_VERSION.test(version) || Buffer.byteLength(version, "utf8") > 64) {
+		throw new Error("Unsupported active-bound package identity.");
+	}
+	return raw as ActiveBoundPackageManifest;
+}
+
+function activeBoundPackageSources(settingsPath: string, packageCount: { count: number }): string[] {
+	try { fs.lstatSync(settingsPath); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+	const raw = readActiveBoundJson(settingsPath);
+	const packages = raw.packages;
+	if (packages === undefined) return [];
+	if (!Array.isArray(packages) || packageCount.count + packages.length > ACTIVE_BOUND_PACKAGE_LIMIT) throw new Error("Unsupported active-bound packages registry.");
+	packageCount.count += packages.length;
+	return packages.map((entry) => {
+		if (typeof entry === "string" && entry.trim()) return entry;
+		if (entry && typeof entry === "object" && !Array.isArray(entry)
+			&& Object.keys(entry).length === 1 && Object.hasOwn(entry, "source")
+			&& typeof (entry as { source?: unknown }).source === "string" && (entry as { source: string }).source.trim()) return (entry as { source: string }).source;
+		throw new Error("Unsupported active-bound package registry entry.");
+	});
+}
+
+function resolveActiveBoundPackageSource(source: string, baseDir: string): string {
+	const trimmed = source.trim();
+	if (!(trimmed.startsWith("git:") || trimmed.startsWith("npm:") || trimmed.startsWith("file:")
+		|| trimmed === "." || trimmed === ".." || trimmed.startsWith("./") || trimmed.startsWith("../"))) {
+		throw new Error("Unsupported active-bound package source.");
+	}
+	const fileValue = trimmed.startsWith("file:") ? trimmed.slice(5) : undefined;
+	if (fileValue !== undefined && (!fileValue || fileValue === "~" || fileValue.startsWith("~/"))) throw new Error("Unsupported active-bound file package source.");
+	const normalizedSource = fileValue !== undefined && !path.isAbsolute(fileValue)
+		&& fileValue !== "." && fileValue !== ".." && !fileValue.startsWith("./") && !fileValue.startsWith("../")
+		? `file:./${fileValue}` : trimmed;
+	const resolved = resolveSettingsPackageRoot(normalizedSource, baseDir);
+	if (!resolved) throw new Error("Unresolved active-bound package source.");
+	return path.resolve(resolved);
+}
+
+function activeBoundAgentRoots(manifest: ActiveBoundPackageManifest, packageRoot: string): string[] {
+	const values = [manifest["pi-subagents"]?.agents, manifest.pi?.subagents?.agents];
+	const roots: string[] = [];
+	for (const value of values) {
+		if (value === undefined) continue;
+		if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string" && entry.trim())) throw new Error("Unsupported active-bound package agent roots.");
+		for (const entry of value as string[]) {
+			if (path.isAbsolute(entry) || entry.split(/[\\/]/u).some((part) => part === "..")) throw new Error("Unsafe active-bound package agent root.");
+			roots.push(path.resolve(packageRoot, entry));
+		}
+	}
+	if (roots.length > ACTIVE_BOUND_PACKAGE_LIMIT) throw new Error("Too many active-bound package agent roots.");
+	return roots;
+}
+
+function validateActiveBoundAgentTree(root: string, packageRoot: string, total: { count: number }): void {
+	const visit = (directory: string, depth: number): void => {
+		if (depth > ACTIVE_BOUND_AGENT_DEPTH) throw new Error("Active-bound agent tree is too deep.");
+		const stat = fs.lstatSync(directory);
+		const relative = path.relative(packageRoot, directory);
+		if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(directory) !== directory
+			|| path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) throw new Error("Unsafe active-bound agent directory.");
+		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+			if (entry.isDirectory() && DISCOVERY_PRUNED_DIR_NAMES.has(entry.name)) continue;
+			if (++total.count > ACTIVE_BOUND_PACKAGE_LIMIT) throw new Error("Too many active-bound agent entries.");
+			const entryPath = path.join(directory, entry.name); const entryStat = fs.lstatSync(entryPath);
+			if (entryStat.isSymbolicLink()) throw new Error("Symlinked active-bound agent entry.");
+			if (entryStat.isDirectory()) visit(entryPath, depth + 1);
+			else if (entry.name.endsWith(".md") && (!entryStat.isFile() || entryStat.size > ACTIVE_BOUND_FILE_LIMIT)) throw new Error("Unsupported active-bound agent definition.");
+		}
+	};
+	visit(root, 0);
+}
+
+function loadActiveBoundPackageAgents(settingsPath: string, roots: Set<string>, total: { count: number }, packageCount: { count: number }, rootCount: { count: number }): AgentConfig[] {
+	const agents: AgentConfig[] = [];
+	for (const source of activeBoundPackageSources(settingsPath, packageCount)) {
+		const root = resolveActiveBoundPackageSource(source, path.dirname(settingsPath));
+		const manifest = activeBoundPackageManifest(root);
+		if (roots.has(root)) throw new Error("Duplicate active-bound package root.");
+		roots.add(root);
+		const manifestDigest = activeBoundJsonDigests.get(manifest);
+		if (!manifestDigest) throw new Error("Active-bound package manifest digest is unavailable.");
+		const agentRoots = activeBoundAgentRoots(manifest, root);
+		if (rootCount.count + agentRoots.length > ACTIVE_BOUND_PACKAGE_LIMIT) throw new Error("Too many active-bound package agent roots.");
+		rootCount.count += agentRoots.length;
+		for (const agentRoot of agentRoots) {
+			validateActiveBoundAgentTree(agentRoot, root, total);
+			for (const agent of loadAgentsFromDir(agentRoot, "package", true)) {
+				const refs = agent.subagentOnlyExtensions ?? [];
+				if (refs.length > ACTIVE_BOUND_EXTENSION_REF_LIMIT || new Set(refs).size !== refs.length
+					|| refs.some((ref) => !(ref.startsWith("./") && !path.isAbsolute(ref) && !ref.split(/[\\/]/u).some((part) => part === ".."))
+						&& !(ref.startsWith("package:") && SAFE_NPM_PACKAGE_NAME.test(ref.slice("package:".length))))) throw new Error("Invalid active-bound package extension refs.");
+				agent.activeBoundPackageOwner = { name: manifest.name, version: manifest.version, manifestDigest, rootPath: root };
+				agents.push(agent);
+			}
+		}
+	}
+	return agents;
+}
+
+/** Restricted active-bound discovery; reads package roots only from the active registry. */
+export function discoverProjectAgentsRestricted(cwd: string, projectTrusted = false): AgentDiscoveryResult {
+	const discoveredProjectRoot = projectTrusted ? findNearestStandardProjectRoot(cwd) : null;
+	const projectRoot = discoveredProjectRoot ?? fs.realpathSync(path.resolve(cwd));
+	const projectConfigDir = path.join(projectRoot, ".pi");
+	if (discoveredProjectRoot) {
+		try {
+			const stat = fs.lstatSync(projectConfigDir);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Active-bound project config root must be a regular directory.");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Active-bound project config root must be a regular directory.");
+		}
+	}
+	const settingsPath = path.join(projectConfigDir, "settings.json");
+	const userSettingsPath = getUserAgentSettingsPath();
+	let projectModelScope: ModelScopeConfig | undefined;
+	if (projectTrusted && fs.existsSync(settingsPath)) {
+		const stat = fs.lstatSync(settingsPath);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) {
+			throw new Error(`Unsupported active-bound project settings '${settingsPath}'.`);
+		}
+		const settings = readActiveBoundJson(settingsPath);
+		if (Array.isArray(settings.skills) && settings.skills.length > 0) {
+			throw new Error("Active-bound project discovery does not support custom skill refs.");
+		}
+		const subagents = settings.subagents;
+		if (subagents !== undefined && (!subagents || typeof subagents !== "object" || Array.isArray(subagents))) {
+			throw new Error("Active-bound project subagent settings must be an object.");
+		}
+		const subagentSettings = (subagents ?? {}) as Record<string, unknown>;
+		for (const key of ["defaultModel", "defaultThinking", "defaultExtensions", "disableBuiltins", "disableThinking", "agentOverrides"]) {
+			if (key in subagentSettings) throw new Error(`Active-bound project discovery does not support '${key}'.`);
+		}
+		const rootResolution = subagentSettings.projectRootResolution;
+		if (rootResolution !== undefined && rootResolution !== "nearest") {
+			throw new Error("Active-bound project discovery only supports nearest project roots.");
+		}
+		projectModelScope = parseModelScopeConfig(subagentSettings.modelScope, { filePath: settingsPath });
+	}
+	let userModelScope: ModelScopeConfig | undefined;
+	if (fs.existsSync(userSettingsPath)) {
+		const settings = readActiveBoundJson(userSettingsPath);
+		const subagents = settings.subagents;
+		if (subagents !== undefined && (!subagents || typeof subagents !== "object" || Array.isArray(subagents))) throw new Error("Invalid active-bound user subagent settings.");
+		userModelScope = parseModelScopeConfig((subagents as Record<string, unknown> | undefined)?.modelScope, { filePath: userSettingsPath });
+	}
+	const modelScope = projectModelScope ?? userModelScope;
+	const legacyDir = path.join(projectRoot, ".agents");
+	const preferredDir = path.join(projectConfigDir, "agents");
+	const safeAgentDirs = (discoveredProjectRoot && projectTrusted ? [legacyDir, preferredDir] : []).filter((dir) => {
+		try {
+			const stat = fs.lstatSync(dir);
+			return stat.isDirectory() && !stat.isSymbolicLink() && isWithinProjectRoot(fs.realpathSync(dir), projectRoot);
+		} catch { return false; }
+	});
+	const projectAgents = safeAgentDirs.flatMap((dir) => loadAgentsFromDir(dir, "project", true));
+	const packageRoots = new Set<string>(); const packageEntryCount = { count: 0 }; const packageCount = { count: 0 }; const rootCount = { count: 0 };
+	const packageAgents = [
+		...loadActiveBoundPackageAgents(userSettingsPath, packageRoots, packageEntryCount, packageCount, rootCount),
+		...(projectTrusted && discoveredProjectRoot ? loadActiveBoundPackageAgents(settingsPath, packageRoots, packageEntryCount, packageCount, rootCount) : []),
+	];
+	for (const agent of packageAgents) {
+		const owners = [...packageRoots].filter((root) => {
+			const relative = path.relative(root, agent.filePath);
+			return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+		});
+		if (owners.length !== 1 || owners[0] !== agent.activeBoundPackageOwner?.rootPath) throw new Error("Ambiguous active-bound package agent owner.");
+	}
+	const seenNames = new Set<string>();
+	for (const agent of [...projectAgents, ...packageAgents]) {
+		if (seenNames.has(agent.name)) throw new Error("Duplicate active-bound agent name.");
+		seenNames.add(agent.name);
+	}
+	const agents = mergeAgentsForScope("project", [], projectAgents, [], packageAgents).filter((agent) => agent.disabled !== true);
+	return { agents, projectAgentsDir: discoveredProjectRoot ? preferredDir : null, ...(modelScope !== undefined ? { modelScope } : {}) };
 }
 
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {

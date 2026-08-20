@@ -70,8 +70,17 @@ function compactRun(run: ForegroundResumeRun): ForegroundResumeRun | undefined {
 		cwd: run.cwd,
 		sessionId: run.sessionId,
 		updatedAt: run.updatedAt,
+		...(run.activeBound ? { activeBound: true as const } : {}),
 		children: run.children.map(compactChild),
 	};
+}
+
+function migratePrivateBoundHistory(run: ForegroundResumeRun): ForegroundResumeRun {
+	// A1.7 active-bound single leaves were the only foreground path whose runtime
+	// runId was the caller-preflighted full UUID; ordinary foreground IDs are short.
+	return run.activeBound === true || run.mode !== "single" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(run.runId)
+		? run
+		: { ...run, activeBound: true };
 }
 
 function readIndex(resultsDir: string): ForegroundHistoryIndex {
@@ -82,7 +91,7 @@ function readIndex(resultsDir: string): ForegroundHistoryIndex {
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { version: HISTORY_VERSION, runs: [] };
 		const record = parsed as Partial<ForegroundHistoryIndex>;
 		if (record.version !== HISTORY_VERSION || !Array.isArray(record.runs)) return { version: HISTORY_VERSION, runs: [] };
-		return { version: HISTORY_VERSION, runs: record.runs.filter(isRestorableRun) };
+		return { version: HISTORY_VERSION, runs: record.runs.filter(isRestorableRun).map(migratePrivateBoundHistory) };
 	} catch {
 		return { version: HISTORY_VERSION, runs: [] };
 	}
@@ -96,6 +105,7 @@ function isRestorableRun(value: unknown): value is ForegroundResumeRun {
 		&& typeof run.cwd === "string" && Boolean(run.cwd)
 		&& typeof run.sessionId === "string" && Boolean(run.sessionId)
 		&& typeof run.updatedAt === "number" && Number.isFinite(run.updatedAt)
+		&& (run.activeBound === undefined || run.activeBound === true)
 		&& Array.isArray(run.children)
 		&& run.children.length > 0
 		&& run.children.every((child) => Boolean(child && typeof child === "object" && !Array.isArray(child)

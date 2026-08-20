@@ -6,6 +6,8 @@ import {
 	type SubagentDelegationUpdate,
 	type SubagentDelegationValue,
 } from "../api/delegation.ts";
+import type { ActiveBoundExecutionProofV1 } from "../api/active-bound-runtime.ts";
+import { DENIED_TOOL_MAX_CALLS, validDeniedToolCall, type DeniedToolCallV1, type DeniedToolProofErrorCode } from "../runs/shared/denied-tool-proof.ts";
 import type { AcceptanceInput, AgentContract, EffectsProjection, ExecutionProjection, JsonSchemaObject, ReviewProjection, ToolBudgetConfig, TurnBudgetConfig, Usage } from "../shared/types.ts";
 import { cloneJsonWithinByteLimit } from "./delegation-json.ts";
 
@@ -97,6 +99,17 @@ export interface PromptTemplateBridgeResult {
 			skillsWarning?: string;
 			outputSaveError?: string;
 			transcriptError?: string;
+			artifactInitializationFailed?: boolean;
+			launchContractDigest?: string;
+			toolRegistry?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProjectionV1;
+			toolsMissing?: string[];
+			toolsExtra?: string[];
+			toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+			deniedToolCalls?: import("../runs/shared/denied-tool-proof.ts").DeniedToolCallV1[];
+			deniedToolCallsOverflow?: true;
+			deniedToolCallsError?: import("../runs/shared/denied-tool-proof.ts").DeniedToolProofErrorCode;
+			transportIncomplete?: boolean;
+			nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error" | "native_denied_tools_protocol_error";
 		}>;
 		progress?: Array<{
 			index?: number;
@@ -131,10 +144,14 @@ export interface DelegatedSubagentExecutionParams {
 	agentContract?: AgentContract;
 	acceptance?: AcceptanceInput;
 	artifacts?: boolean;
+	share?: false;
+	mission?: false;
 	/** Internal-only thinking override accepted by executeDelegated. */
 	delegatedThinkingOverride?: SubagentDelegationThinking;
 	/** Internal-only capability accepted and stripped by executeDelegated. */
 	delegatedAllowZeroToolBudget?: true;
+	/** Private admitted proof; never accepted from a public tool surface. */
+	activeBoundProof?: ActiveBoundExecutionProofV1;
 	async: false;
 	foregroundOnly: true;
 	clarify: false;
@@ -337,8 +354,10 @@ function resolveSubagentDelegationStatus(
 	result: PromptTemplateBridgeResult,
 	aborted: boolean,
 ): SubagentDelegationStatus {
-	if (aborted) return "cancelled";
 	const child = result.details?.results?.[0];
+	if (child?.artifactInitializationFailed) return "failed";
+	if (child?.nativeStatus) return child.nativeStatus;
+	if (aborted) return "cancelled";
 	if (!child) return "failed";
 	if (result.details?.timedOut || child.timedOut) return "timed_out";
 	if (child?.structuredOutputFailed) return "structured_output_failed";
@@ -361,6 +380,37 @@ export function toSubagentDelegationResponse(
 	const progress = child?.progressSummary ?? result.details?.progress?.[0];
 	let status = resolveSubagentDelegationStatus(result, aborted);
 	let error = child?.error ?? (status === "failed" ? firstTextContent(result.content) : undefined);
+	let deniedToolCalls: DeniedToolCallV1[] | undefined;
+	let deniedToolCallsOverflow: true | undefined;
+	let deniedToolCallsError: DeniedToolProofErrorCode | undefined;
+	let transportIncomplete = child?.transportIncomplete === true;
+	const registryTerminalPriority = status === "native_tool_registry_mismatch" || status === "native_tool_registry_protocol_error";
+	if (request.binding && child && (child.deniedToolCalls !== undefined || child.deniedToolCallsOverflow !== undefined || child.deniedToolCallsError !== undefined)) {
+		const validCalls = Array.isArray(child.deniedToolCalls) && child.deniedToolCalls.length <= DENIED_TOOL_MAX_CALLS
+			&& child.deniedToolCalls.every(validDeniedToolCall)
+			&& (child.deniedToolCallsOverflow === undefined || child.deniedToolCallsOverflow === true)
+			&& (child.deniedToolCallsOverflow !== true || child.deniedToolCalls.length === DENIED_TOOL_MAX_CALLS)
+			&& child.deniedToolCallsError === undefined;
+		const validError = child.deniedToolCalls === undefined && child.deniedToolCallsOverflow === undefined
+			&& typeof child.deniedToolCallsError === "string"
+			&& ["missing_frame", "invalid_frame", "multiple_frames", "frame_too_large"].includes(child.deniedToolCallsError);
+		if (validCalls) {
+			deniedToolCalls = child.deniedToolCalls!.map((call) => ({ ...call }));
+			if (child.deniedToolCallsOverflow === true) deniedToolCallsOverflow = true;
+			if (deniedToolCalls.length > 0 || deniedToolCallsOverflow) transportIncomplete = true;
+		} else if (validError) {
+			deniedToolCallsError = child.deniedToolCallsError;
+			if (!registryTerminalPriority) status = "native_denied_tools_protocol_error";
+			transportIncomplete = true;
+		} else {
+			deniedToolCallsError = "invalid_frame";
+			if (!registryTerminalPriority) {
+				status = "native_denied_tools_protocol_error";
+				error = "Delegated subagent returned a malformed denied-tool proof.";
+			}
+			transportIncomplete = true;
+		}
+	}
 	let projectedResult: SubagentDelegationValue | undefined;
 	if (status === "completed") {
 		if (request.result.kind === "text") {
@@ -402,6 +452,14 @@ export function toSubagentDelegationResponse(
 		...(child?.thinking ? { thinking: child.thinking } : {}),
 		...(typeof child?.exitCode === "number" ? { exitCode: child.exitCode } : {}),
 		...(childLaunchContractDigest ? { launchContractDigest: childLaunchContractDigest } : {}),
+		...(child?.toolRegistry ? { toolRegistry: child.toolRegistry } : {}),
+		...(child?.toolsMissing ? { toolsMissing: child.toolsMissing } : {}),
+		...(child?.toolsExtra ? { toolsExtra: child.toolsExtra } : {}),
+		...(child?.toolRegistryError ? { toolRegistryError: child.toolRegistryError } : {}),
+		...(deniedToolCalls ? { deniedToolCalls } : {}),
+		...(deniedToolCallsOverflow ? { deniedToolCallsOverflow: true } : {}),
+		...(deniedToolCallsError ? { deniedToolCallsError } : {}),
+		...(transportIncomplete ? { transportIncomplete: true } : {}),
 		...(projectedResult ? { result: projectedResult } : {}),
 		...(usage ? {
 			usage: {

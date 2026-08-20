@@ -910,6 +910,8 @@ export interface SingleResult {
 	outputSaveError?: string;
 	/** Best-effort metadata persistence failure; execution and receipt publication continue. */
 	metadataSaveError?: string;
+	/** Critical post-spawn bound artifact activation failed; terminal failure outranks later cancellation. */
+	artifactInitializationFailed?: boolean;
 	structuredOutput?: unknown;
 	structuredOutputFailed?: boolean;
 	structuredOutputPath?: string;
@@ -917,6 +919,15 @@ export interface SingleResult {
 	acceptance?: AcceptanceLedger;
 	agentContract?: AgentContract;
 	launchContractDigest?: string;
+	toolRegistry?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProjectionV1;
+	toolsMissing?: string[];
+	toolsExtra?: string[];
+	toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+	deniedToolCalls?: import("../runs/shared/denied-tool-proof.ts").DeniedToolCallV1[];
+	deniedToolCallsOverflow?: true;
+	deniedToolCallsError?: import("../runs/shared/denied-tool-proof.ts").DeniedToolProofErrorCode;
+	transportIncomplete?: boolean;
+	nativeStatus?: "native_tool_registry_mismatch" | "native_tool_registry_protocol_error" | "native_denied_tools_protocol_error";
 	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
 	execution?: ExecutionProjection;
@@ -1517,6 +1528,8 @@ export interface ForegroundResumeRun {
 	sessionId?: string;
 	updatedAt: number;
 	checkpoint?: ChainCheckpointState;
+	/** Public RPC must not expose active-bound identifiers, paths, prompts, or output. */
+	activeBound?: true;
 	children: ForegroundResumeChild[];
 }
 
@@ -1559,8 +1572,10 @@ export interface ForegroundRunControl {
 	cwd?: string;
 	currentAgent?: string;
 	currentIndex?: number;
-	/** Short caller-facing task/goal shown in fleet surfaces when available. */
+	/** Short caller-facing task/goal shown in local fleet surfaces when available. */
 	description?: string;
+	/** Active-bound controls require authenticated transport cancellation and private public-RPC projection. */
+	activeBound?: true;
 	currentActivityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -1712,6 +1727,26 @@ export interface RunSyncOptions {
 	onDetachReady?: (detach: (reason?: string) => boolean) => void;
 	/** Internal foreground receipt proposal; returns true only when the outer waiter accepted it. */
 	onDetachReceipt?: (result: SingleResult) => boolean;
+	/** Immediate pre-spawn barrier. Throwing prevents child creation. */
+	beforeSpawn?: (materializedLaunchDigest: string) => void;
+	/** Private active-bound path: resolve only uncached nearest-project skills. */
+	activeBoundProjectSkills?: boolean;
+	/** Private active-bound per-spawn values; empty object still selects isolated mode. */
+	activeBoundEnvironment?: import("../api/active-bound-environment.ts").ActiveBoundEnvironmentV1;
+	/** Private active-bound mode: artifact writers activate only after child spawn. */
+	deferArtifactsUntilSpawn?: boolean;
+	/** Private active-bound snapshot; avoids rereading mutable ambient depth. */
+	parentDepthOverride?: number;
+	/** Private active-bound materialized tool plan without mutating source definition. */
+	launchToolsOverride?: string[];
+	/** Private active-bound final provider tool-registry policy. */
+	activeBoundToolRegistry?: Omit<import("../runs/shared/tool-registry-proof.ts").BoundToolRegistryPolicyV1, "proofNonce" | "denialFd">;
+	/** Observes the first successful child spawn event. */
+	onSpawn?: () => void;
+	/** Bound launches disable startup/model retry after the first attempt. */
+	singleModelAttempt?: boolean;
+	/** Bound launches fix watchdog policy off regardless of ambient settings. */
+	disableWatchdog?: boolean;
 	/** Authoritative terminal result, emitted only after the full detached run finalizes. */
 	onDetachedExit?: (result: SingleResult) => void;
 	controlConfig?: ResolvedControlConfig;
@@ -2050,8 +2085,8 @@ export function checkSubagentDepth(configMaxDepth?: number): { blocked: boolean;
 	return { blocked, depth, maxDepth };
 }
 
-export function getSubagentDepthEnv(maxDepth?: number): Record<string, string> {
-	const parentDepth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
+export function getSubagentDepthEnv(maxDepth?: number, parentDepthOverride?: number): Record<string, string> {
+	const parentDepth = parentDepthOverride ?? Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
 	const nextDepth = Number.isFinite(parentDepth) ? parentDepth + 1 : 1;
 	return {
 		PI_SUBAGENT_DEPTH: String(nextDepth),

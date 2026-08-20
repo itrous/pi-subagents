@@ -1,5 +1,5 @@
 <p>
-  <img src="https://raw.githubusercontent.com/nicobailon/pi-subagents/main/banner.png" alt="pi-subagents" width="1100">
+  <img src="banner.png" alt="pi-subagents" width="1100">
 </p>
 
 # pi-subagents
@@ -8,13 +8,27 @@
 
 <https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1>
 
-## Install
+## Install this fork
+
+This branch is the security-focused `itrous/pi-subagents` fork. Its supported
+installation contract is a reviewed immutable commit. A floating npm or branch
+installation does not establish that pin; tags and abbreviated inputs are not
+accepted as substitutes by the fork installer.
+
+First use `pi list` and remove every prior npm/local package or manually installed
+extension-directory copy so that only one `pi-subagents` responder can load. For
+example, remove the upstream npm source if it is present. Then use the fork's
+protected installer; Pi's package reconciler uses hard reset/clean during updates
+and is therefore not the supported update path for this fork.
 
 ```bash
-pi install npm:pi-subagents
+pi remove npm:pi-subagents
+npx git+https://github.com/itrous/pi-subagents.git#<40-hex-commit> \
+  --commit <40-hex-commit>
 ```
 
-That is the only required step.
+See [FORK.md](FORK.md) for the exact-commit legacy installer, upstream base,
+verification gates, and update procedure.
 
 ## Try this first
 
@@ -83,7 +97,7 @@ Rule of thumb: `scout` before you understand the code, `researcher` before you t
 | See running work | "Show active async runs." or "Show the subagent fleet." |
 | Check setup | "Check whether subagents are configured correctly." |
 
-For implementation work, the recommended loop is `clarify → scout → worker → fresh reviewers → worker`. Packaged prompt shortcuts like `/parallel-review` and `/review-loop` make these patterns repeatable — see [Workflows](https://github.com/nicobailon/pi-subagents/blob/main/docs/workflows.md).
+For implementation work, the recommended loop is `clarify → scout → worker → fresh reviewers → worker`. Packaged prompt shortcuts like `/parallel-review` and `/review-loop` make these patterns repeatable — see [Workflows](docs/workflows.md).
 
 ## Where running work shows up
 
@@ -91,7 +105,7 @@ Foreground runs stream progress in the conversation. Background runs keep workin
 
 In the TUI, a persistent FleetView below the editor keeps active work visible. `/subagents-fleet` opens a live inspector where you can browse children, read transcripts, steer a running child, or stop a run. You can also just ask: "Show me the current async runs."
 
-Details, keybindings, and the machine-readable run artifacts are in [Observability](https://github.com/nicobailon/pi-subagents/blob/main/docs/observability.md).
+Details, keybindings, and the machine-readable run artifacts are in [Observability](docs/observability.md).
 
 ## If something feels off
 
@@ -109,12 +123,12 @@ The full reference lives in `docs/`:
 
 | Doc | What's in it |
 |-----|--------------|
-| [Agents](https://github.com/nicobailon/pi-subagents/blob/main/docs/agents.md) | Custom agents, frontmatter reference, overriding builtins, tools, extensions, skills, per-agent memory. |
-| [Models](https://github.com/nicobailon/pi-subagents/blob/main/docs/models.md) | Default models, per-role overrides, recommended tiering, fallbacks, thinking levels, model scope enforcement, profiles. |
-| [Workflows](https://github.com/nicobailon/pi-subagents/blob/main/docs/workflows.md) | Orchestration patterns, prompt shortcuts, scripted workflows, worktree isolation, child-to-parent coordination, the recursion guard. |
-| [Watchdog](https://github.com/nicobailon/pi-subagents/blob/main/docs/watchdog.md) | The opt-in adversarial change reviewer, scope monitoring, LSP checks, and child tool permissions. |
-| [Tool reference](https://github.com/nicobailon/pi-subagents/blob/main/docs/tool-reference.md) | Every `subagent` parameter, management actions, status/control actions, acceptance gates, external CLI runners. |
-| [Observability](https://github.com/nicobailon/pi-subagents/blob/main/docs/observability.md) | FleetView, the fleet inspector, lifecycle artifacts, events, logs, session sharing. |
-| [Missions and schedules](https://github.com/nicobailon/pi-subagents/blob/main/docs/missions.md) | Durable mission records, delivery receipts, timed and recurring runs. |
-| [Configuration](https://github.com/nicobailon/pi-subagents/blob/main/docs/configuration.md) | Every `config.json` key and environment variable. |
-| [Extension API](https://github.com/nicobailon/pi-subagents/blob/main/docs/extension-api.md) | The RPC, delegation API, preflight, capability ceilings, background-work providers, Herdr integration. |
+| [Agents](docs/agents.md) | Custom agents, frontmatter reference, overriding builtins, tools, extensions, skills, per-agent memory. |
+| [Models](docs/models.md) | Default models, per-role overrides, recommended tiering, fallbacks, thinking levels, model scope enforcement, profiles. |
+| [Workflows](docs/workflows.md) | Orchestration patterns, prompt shortcuts, scripted workflows, worktree isolation, child-to-parent coordination, the recursion guard. |
+| [Watchdog](docs/watchdog.md) | The opt-in adversarial change reviewer, scope monitoring, LSP checks, and child tool permissions. |
+| [Tool reference](docs/tool-reference.md) | Every `subagent` parameter, management actions, status/control actions, acceptance gates, external CLI runners. |
+| [Observability](docs/observability.md) | FleetView, the fleet inspector, lifecycle artifacts, events, logs, session sharing. |
+| [Missions and schedules](docs/missions.md) | Durable mission records, delivery receipts, timed and recurring runs. |
+| [Configuration](docs/configuration.md) | Every `config.json` key and environment variable. |
+| [Extension API](docs/extension-api.md) | The RPC, delegation API, preflight, capability ceilings, background-work providers, Herdr integration. |

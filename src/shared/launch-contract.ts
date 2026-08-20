@@ -66,6 +66,12 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 		completionGuard: agent.completionGuard,
 		toolBudget: agent.toolBudget,
 		memory: agent.memory,
+		activeBoundPackageOwner: agent.activeBoundPackageOwner ? {
+			name: agent.activeBoundPackageOwner.name,
+			version: agent.activeBoundPackageOwner.version,
+			manifestDigest: agent.activeBoundPackageOwner.manifestDigest,
+		} : undefined,
+		activeBoundExtensionProjection: agent.activeBoundExtensionProjection,
 	};
 }
 
@@ -85,10 +91,16 @@ export interface LaunchBindingInput {
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
+	environment?: unknown;
+	packageExtensions?: unknown;
+	piCommandEvidence?: unknown;
+	toolRegistry?: unknown;
+	artifactPolicy?: unknown;
 	tools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
+	permissionRules?: unknown;
 	outputPath?: string;
 	outputMode?: string;
 	structuredOutputSchema?: unknown;
@@ -100,8 +112,7 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		version: LAUNCH_BINDING_PROJECTION_VERSION,
 		definitionDigest: input.definitionDigest,
 		taskDigest: input.task === undefined ? undefined : sha256(input.task),
-		// The ordered candidate set already contains each attempted model; keeping only
-		// this set makes retries correlate to the same preflight binding.
+		model: input.model,
 		modelCandidates: input.modelCandidates,
 		thinking: input.thinking,
 		systemPromptDigest: input.systemPrompt === undefined || input.systemPrompt === null ? undefined : sha256(input.systemPrompt),
@@ -109,10 +120,16 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 		inheritProjectContext: input.inheritProjectContext,
 		inheritSkills: input.inheritSkills,
 		skills: input.skills,
+		environment: input.environment,
+		packageExtensions: input.packageExtensions,
+		piCommandEvidence: input.piCommandEvidence,
+		toolRegistry: input.toolRegistry,
+		artifactPolicy: input.artifactPolicy,
 		tools: input.tools,
 		extensions: input.extensions,
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		mcpDirectTools: input.mcpDirectTools,
+		permissionRules: input.permissionRules,
 		outputPath: input.outputPath,
 		outputMode: input.outputMode,
 		structuredOutputSchema: input.structuredOutputSchema,

@@ -2,11 +2,14 @@
  * Core execution logic for running subagents
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import type { Readable } from "node:stream";
 import { existsSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
+import { resolveActiveBoundPackageExtensions, type ActiveBoundResolvedPackageExtensions } from "../../api/active-bound-package-extensions.ts";
 import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts";
 import { alignForkedSessionCwd } from "../../shared/fork-context.ts";
 import {
@@ -51,15 +54,16 @@ import {
 	boundStreamedRecentOutput,
 	boundStreamedToolCalls,
 } from "../../shared/utils.ts";
-import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
+import { buildBoundSkillInjection, buildSkillInjection, resolveProjectSkillsUncached, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { arbitrateCompletionGuardRescue } from "../shared/llm-intent-arbiter.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
+import { attestPiSpawnCommand } from "../shared/pi-command-evidence.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { resolvePermissionRules } from "../shared/permissions.ts";
-import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
+import { applyThinkingSuffix, attestBoundRuntimeExtensions, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -67,6 +71,10 @@ import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../s
 import { formatProcessSignalError, isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { BOUND_PACKAGE_MUTATION_EXIT, BOUND_TOOL_REGISTRY_ACTIVE_ENV, BOUND_TOOL_REGISTRY_FD_ENV, BOUND_TOOL_REGISTRY_POLICY_ENV } from "../shared/bound-tool-registry-runtime.ts";
+import { createToolRegistryCollector, type ToolRegistryCollected, type ToolRegistryCollector } from "../shared/tool-registry-collector.ts";
+import { expectedToolRegistryProjection } from "../shared/tool-registry-proof.ts";
+import { createDeniedToolCollector, type DeniedToolCollected, type DeniedToolCollector } from "../shared/denied-tool-proof.ts";
 import {
 	buildModelCandidates,
 	formatModelAttemptNote,
@@ -96,6 +104,8 @@ import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudget
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
+import { canonicalSha256 } from "../../shared/canonical-json.ts";
+import { buildActiveBoundSpawnEnvironment, projectActiveBoundEnvironment } from "../../api/active-bound-environment.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, PI_AGGREGATE_EVENT_PROJECTOR, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import {
 	acceptChildWatchdogEvent,
@@ -110,6 +120,61 @@ const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+}
+
+function applyBoundToolRegistryOutcome(result: SingleResult, collection: ToolRegistryCollected, expected: NonNullable<RunSyncOptions["activeBoundToolRegistry"]>): void {
+	const protocol = (code: NonNullable<SingleResult["toolRegistryError"]>): void => {
+		result.exitCode = 1;
+		result.nativeStatus = "native_tool_registry_protocol_error";
+		result.toolRegistryError = code;
+		result.transportIncomplete = true;
+		result.error = `Native tool registry proof failed: ${code}.`;
+	};
+	if (!collection.ok) return protocol(collection.code);
+	const frame = collection.frame;
+	if (frame.kind === "protocol" || frame.kind === "unrepresentable") return protocol(frame.code);
+	const projection = frame.projection;
+	const projectionBase = {
+		version: projection.version,
+		projectionVersion: projection.projectionVersion,
+		required: projection.required,
+		effectiveCallerTools: projection.effectiveCallerTools,
+		internalTools: projection.internalTools,
+		missing: projection.missing,
+	};
+	const actual = [...projection.effectiveCallerTools, ...projection.internalTools].sort();
+	const required = [...expected.required].sort();
+	const internalExpected = new Set(expected.internalTools);
+	if (projection.digest !== canonicalSha256(projectionBase)
+		|| JSON.stringify(projection.required) !== JSON.stringify(required)
+		|| projection.effectiveCallerTools.some((name) => internalExpected.has(name))
+		|| projection.internalTools.some((name) => !internalExpected.has(name))
+		|| actual.length > 128
+		|| new Set(actual).size !== actual.length) return protocol("invalid_frame");
+	const actualSet = new Set(actual);
+	const requiredSet = new Set(required);
+	const missing = required.filter((name) => !actualSet.has(name));
+	const extra = actual.filter((name) => !requiredSet.has(name));
+	if (JSON.stringify(missing) !== JSON.stringify(projection.missing)) return protocol("invalid_frame");
+	result.toolRegistry = projection;
+	if (missing.length || extra.length) {
+		result.exitCode = 1;
+		result.nativeStatus = "native_tool_registry_mismatch";
+		result.toolsMissing = missing;
+		result.toolsExtra = extra;
+		result.transportIncomplete = true;
+		result.error = `Native tool registry mismatch (missing: ${missing.join(", ") || "none"}; extra: ${extra.join(", ") || "none"}).`;
+	}
+}
+
+function applyDeniedToolOutcome(result: SingleResult, collection: DeniedToolCollected): void {
+	if (!collection.ok) {
+		result.exitCode = 1; result.nativeStatus = "native_denied_tools_protocol_error"; result.deniedToolCallsError = collection.code;
+		result.transportIncomplete = true; result.error = `Native denied-tool proof failed: ${collection.code}.`; return;
+	}
+	result.deniedToolCalls = collection.frame.calls.map((call) => ({ ...call }));
+	if (collection.frame.overflow) result.deniedToolCallsOverflow = true;
+	if (collection.frame.calls.length > 0 || collection.frame.overflow) result.transportIncomplete = true;
 }
 
 function withRunContext<T extends SingleResult>(result: T, context: RunSyncOptions["context"]): T {
@@ -152,6 +217,12 @@ function persistSingleResultMetadata(input: {
 		error: target.error,
 		agentContract: target.agentContract,
 		launchContractDigest: target.launchContractDigest,
+		toolRegistry: target.toolRegistry,
+		toolsMissing: target.toolsMissing,
+		toolsExtra: target.toolsExtra,
+		toolRegistryError: target.toolRegistryError,
+		transportIncomplete: target.transportIncomplete,
+		nativeStatus: target.nativeStatus,
 		launchResolvedExtensions: target.launchResolvedExtensions,
 		runtimeAcknowledgedExtensions: target.runtimeAcknowledgedExtensions,
 		execution: target.execution,
@@ -289,6 +360,7 @@ async function runSingleAttempt(
 		jsonlPath?: string;
 		artifactPaths?: ArtifactPaths;
 		transcriptWriter?: ChildTranscriptWriter;
+		activateDeferredArtifacts?: () => ChildTranscriptWriter | undefined;
 		attemptNotes: string[];
 		outputSnapshot?: SingleOutputSnapshot;
 		originalTask?: string;
@@ -297,7 +369,7 @@ async function runSingleAttempt(
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
-	const watchdogConfig = resolveWatchdogConfig(options.cwd ?? runtimeCwd);
+	const watchdogConfig = options.disableWatchdog ? { ok: false as const } : resolveWatchdogConfig(options.cwd ?? runtimeCwd);
 	const childWatchdog = watchdogConfig.ok
 		? resolveChildWatchdogConfig({
 			config: watchdogConfig.config,
@@ -307,6 +379,15 @@ async function runSingleAttempt(
 		})
 		: undefined;
 	const permissionRules = resolvePermissionRules(options.permissions, agent.permissions);
+	let boundPackageExtensions: ActiveBoundResolvedPackageExtensions | undefined;
+	try { boundPackageExtensions = options.activeBoundProjectSkills ? resolveActiveBoundPackageExtensions(agent) : undefined; }
+	catch { throw new Error("Active-bound launch contract changed before spawn."); }
+	if (boundPackageExtensions && agent.source === "package") {
+		agent.activeBoundResolvedExtensions = boundPackageExtensions.paths;
+		agent.activeBoundExtensionProjection = boundPackageExtensions.projection;
+	}
+	const launchSubagentOnlyExtensions = boundPackageExtensions?.paths ?? agent.subagentOnlyExtensions;
+	const launchTools = options.launchToolsOverride ?? agent.tools;
 	const permissionAuditPath = permissionRules && options.artifactsDir
 		? path.join(options.artifactsDir, "permission-audit", `${options.runId}-${options.index ?? 0}.jsonl`)
 		: undefined;
@@ -322,9 +403,9 @@ async function runSingleAttempt(
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
-		tools: agent.tools,
-		extensions: agent.extensions,
-		subagentOnlyExtensions: agent.subagentOnlyExtensions,
+		tools: launchTools,
+		extensions: options.activeBoundProjectSkills ? [] : agent.extensions,
+		subagentOnlyExtensions: launchSubagentOnlyExtensions,
 		systemPrompt: appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget),
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
@@ -350,13 +431,15 @@ async function runSingleAttempt(
 		childWatchdog,
 		waitToolEnabled: options.waitToolEnabled,
 		capabilityCeiling: options.capabilityCeiling,
+		disablePermissionSystemExtension: options.activeBoundProjectSkills,
+		activeBoundPackageMediator: options.activeBoundToolRegistry !== undefined,
 	});
 
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
-		tools: agent.tools,
-		extensions: agent.extensions,
-		subagentOnlyExtensions: agent.subagentOnlyExtensions,
+		tools: launchTools,
+		extensions: options.activeBoundProjectSkills ? [] : agent.extensions,
+		subagentOnlyExtensions: launchSubagentOnlyExtensions,
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
@@ -364,8 +447,32 @@ async function runSingleAttempt(
 		capabilityCeiling: options.capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agent.name,
+		disablePermissionSystemExtension: options.activeBoundProjectSkills,
+		activeBoundPackageMediator: options.activeBoundToolRegistry !== undefined,
 	});
 	const launchResolvedExtensions = projectLaunchResolvedChildExtensions(toolPlan);
+	const boundToolRegistryProjection = options.activeBoundToolRegistry
+		? expectedToolRegistryProjection(options.activeBoundToolRegistry.required, options.activeBoundToolRegistry.internalTools)
+		: undefined;
+	if (options.activeBoundToolRegistry && !boundToolRegistryProjection) throw new Error("Active-bound tool registry policy is invalid.");
+	const boundRuntimeExtensions = options.activeBoundToolRegistry
+		? attestBoundRuntimeExtensions(toolPlan.runtimeExtensions)
+		: undefined;
+	const boundToolRegistryDigest = options.activeBoundToolRegistry && boundToolRegistryProjection && boundRuntimeExtensions
+		? canonicalSha256({ modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions })
+		: undefined;
+	let piCommandEvidence;
+	try { piCommandEvidence = options.activeBoundToolRegistry ? attestPiSpawnCommand(options.cwd ?? runtimeCwd) : undefined; }
+	catch (error) {
+		cleanupTempDir(tempDir);
+		const message = `Failed to attest Pi command before spawn: ${error instanceof Error ? error.message : String(error)}`;
+		return withRunContext({
+			index: options.index ?? 0, agent: agent.name, task: shared.originalTask ?? task,
+			exitCode: 1, error: message, finalOutput: message, outputState: "absent", messages: [], usage: emptyUsage(), model: modelArg,
+			...(resolvedThinking ? { thinking: resolvedThinking } : {}), skills: shared.resolvedSkillNames,
+			progressSummary: { toolCount: 0, tokens: 0, durationMs: 0 },
+		}, options.context);
+	}
 	const launchContractDigest = launchBindingDigest({
 		definitionDigest: agentDefinitionDigest(agent),
 		task: shared.originalTask ?? task,
@@ -377,9 +484,16 @@ async function runSingleAttempt(
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
 		skills: shared.resolvedSkillNames ?? [],
+		...(options.activeBoundEnvironment !== undefined ? { environment: projectActiveBoundEnvironment(options.activeBoundEnvironment) } : {}),
+		...(boundPackageExtensions ? { packageExtensions: boundPackageExtensions.projection } : {}),
+		...(piCommandEvidence ? { piCommandEvidence } : {}),
+		...(options.activeBoundToolRegistry && boundToolRegistryProjection && boundToolRegistryDigest ? { toolRegistry: { modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions, digest: boundToolRegistryDigest } } : {}),
+		...(options.activeBoundEnvironment !== undefined ? { artifactPolicy: options.deferArtifactsUntilSpawn ? { enabled: true, dir: "session", root: options.artifactsDir, includeInput: options.artifactConfig?.includeInput !== false, includeOutput: options.artifactConfig?.includeOutput !== false, includeJsonl: options.artifactConfig?.includeJsonl !== false, includeTranscript: options.artifactConfig?.includeTranscript !== false, includeMetadata: options.artifactConfig?.includeMetadata !== false } : { enabled: false } } : {}),
 		tools: toolPlan.effectiveToolAllowlist,
 		extensions: toolPlan.extensionArgs,
+		subagentOnlyExtensions: options.activeBoundProjectSkills ? launchSubagentOnlyExtensions ?? [] : undefined,
 		mcpDirectTools: toolPlan.effectiveMcpTools,
+		permissionRules: options.activeBoundProjectSkills ? permissionRules : undefined,
 		...(options.outputPath ? { outputPath: options.outputPath } : {}),
 		outputMode: options.outputMode ?? "inline",
 		...(options.structuredOutput ? { structuredOutputSchema: options.structuredOutput.schema } : {}),
@@ -397,7 +511,7 @@ async function runSingleAttempt(
 		usage: emptyUsage(),
 		model: modelArg,
 		...(resolvedThinking ? { thinking: resolvedThinking } : {}),
-		artifactPaths: shared.artifactPaths,
+		artifactPaths: shared.activateDeferredArtifacts ? undefined : shared.artifactPaths,
 		transcriptPath: shared.transcriptWriter ? shared.artifactPaths?.transcriptPath : undefined,
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
@@ -445,7 +559,7 @@ async function runSingleAttempt(
 		lastActivityAt: startTime,
 	};
 	result.progress = progress;
-	const attemptTimeout = resolveAttemptTimeout(options);
+	let attemptTimeout = resolveAttemptTimeout(options);
 	if (attemptTimeout?.remainingMs === 0) {
 		cleanupTempDir(tempDir);
 		result.exitCode = 1;
@@ -461,20 +575,105 @@ async function runSingleAttempt(
 		};
 		return result;
 	}
-	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
+	const inheritedSpawnEnv = options.activeBoundEnvironment !== undefined
+		? buildActiveBoundSpawnEnvironment(process.env, options.activeBoundEnvironment)
+		: { ...process.env };
+	if (options.disableWatchdog && options.activeBoundEnvironment === undefined) {
+		for (const key of Object.keys(inheritedSpawnEnv)) {
+			if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INTERCOM_")) delete inheritedSpawnEnv[key];
+		}
+	}
+	const spawnEnv: NodeJS.ProcessEnv = options.activeBoundEnvironment !== undefined
+		? Object.assign(Object.create(null), inheritedSpawnEnv, sharedEnv, getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride))
+		: { ...inheritedSpawnEnv, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth, options.parentDepthOverride) };
+	for (const [key, value] of Object.entries(spawnEnv)) if (value === undefined) delete spawnEnv[key];
+	delete spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV];
+	delete spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV];
+	delete spawnEnv[BOUND_TOOL_REGISTRY_FD_ENV];
+	if (options.activeBoundToolRegistry) {
+		const deniedExact = new Set(["NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV", "ZDOTDIR"]);
+		for (const key of Object.keys(spawnEnv)) {
+			const normalized = key.toUpperCase();
+			if (deniedExact.has(normalized) || normalized.startsWith("LD_") || normalized.startsWith("DYLD_")) delete spawnEnv[key];
+		}
+	}
+	const toolRegistryProofNonce = options.activeBoundToolRegistry ? randomBytes(32).toString("hex") : undefined;
+	if (options.activeBoundToolRegistry) {
+		spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
+		spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
+			...options.activeBoundToolRegistry,
+			proofNonce: toolRegistryProofNonce,
+			denialFd: 4,
+			runtimeExtensions: boundRuntimeExtensions,
+			packageExtensions: (boundPackageExtensions?.attestations ?? []).map((entry) => ({ ...entry })),
+		});
+		spawnEnv[BOUND_TOOL_REGISTRY_FD_ENV] = "3";
+	}
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
 
-	const exitCode = await new Promise<number>((resolve) => {
+	let artifactActivationFailed = false;
+	let artifactActivationPending = Boolean(shared.activateDeferredArtifacts);
+	let toolRegistryCollector: ToolRegistryCollector | undefined;
+	let deniedToolCollector: DeniedToolCollector | undefined;
+	let deniedToolProofReceived = false;
+	let childSpawned = false;
+	const exitCode = await new Promise<number>((resolve, reject) => {
 		const spawnSpec = getPiSpawnCommand(args);
-		const proc = spawn(spawnSpec.command, spawnSpec.args, {
-			cwd: options.cwd ?? runtimeCwd,
-			env: spawnEnv,
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
+		try { options.beforeSpawn?.(launchContractDigest); } catch (error) { cleanupTempDir(tempDir); reject(error); return; }
+		attemptTimeout = resolveAttemptTimeout(options);
+		if (attemptTimeout?.remainingMs === 0) {
+			cleanupTempDir(tempDir);
+			result.timedOut = true; result.error = attemptTimeout.message; result.finalOutput = attemptTimeout.message;
+			progress.status = "failed"; progress.error = attemptTimeout.message; progress.durationMs = Date.now() - startTime;
+			resolve(1); return;
+		}
+		let proc: ChildProcessByStdio<null, Readable, Readable>;
+		try {
+			proc = spawn(spawnSpec.command, spawnSpec.args, {
+				cwd: options.cwd ?? runtimeCwd,
+				env: spawnEnv,
+				stdio: options.activeBoundToolRegistry ? ["ignore", "pipe", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+			}) as ChildProcessByStdio<null, Readable, Readable>;
+			if (options.activeBoundToolRegistry) {
+				const proofStream = (proc as unknown as { stdio: Array<unknown> }).stdio[3];
+				if (!proofStream || typeof (proofStream as Readable).on !== "function") throw new Error("Bound registry proof pipe was not created.");
+				toolRegistryCollector = createToolRegistryCollector(proofStream as Readable, toolRegistryProofNonce!);
+				const denialStream = (proc as unknown as { stdio: Array<unknown> }).stdio[4];
+				if (!denialStream || typeof (denialStream as Readable).on !== "function") throw new Error("Bound denial proof pipe was not created.");
+				deniedToolCollector = createDeniedToolCollector(denialStream as Readable, toolRegistryProofNonce!);
+			}
+		} catch (error) {
+			cleanupTempDir(tempDir);
+			reject(error);
+			return;
+		}
+		let jsonlWriter = createJsonlWriter(shared.activateDeferredArtifacts ? undefined : shared.jsonlPath, proc.stdout);
+		let spawnObserved = false;
+		proc.once("spawn", () => {
+			if (spawnObserved) return;
+			spawnObserved = true;
+			childSpawned = true;
+			options.onSpawn?.();
+			if (!shared.activateDeferredArtifacts) return;
+			try {
+				shared.transcriptWriter = shared.activateDeferredArtifacts();
+				shared.jsonlPath = shared.artifactPaths?.jsonlPath;
+				result.artifactPaths = shared.artifactPaths;
+				result.transcriptPath = shared.transcriptWriter ? shared.artifactPaths?.transcriptPath : undefined;
+				artifactActivationPending = false;
+				jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
+			} catch (error) {
+				artifactActivationPending = false;
+				artifactActivationFailed = true;
+				const message = "Bound artifact initialization failed.";
+				result.error = message; result.finalOutput = message; result.artifactInitializationFailed = true; progress.error = message; progress.status = "failed";
+				trySignalChild(proc, "SIGTERM");
+				setTimeout(() => { if (!processClosed) trySignalChild(proc, "SIGKILL"); }, 3000).unref?.();
+			}
 		});
-		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let processClosed = false;
 		let lifecycleFinished = false;
 		let detached = false;
@@ -516,7 +715,7 @@ async function runSingleAttempt(
 		};
 
 		const detachForeground = (reason: string): boolean => {
-			if (detached || processClosed || lifecycleFinished || options.signal?.aborted) return false;
+			if (artifactActivationFailed || detached || processClosed || lifecycleFinished || options.signal?.aborted) return false;
 			const receiptProgress = snapshotProgress(progress);
 			receiptProgress.status = "detached";
 			receiptProgress.durationMs = Date.now() - startTime;
@@ -588,6 +787,7 @@ async function runSingleAttempt(
 			}
 		};
 		const startFinalDrain = () => {
+			if (options.activeBoundToolRegistry && !agentSettledReceived && !deniedToolProofReceived) return;
 			if (childWatchdogIsActive(childWatchdogState)) {
 				armWatchdogTail();
 				return;
@@ -609,6 +809,11 @@ async function runSingleAttempt(
 			}, FINAL_STOP_GRACE_MS);
 			finalDrainTimer.unref?.();
 		};
+		if (deniedToolCollector) void deniedToolCollector.result.then((collection) => {
+			if (!collection.ok) return;
+			deniedToolProofReceived = true;
+			startFinalDrain();
+		});
 		function armWatchdogTail(): void {
 			if ((!cleanTerminalAssistantStopReceived && !agentSettledReceived) || watchdogTailTimer || lifecycleFinished || processClosed) return;
 			watchdogTailTimer = setTimeout(() => {
@@ -738,7 +943,7 @@ async function runSingleAttempt(
 		};
 		const requestTurnBudgetAbort = (turnCount: number) => {
 			const budget = options.turnBudget;
-			if (!budget || result.timedOut || result.turnBudgetExceeded || interruptedByControl || processClosed || lifecycleFinished) return;
+			if (!budget || artifactActivationFailed || result.timedOut || result.turnBudgetExceeded || interruptedByControl || processClosed || lifecycleFinished) return;
 			const message = turnBudgetExceededMessage(budget, turnCount);
 			result.turnBudgetExceeded = true;
 			result.wrapUpRequested = true;
@@ -810,7 +1015,7 @@ async function runSingleAttempt(
 
 
 		const emitUpdateSnapshot = (text: string) => {
-			if (!options.onUpdate || processClosed) return;
+			if (!options.onUpdate || processClosed || artifactActivationPending || artifactActivationFailed) return;
 			const progressSnapshot = snapshotProgress(progress);
 			const resultSnapshot = snapshotStreamResult(result, progressSnapshot);
 			const controlEvents = drainPendingControlEvents();
@@ -826,7 +1031,7 @@ async function runSingleAttempt(
 		};
 
 		const fireUpdate = () => {
-			if (!options.onUpdate || processClosed) return;
+			if (!options.onUpdate || processClosed || artifactActivationPending || artifactActivationFailed) return;
 			progress.durationMs = Date.now() - startTime;
 			const output = (result.timedOut || result.turnBudgetExceeded) && result.finalOutput ? result.finalOutput : getFinalOutput(result.messages ?? []);
 			emitUpdateSnapshot(output || "(running...)");
@@ -834,7 +1039,7 @@ async function runSingleAttempt(
 
 		const rawStdoutTail = createBoundedByteTail();
 		const processLine = (line: string) => {
-			if (!line.trim()) return;
+			if (artifactActivationPending || artifactActivationFailed || !line.trim()) return;
 			jsonlWriter.writeLine(line);
 			let evt: { type?: string; message?: Message; toolName?: string; args?: unknown; willRetry?: unknown };
 			try {
@@ -1006,14 +1211,15 @@ async function runSingleAttempt(
 			activityTimer.unref?.();
 		}
 
-		if (attemptTimeout) {
+		const activeAttemptTimeout = attemptTimeout;
+		if (activeAttemptTimeout) {
 			timeoutTimer = setTimeout(() => {
-				if (processClosed || lifecycleFinished || interruptedByControl) return;
+				if (processClosed || lifecycleFinished || interruptedByControl || artifactActivationFailed) return;
 				result.timedOut = true;
-				result.error = attemptTimeout.message;
-				result.finalOutput = attemptTimeout.message;
+				result.error = activeAttemptTimeout.message;
+				result.finalOutput = activeAttemptTimeout.message;
 				progress.status = "failed";
-				progress.error = attemptTimeout.message;
+				progress.error = activeAttemptTimeout.message;
 				progress.durationMs = Date.now() - startTime;
 				fireUpdate();
 				trySignalChild(proc, "SIGINT");
@@ -1027,13 +1233,13 @@ async function runSingleAttempt(
 					trySignalChild(proc, "SIGKILL");
 				}, 4000);
 				timeoutHardKillTimer.unref?.();
-			}, attemptTimeout.remainingMs);
+			}, activeAttemptTimeout.remainingMs);
 			timeoutTimer.unref?.();
 		}
 
 		const stderrTail = createBoundedByteTail();
 		const failProtocol = (limit: ProtocolOutputLimit): void => {
-			if (result.protocolError) return;
+			if (artifactActivationFailed || result.protocolError) return;
 			result.protocolError = limit;
 			result.error = formatProtocolOutputLimit(limit);
 			progress.status = "failed";
@@ -1069,20 +1275,27 @@ async function runSingleAttempt(
 		proc.on("exit", () => {
 			childExited = true;
 			clearFinalDrainTimers();
+			for (const collector of [toolRegistryCollector, deniedToolCollector]) if (collector) {
+				const finalizationTimer = setTimeout(() => collector.finalize(), 100);
+				void collector.result.finally(() => clearTimeout(finalizationTimer));
+			}
 		});
-		proc.on("close", (code, signal) => {
+		proc.on("close", async (code, signal) => {
 			if (lifecycleFinished) return;
 			processClosed = true;
+			toolRegistryCollector?.finalize();
+			deniedToolCollector?.finalize();
 			clearFinalDrainTimers();
 			clearStdioGuard();
-			void jsonlWriter.close().catch(() => {
+			stdoutReader.end();
+			stderrReader.end();
+			const closeJsonl = jsonlWriter.close().catch(() => {
 				// JSONL artifact flush is best effort.
 			});
+			if (shared.activateDeferredArtifacts) await closeJsonl;
 			const toolDiagnosticError = readChildToolDiagnosticError(toolDiagnosticPath);
 			result.runtimeAcknowledgedExtensions = readRuntimeAcknowledgedExtensions(runtimeAcknowledgedExtensionsPath);
 			cleanupTempDir(tempDir);
-			stdoutReader.end();
-			stderrReader.end();
 			const stderr = stderrTail.text();
 			const rawStdout = rawStdoutTail.text();
 			let closeError = result.error ?? toolDiagnosticError ?? assistantError;
@@ -1111,6 +1324,8 @@ async function runSingleAttempt(
 		proc.on("error", (error) => {
 			if (lifecycleFinished) return;
 			processClosed = true;
+			toolRegistryCollector?.finalize();
+			deniedToolCollector?.finalize();
 			clearFinalDrainTimers();
 			clearStdioGuard();
 			void jsonlWriter.close().catch(() => {
@@ -1128,8 +1343,9 @@ async function runSingleAttempt(
 		if (options.signal) {
 			const kill = () => {
 				if (processClosed || lifecycleFinished) return;
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				trySignalChild(proc, "SIGTERM");
+				const cancellationHardKill = setTimeout(() => { if (options.activeBoundToolRegistry || !proc.killed) trySignalChild(proc, "SIGKILL"); }, 3000);
+				cancellationHardKill.unref?.();
 			};
 			if (options.signal.aborted) kill();
 			else {
@@ -1140,7 +1356,7 @@ async function runSingleAttempt(
 
 		if (options.interruptSignal) {
 			const interrupt = () => {
-				if (processClosed || lifecycleFinished) return;
+				if (processClosed || lifecycleFinished || artifactActivationFailed) return;
 				if (result.timedOut) return;
 				interruptedByControl = true;
 				clearTimeoutTimers();
@@ -1174,7 +1390,47 @@ async function runSingleAttempt(
 		}
 	});
 	result.exitCode = exitCode;
-	if (interruptedByControl) {
+	if (options.activeBoundToolRegistry && !artifactActivationFailed && childSpawned) {
+		const collection = toolRegistryCollector ? await toolRegistryCollector.result : { ok: false as const, code: "missing_frame" as const };
+		if (exitCode === BOUND_PACKAGE_MUTATION_EXIT) {
+			applyBoundToolRegistryOutcome(result, collection, options.activeBoundToolRegistry);
+			if (result.toolRegistry && result.nativeStatus !== "native_tool_registry_mismatch") {
+				result.toolRegistry = undefined;
+				result.exitCode = 1;
+				result.nativeStatus = "native_tool_registry_protocol_error";
+				result.toolRegistryError = "package_runtime_mutation";
+				result.transportIncomplete = true;
+				result.error = "Native package attempted to mutate the bound runtime contract.";
+			}
+		} else if (!((result.timedOut || options.signal?.aborted || interruptedByControl) && !collection.ok && (collection.code === "missing_frame" || (collection.code === "invalid_frame" && collection.partial === true)))) {
+			applyBoundToolRegistryOutcome(result, collection, options.activeBoundToolRegistry);
+		}
+	}
+	if (options.activeBoundToolRegistry && !artifactActivationFailed && childSpawned) {
+		const denial = deniedToolCollector ? await deniedToolCollector.result : { ok: false as const, code: "missing_frame" as const };
+		const interrupted = result.timedOut || options.signal?.aborted || interruptedByControl;
+		if (!(interrupted && !denial.ok && (denial.code === "missing_frame" || (denial.code === "invalid_frame" && denial.partial === true)))) {
+			if (!result.nativeStatus) applyDeniedToolOutcome(result, denial);
+			else if (denial.ok) {
+				result.deniedToolCalls = denial.frame.calls.map((call) => ({ ...call }));
+				if (denial.frame.overflow) result.deniedToolCallsOverflow = true;
+			} else {
+				result.deniedToolCallsError = denial.code;
+				result.transportIncomplete = true;
+			}
+		}
+	}
+	if (options.activeBoundToolRegistry && exitCode === 78 && result.toolRegistry && !result.nativeStatus) {
+		result.toolRegistry = undefined;
+		result.toolsMissing = undefined;
+		result.toolsExtra = undefined;
+		result.exitCode = 1;
+		result.nativeStatus = "native_tool_registry_protocol_error";
+		result.toolRegistryError = "invalid_frame";
+		result.transportIncomplete = true;
+		result.error = "Native tool registry gate exited without a measured mismatch.";
+	}
+	if (interruptedByControl && !artifactActivationFailed && !result.nativeStatus) {
 		result.exitCode = 0;
 		result.interrupted = true;
 		result.error = undefined;
@@ -1274,7 +1530,7 @@ async function runSingleAttempt(
 			agent: agent.name,
 			task: shared.originalTask ?? task,
 			messages: result.messages ?? [],
-			tools: agent.tools,
+			tools: launchTools,
 			mcpDirectTools: agent.mcpDirectTools,
 		})
 		: undefined;
@@ -1346,7 +1602,7 @@ async function runSingleAttempt(
 		? result.outputReference.message
 		: fullOutput;
 	result.controlEvents = allControlEvents.length ? allControlEvents : undefined;
-	if (options.onUpdate) {
+	if (options.onUpdate && !artifactActivationPending && !artifactActivationFailed) {
 		const finalText = result.finalOutput || result.error || "(no output)";
 		const progressSnapshot = snapshotProgress(progress);
 		const resultSnapshot = snapshotStreamResult(result, progressSnapshot);
@@ -1449,13 +1705,15 @@ async function runSyncCompletion(
 	}
 	const skillNames = options.skills ?? agent.skills ?? [];
 	const skillCwd = options.cwd ?? runtimeCwd;
-	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
-		skillNames,
-		skillCwd,
-		runtimeCwd,
-		agent.skillPath,
-		agent.filePath ? path.dirname(agent.filePath) : skillCwd,
-	);
+	const { resolved: resolvedSkills, missing: missingSkills } = options.activeBoundProjectSkills
+		? resolveProjectSkillsUncached(skillNames, skillCwd)
+		: resolveSkillsWithFallback(
+			skillNames,
+			skillCwd,
+			runtimeCwd,
+			agent.skillPath,
+			agent.filePath ? path.dirname(agent.filePath) : skillCwd,
+		);
 	if (skillNames.some((skill) => skill.trim() === "pi-subagents") && missingSkills.includes("pi-subagents")) {
 		return withRunContext({
 			index: options.index ?? 0,
@@ -1469,7 +1727,7 @@ async function runSyncCompletion(
 	}
 	let systemPrompt = agent.systemPrompt?.trim() || "";
 	if (resolvedSkills.length > 0) {
-		const skillInjection = buildSkillInjection(resolvedSkills);
+		const skillInjection = options.activeBoundProjectSkills ? buildBoundSkillInjection(resolvedSkills) : buildSkillInjection(resolvedSkills);
 		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${skillInjection}` : skillInjection;
 	}
 	const memoryInjection = buildAgentMemoryInjection(agent, skillCwd);
@@ -1496,18 +1754,22 @@ async function runSyncCompletion(
 	let artifactPathsResult: ArtifactPaths | undefined;
 	let jsonlPath: string | undefined;
 	let transcriptWriter: ChildTranscriptWriter | undefined;
+	let activateDeferredArtifacts: (() => ChildTranscriptWriter | undefined) | undefined;
+	let deferredArtifactsActivated = false;
 	if (options.artifactsDir && options.artifactConfig?.enabled !== false) {
-		artifactPathsResult = getArtifactPaths(options.artifactsDir, options.runId, agentName, options.index);
-		ensureArtifactsDir(options.artifactsDir);
+		const artifactPaths = getArtifactPaths(options.artifactsDir, options.runId, agentName, options.index);
+		artifactPathsResult = artifactPaths;
+		const activate = () => {
+			ensureArtifactsDir(options.artifactsDir!);
 		if (options.artifactConfig?.includeInput !== false) {
-				writeArtifact(artifactPathsResult.inputPath, `# Task for ${agentName}\n\n${taskWithAcceptance}`);
+				writeArtifact(artifactPaths.inputPath, `# Task for ${agentName}\n\n${taskWithAcceptance}`);
 		}
 		if (options.artifactConfig?.includeJsonl !== false) {
-			jsonlPath = artifactPathsResult.jsonlPath;
+			jsonlPath = artifactPaths.jsonlPath;
 		}
 		if (options.artifactConfig?.includeTranscript !== false) {
 			transcriptWriter = createChildTranscriptWriter({
-				transcriptPath: artifactPathsResult.transcriptPath,
+				transcriptPath: artifactPaths.transcriptPath,
 				source: "foreground",
 				runId: options.runId,
 				agent: agentName,
@@ -1516,12 +1778,17 @@ async function runSyncCompletion(
 			});
 			transcriptWriter.writeInitialUserMessage(taskWithAcceptance);
 		}
+			deferredArtifactsActivated = true;
+			return transcriptWriter;
+		};
+		if (options.deferArtifactsUntilSpawn) activateDeferredArtifacts = activate;
+		else activate();
 	}
 
 	const persistResultMetadata = (target: SingleResult): void => {
 		persistSingleResultMetadata({
 			metadataPath: artifactPathsResult?.metadataPath,
-			enabled: options.artifactConfig?.enabled !== false && options.artifactConfig?.includeMetadata !== false,
+			enabled: options.artifactConfig?.enabled !== false && options.artifactConfig?.includeMetadata !== false && (!options.deferArtifactsUntilSpawn || deferredArtifactsActivated),
 			runId: options.runId,
 			agent: agentName,
 			task,
@@ -1562,6 +1829,7 @@ async function runSyncCompletion(
 				jsonlPath,
 				artifactPaths: artifactPathsResult,
 				transcriptWriter,
+				activateDeferredArtifacts,
 				attemptNotes,
 				modelCandidates: candidates
 					.map((modelCandidate) => applyThinkingSuffix(modelCandidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
@@ -1590,7 +1858,7 @@ async function runSyncCompletion(
 			// been handed to a supervisor, terminating that attempt must not launch a
 			// startup retry or model fallback. Explicit user detach retains fallback.
 			if (intercomDetached || result.timedOut || result.turnBudgetExceeded) break modelAttemptsLoop;
-			if (attemptSucceeded) break modelAttemptsLoop;
+			if (attemptSucceeded || options.singleModelAttempt) break modelAttemptsLoop;
 
 			const startupFailure = isRetryableSubagentStartupFailure({
 				exitCode: result.exitCode,
@@ -1682,7 +1950,7 @@ async function runSyncCompletion(
 	if (transcriptWriter?.getError()) result.transcriptError = transcriptWriter.getError();
 
 	try {
-		if (artifactPathsResult && options.artifactConfig?.enabled !== false) {
+		if (artifactPathsResult && options.artifactConfig?.enabled !== false && (!options.deferArtifactsUntilSpawn || deferredArtifactsActivated)) {
 			result.artifactPaths = artifactPathsResult;
 			if (options.artifactConfig?.includeOutput !== false) {
 				writeArtifact(artifactPathsResult.outputPath, formatOutputArtifactContent({

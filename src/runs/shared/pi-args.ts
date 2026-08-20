@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+export { attestBoundRuntimeExtensions, type BoundRuntimeExtensionEvidenceV1 } from "./bound-runtime-evidence.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -67,6 +68,18 @@ const MAX_LAUNCH_RESOLVED_EXTENSION_IDS = 32;
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"subagent-prompt-runtime.ts",
+);
+const BOUND_TOOL_REGISTRY_BOOTSTRAP_EXTENSION_PATH = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"bound-tool-registry-bootstrap.ts",
+);
+const BOUND_PACKAGE_MEDIATOR_EXTENSION_PATH = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"bound-package-mediator.ts",
+);
+const BOUND_TOOL_REGISTRY_GATE_EXTENSION_PATH = path.join(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"bound-tool-registry-gate.ts",
 );
 const FANOUT_CHILD_EXTENSION_PATH = path.join(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -151,6 +164,9 @@ export interface BuildPiArgsInput {
 	childWatchdog?: ChildWatchdogConfig;
 	waitToolEnabled?: boolean;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	disablePermissionSystemExtension?: boolean;
+	/** Active-bound only: mediate attested package factories and append final registry gate. */
+	activeBoundPackageMediator?: boolean;
 }
 
 export interface BuildPiArgsResult {
@@ -216,6 +232,8 @@ export interface ResolvePiLaunchToolPlanInput {
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	agentName?: string;
+	disablePermissionSystemExtension?: boolean;
+	activeBoundPackageMediator?: boolean;
 }
 
 export interface PiLaunchToolPlan {
@@ -391,6 +409,14 @@ export function resolvePiLaunchToolPlan(
 		(input.mcpDirectTools?.length ?? 0) > 0 ||
 		allowedToolSet !== undefined;
 	const internalTools = input.structuredOutput ? ["structured_output"] : [];
+	if (input.activeBoundPackageMediator) {
+		const mcpNames = new Set(effectiveMcpTools);
+		if (mcpNames.size !== effectiveMcpTools.length
+			|| effectiveMcpTools.some((name) => declaredBuiltinTools.includes(name) || internalTools.includes(name))
+			|| internalTools.some((name) => declaredBuiltinTools.includes(name))) {
+			throw new Error("Active-bound tool names must not overlap across builtin, MCP, and internal origins.");
+		}
+	}
 	const effectiveToolAllowlist = [
 		...new Set([
 			...declaredBuiltinTools,
@@ -407,14 +433,16 @@ export function resolvePiLaunchToolPlan(
 				]),
 			]
 		: [];
-	const permSystemExt = capabilityCeiling?.denyExtensions
+	const permSystemExt = capabilityCeiling?.denyExtensions || input.disablePermissionSystemExtension
 		? undefined
 		: resolvePermissionSystemExtension();
-	const runtimeExtensions = [
-		PROMPT_RUNTIME_EXTENSION_PATH,
-		...(fanoutAuthorized ? [FANOUT_CHILD_EXTENSION_PATH] : []),
-		...(permSystemExt ? [permSystemExt] : []),
-	];
+	const runtimeExtensions = input.activeBoundPackageMediator
+		? [BOUND_TOOL_REGISTRY_BOOTSTRAP_EXTENSION_PATH, PROMPT_RUNTIME_EXTENSION_PATH, BOUND_PACKAGE_MEDIATOR_EXTENSION_PATH, BOUND_TOOL_REGISTRY_GATE_EXTENSION_PATH]
+		: [
+			PROMPT_RUNTIME_EXTENSION_PATH,
+			...(fanoutAuthorized ? [FANOUT_CHILD_EXTENSION_PATH] : []),
+			...(permSystemExt ? [permSystemExt] : []),
+		];
 	const disableAmbientExtensions =
 		capabilityCeiling?.denyExtensions === true ||
 		input.extensions !== undefined;
@@ -423,7 +451,7 @@ export function resolvePiLaunchToolPlan(
 		: [
 				...toolExtensionPaths,
 				...(input.extensions ?? []),
-				...(input.subagentOnlyExtensions ?? []),
+				...(input.activeBoundPackageMediator ? [] : (input.subagentOnlyExtensions ?? [])),
 			];
 	const extensionArgs = disableAmbientExtensions
 		? [...new Set([...runtimeExtensions, ...configuredExtensions])]
@@ -545,6 +573,8 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 			process.env[SUBAGENT_CAPABILITY_CEILING_ENV],
 		),
 		agentName: input.childAgentName,
+		disablePermissionSystemExtension: input.disablePermissionSystemExtension,
+		activeBoundPackageMediator: input.activeBoundPackageMediator,
 	});
 	if (toolPlan.explicitToolAllowlist) {
 		args.push(
