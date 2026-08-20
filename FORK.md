@@ -76,9 +76,14 @@ node --experimental-strip-types --import ./test/support/register-loader.mjs \
          test/integration/bound-tool-registry-installed.test.ts
 npm run test:all
 npm pack --dry-run
+A1_PROBE_EXPECTED_COMMIT=<40-hex-commit> A1_PROBE_SOURCE_MODE=local \
+  npm run test:probe:active-runtime
 ```
 
-The final release gate additionally requires a new Pi parent using the package
+`A1_PROBE_SOURCE_MODE=local` is a pre-push control: it installs exact local Git
+bytes and then applies the canonical origin solely for source-attestation testing.
+It does not replace the authoritative post-push run with
+`A1_PROBE_SOURCE_MODE=github`. The final release gate additionally requires a new Pi parent using the package
 installed from the canonical GitHub URL at the published exact SHA. The probe must
 enter through a real registered `ToolDefinition.execute`, observe one responder,
 verify pre-turn registry proof, exact cancellation, Fleet, headless, and reload,
