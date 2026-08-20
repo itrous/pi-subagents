@@ -116,6 +116,20 @@ describe("subagent extension child mode", () => {
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
+	it("does not harden the active historical coordinator when a reload candidate rolls back", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const key = "__piSubagentStructuredAttemptCoordinatorV1"; const attemptsByTuple = new Map(); const originalCancel = function() { return true; };
+			const legacy = { attemptsByTuple, admit() { return { accepted:false, reason:"capacity" }; }, cancel:originalCancel, activateSink(){}, deactivateSink(){}, stopOwner(){}, drainOwner(){return Promise.resolve();}, hasDrainingOwner(){return false;}, commitRejected(){return "capacity";} };
+			Object.defineProperty(legacy, "contractVersion", { value:2, writable:false, configurable:false }); globalThis[key] = legacy;
+			const handlers = new Map(); const listeners = new Map(); const events = { on(channel, handler) { const list = listeners.get(channel) ?? []; list.push(handler); listeners.set(channel, list); return () => {}; }, emit(channel, value) { for (const handler of listeners.get(channel) ?? []) handler(value); } };
+			const pi = new Proxy({ events, on(channel, handler){handlers.set(channel,handler);}, registerTool(){},registerCommand(){},registerShortcut(){},registerMessageRenderer(){},sendMessage(){},getSessionName(){} }, { get(target,prop){ return prop in target ? target[prop] : () => undefined; } });
+			let failed = false; try { registerSubagentExtension(pi, { resolveSourceIdentity(){return {available:false,sourceIdentityUnavailable:{version:1,reasonCode:"unverified_source"}};}, registerRpcBridge(){ return { prepare(){ throw new Error("candidate failed after prompt bridge"); }, activate(){}, stop(){}, emitReady(){}, dispose(){} }; } }); } catch (error) { failed = error?.message === "candidate failed after prompt bridge"; }
+			if (!failed) throw new Error("candidate failure did not propagate"); if (legacy.cancellationContractVersion !== undefined) throw new Error("rollback published cancellation contract"); if (legacy.cancel !== originalCancel || legacy.cancel() !== true) throw new Error("rollback changed active legacy cancellation"); delete globalThis[key];
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
+	});
+
 	it("publishes prepared transport only after complete registration and activates in session_start order", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
@@ -175,6 +189,25 @@ describe("subagent extension child mode", () => {
 			if (globalThis.__piSubagentRuntimeCleanup !== currentCleanup) throw new Error("late old shutdown cleared replacement cleanup pointer");
 			if (process.env.PI_SUBAGENT_PARENT_SESSION !== "new-session") throw new Error("late old shutdown cleared replacement session environment");
 			await replacement.handlers.get("session_shutdown")({reason:"quit"});
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
+	});
+
+	it("does not auto-drain known pending background work from a UI agent_end", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			import { registerBackgroundWorkProvider } from "./src/api/background-work.ts";
+			const handlers = new Map(); const listeners = new Map();
+			const events = { on(channel, handler) { const set = listeners.get(channel) ?? new Set(); set.add(handler); listeners.set(channel, set); return () => set.delete(handler); }, emit(channel, payload) { for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload); } };
+			const pi = new Proxy({ events, on(channel, handler) { handlers.set(channel, handler); }, registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {} }, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const ctx = { cwd:process.cwd(), hasUI:true, sessionManager:{getSessionId(){return "ui-pending";},getSessionFile(){return null;},getEntries(){return[];}}, modelRegistry:{getAvailable(){return[];}}, ui:{setWidget(){},requestRender(){},theme:{fg(_n,t){return t;},bg(_n,t){return t;},bold(t){return t;}}} };
+			let active = true; let listCalls = 0; const disposeProvider = registerBackgroundWorkProvider({ name:"ui-pending-test", wakeChannels:["ui-pending:wake"], listActiveWork() { listCalls++; return active ? [{ id:"pending", sessionId:"ui-pending" }] : []; } });
+			registerSubagentExtension(pi); handlers.get("session_start")({reason:"startup"}, ctx); const before = listCalls;
+			const completion = Promise.resolve(handlers.get("agent_end")({}, ctx));
+			const outcome = await Promise.race([completion.then(() => "resolved"), new Promise(resolve => setTimeout(() => resolve("blocked"), 100))]);
+			if (outcome !== "resolved") { active = false; events.emit("ui-pending:wake", {}); await completion; throw new Error("UI agent_end attempted to auto-drain pending background work"); }
+			if (listCalls !== before) throw new Error("UI agent_end inspected background work: " + listCalls + " vs " + before);
+			active = false; events.emit("ui-pending:wake", {}); disposeProvider(); await handlers.get("session_shutdown")({reason:"quit"});
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});

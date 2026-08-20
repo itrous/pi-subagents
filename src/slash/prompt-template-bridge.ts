@@ -22,7 +22,7 @@ import {
 	type PromptTemplateDelegationResponse,
 } from "./delegation-adapters.ts";
 import { getBoundIdentityRegistry, type BoundIdentityRegistryV1 } from "./bound-identity-registry.ts";
-import { getStructuredAttemptCoordinator, type StructuredAttemptCoordinator } from "./structured-attempt-coordinator.ts";
+import { getStructuredAttemptCoordinator, prepareStructuredAttemptCoordinator, structuredCancellationBindingKey, type StructuredAttemptCoordinator } from "./structured-attempt-coordinator.ts";
 import { cloneJsonWithinByteLimit } from "./delegation-json.ts";
 import { getBoundPendingCancellationRegistry, type BoundPendingCancellationRegistryV1 } from "./bound-pending-cancellation-registry.ts";
 
@@ -69,6 +69,11 @@ function hasStructuredDelegationMarker(data: unknown): boolean {
 	return ["ownerRunId", "nodeId", "result", "version"].some((key) => key in descriptors);
 }
 
+function hasOwnBindingProperty(data: unknown): boolean {
+	if (!data || typeof data !== "object" || Array.isArray(data) || utilTypes.isProxy(data)) return false;
+	try { return Object.getOwnPropertyDescriptor(data, "binding") !== undefined; } catch { return true; }
+}
+
 function hasBindingMarker(data: unknown): boolean {
 	if (!data || typeof data !== "object" || Array.isArray(data) || utilTypes.isProxy(data)) return false;
 	const descriptor = Object.getOwnPropertyDescriptor(data, "binding");
@@ -82,6 +87,7 @@ function validId(value: unknown): value is string {
 export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: string }>(
 	options: PromptTemplateBridgeOptions<Ctx>,
 ): {
+	prepare?: () => void;
 	activate: () => void;
 	activateTerminalSink: () => void;
 	stop: (options?: { preserveSink?: boolean }) => void;
@@ -111,14 +117,14 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 		const value = inspected.value as Record<string, unknown>; const tuple = { requestId: value.requestId, ownerRunId: value.ownerRunId, nodeId: value.nodeId };
 		if (!validId(tuple.requestId) || !validId(tuple.ownerRunId) || !validId(tuple.nodeId)) return;
 		const keys = Object.keys(value).sort().join(",");
-		if (keys === "nodeId,ownerRunId,requestId") { coordinator.cancel(tuple.requestId, tuple.ownerRunId, tuple.nodeId); return; }
+		if (keys === "nodeId,ownerRunId,requestId") { coordinator.cancel(tuple.requestId, tuple.ownerRunId, tuple.nodeId, "legacy"); return; }
 		if (keys !== "binding,nodeId,ownerRunId,requestId,targetServerInstanceId" || !options.activeBoundRuntime || !pendingCancellations
 			|| value.targetServerInstanceId !== options.activeBoundRuntime.serverInstanceId) return;
 		const binding = parseSubagentDelegationBinding(value.binding);
 		if (!binding || binding.targetServerInstanceId !== value.targetServerInstanceId
 			|| !options.activeBoundRuntime.verifyPendingCancellation(tuple as { requestId: string; ownerRunId: string; nodeId: string }, binding)) return;
-		if (coordinator.cancel(tuple.requestId, tuple.ownerRunId, tuple.nodeId)) return;
-		pendingCancellations.remember(tuple as { requestId: string; ownerRunId: string; nodeId: string }, binding);
+		if (coordinator.cancel(tuple.requestId, tuple.ownerRunId, tuple.nodeId, "bound", structuredCancellationBindingKey(binding))) return;
+		if (coordinator.canRememberCancellation(tuple.requestId, tuple.ownerRunId, tuple.nodeId)) pendingCancellations.remember(tuple as { requestId: string; ownerRunId: string; nodeId: string }, binding);
 	});
 
 	subscribe(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, (data) => {
@@ -174,7 +180,7 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 			}
 			return;
 		}
-		executeStructured(parsed.request);
+		executeStructured(parsed.request, hasOwnBindingProperty(data));
 	});
 
 	function rejectBound(request: SubagentDelegationRequest, status: "invalid_request" | "unavailable_context" | "duplicate_node", error?: string): void {
@@ -188,10 +194,18 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 		} catch { /* direct rejected terminal is one-shot even when a listener throws */ }
 	}
 
-	function executeStructured(request: SubagentDelegationRequest): void {
+	function executeStructured(request: SubagentDelegationRequest, ownBindingProperty = request.binding !== undefined): void {
 		if (!active || stopped) return;
 		let prospectiveReservation: { serverInstanceId: string; prospectiveRunId: string } | undefined;
 		let boundProof;
+		if (request.binding && pendingCancellations) {
+			const pending = pendingCancellations.consume(request, request.binding);
+			if (pending === "consumed") return;
+			if (pending) {
+				try { options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, { requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: pending === "cancelled" ? "cancelled" : "unavailable_context", ...(pending === "saturated" ? { error: "Pending cancellation capacity is exhausted for this runtime generation." } : {}) } satisfies SubagentDelegationResponse); } catch {}
+				return;
+			}
+		}
 		if (request.binding) {
 			const runtime = options.activeBoundRuntime;
 			if (!runtime) {
@@ -214,7 +228,7 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 			}
 			boundProof = verified.proof;
 		}
-		const admission = coordinator.admit(request, runtimeId);
+		const admission = coordinator.admit(request, runtimeId, ownBindingProperty ? "bound" : "legacy");
 		if (!admission.accepted) {
 			if (prospectiveReservation) boundRegistry!.release(prospectiveReservation.serverInstanceId, prospectiveReservation.prospectiveRunId);
 			if (request.binding) {
@@ -238,11 +252,6 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 		}
 		if (prospectiveReservation && !boundRegistry!.commit(prospectiveReservation.serverInstanceId, prospectiveReservation.prospectiveRunId)) {
 			admission.settle({ requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: "duplicate_node" });
-			return;
-		}
-		if (request.binding && pendingCancellations?.consume(request, request.binding)) {
-			coordinator.cancel(request.requestId, request.ownerRunId, request.nodeId);
-			admission.settle({ requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId, status: "cancelled" });
 			return;
 		}
 		void (async () => {
@@ -305,6 +314,7 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 
 	return {
 		runtimeId,
+		prepare: () => prepareStructuredAttemptCoordinator(coordinator),
 		activate: () => { if (!stopped) active = true; },
 		activateTerminalSink: () => {
 			if (!stopped) coordinator.activateSink(runtimeId, (terminal) => options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, terminal));

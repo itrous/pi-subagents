@@ -296,18 +296,32 @@ describe("prompt-template delegation bridge", () => {
 		bridge.dispose();
 	});
 
-	it("validates a targeted cancel before aborting an admitted bound request", async () => {
-		const events = new FakeEvents(); const request = boundRequest(); const binding = request.binding as any; let admittedSignal: AbortSignal | undefined;
-		const runtime = { version: 1 as const, serverInstanceId: binding.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), preflight: () => ({ version: 1 as const, code: "invalid_request" as const }), admit: () => ({ ok: true as const, proof: {} as any }), verifyPendingCancellation: (_tuple: unknown, candidate: any) => candidate?.cancellationToken?.mac === binding.cancellationToken.mac, recheck: () => true, claimBase: () => true, dispose: () => {} };
-		const bridge = registerPromptTemplateDelegationBridge({ events, coordinator: new StructuredAttemptCoordinator(), activeBoundRuntime: runtime, boundIdentityRegistry: new BoundIdentityRegistry(), pendingCancellationRegistry: new BoundPendingCancellationRegistryV1(() => 1, 8), getContext: () => ({ cwd: "/repo" }), executeStructured: async (_id, _params, signal) => await new Promise((_resolve, reject) => { admittedSignal = signal; signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }); }), execute: async () => assert.fail() });
-		bridge.activate(); bridge.activateTerminalSink(); const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+	it("requires authenticated bound cancel and suppresses positive-control late updates", async () => {
+		const events = new FakeEvents(); const request = boundRequest(); const binding = request.binding as any; let admittedSignal: AbortSignal | undefined; let pushUpdate!: (value: PromptTemplateBridgeResult) => void; let updates = 0; const pending = new BoundPendingCancellationRegistryV1(() => 1, 8);
+		const runtime = { version: 1 as const, serverInstanceId: binding.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), preflight: () => ({ version: 1 as const, code: "invalid_request" as const }), admit: () => ({ ok: true as const, proof: {} as any }), verifyPendingCancellation: (_tuple: unknown, candidate: any) => candidate?.cancellationToken?.mac === binding.cancellationToken.mac || candidate?.cancellationToken?.mac === "a".repeat(64), recheck: () => true, claimBase: () => true, dispose: () => {} };
+		const bridge = registerPromptTemplateDelegationBridge({ events, coordinator: new StructuredAttemptCoordinator(), activeBoundRuntime: runtime, boundIdentityRegistry: new BoundIdentityRegistry(), pendingCancellationRegistry: pending, getContext: () => ({ cwd: "/repo" }), executeStructured: async (_id, _params, signal, _ctx, onUpdate) => await new Promise((_resolve, reject) => { admittedSignal = signal; pushUpdate = onUpdate; signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }); }), execute: async () => assert.fail() });
+		bridge.activate(); bridge.activateTerminalSink(); events.on(PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT, () => { updates++; }); const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, request);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1" });
+		assert.equal(admittedSignal?.aborted, false, "legacy cancel must not cancel a live bound tuple");
+		pushUpdate({ details: { progress: [{ agent: "worker", currentTool: "read" }] } }); assert.equal(updates, 1);
+		const otherValidBinding = structuredClone(binding); otherValidBinding.prospectiveRunId = "123e4567-e89b-12d3-a456-426614174099"; otherValidBinding.requestDigest = "9".repeat(64); otherValidBinding.cancellationToken.payload.prospectiveRunId = otherValidBinding.prospectiveRunId; otherValidBinding.cancellationToken.payload.requestDigest = otherValidBinding.requestDigest; otherValidBinding.cancellationToken.mac = "a".repeat(64); events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId, binding: otherValidBinding }); assert.equal(admittedSignal?.aborted, false, "another valid preflight binding for the tuple must not cancel the active binding");
 		const forged = structuredClone(binding); forged.cancellationToken.mac = "0".repeat(64);
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId, binding: forged });
 		assert.equal(admittedSignal?.aborted, false);
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId, binding });
+		pushUpdate({ details: { progress: [{ agent: "worker", currentTool: "bash" }] } }); assert.equal(updates, 1, "late update after authenticated cancel must be suppressed");
 		assert.equal((await responsePromise as { status: string }).status, "cancelled");
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: binding.targetServerInstanceId, binding }); assert.equal(pending.snapshot().pending, 0, "terminal cancel replay must not consume pending capacity");
 		bridge.dispose();
+	});
+
+	it("preserves an own undefined binding as fail-closed cancellation policy after parsing", async () => {
+		const events = new FakeEvents(); let signal: AbortSignal | undefined; let settle!: (value: PromptTemplateBridgeResult) => void;
+		const bridge = registerPromptTemplateDelegationBridge({ events, coordinator: new StructuredAttemptCoordinator(), getContext: () => ({ cwd: "/repo" }), execute: async (_id, _params, current) => { signal = current; return await new Promise((resolve) => { settle = resolve; }); } }); bridge.activate(); bridge.activateTerminalSink();
+		const value = structuredRequest({ requestId: "undefined-binding", nodeId: "undefined-binding", binding: undefined }); events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, value); await new Promise((resolve) => setImmediate(resolve));
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "undefined-binding", ownerRunId: "owner-1", nodeId: "undefined-binding" }); assert.equal(signal?.aborted, false);
+		settle({ details: { results: [{ agent: "worker", exitCode: 0, finalOutput: "ok" }] } }); await new Promise((resolve) => setImmediate(resolve)); bridge.dispose();
 	});
 
 	it("does not dispatch after a reentrant stop from the started listener", async () => {
@@ -398,17 +412,18 @@ describe("prompt-template delegation bridge", () => {
 	it("routes an old owner through a replacement and drains a gap through the next active sink", async () => {
 		const events = new FakeEvents();
 		const coordinator = new StructuredAttemptCoordinator();
-		let settle!: (value: PromptTemplateBridgeResult) => void;
+		let settle!: (value: PromptTemplateBridgeResult) => void; let pushUpdate!: (value: PromptTemplateBridgeResult) => void;
 		const runtimeA = registerPromptTemplateDelegationBridge({
 			events, coordinator, runtimeId: "A", getContext: () => ({ cwd: "/repo" }),
-			execute: async () => await new Promise((resolve) => { settle = resolve; }),
+			execute: async (_id, _params, _signal, _ctx, onUpdate) => { pushUpdate = onUpdate; return await new Promise((resolve) => { settle = resolve; }); },
 		});
 		runtimeA.activate(); runtimeA.activateTerminalSink();
-		const terminals: Array<{ status: string }> = [];
-		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, (value) => terminals.push(value as { status: string }));
+		const terminals: Array<{ status: string }> = []; let updates = 0;
+		events.on(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, (value) => terminals.push(value as { status: string })); events.on(PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT, () => { updates++; });
 		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "from-a" }));
 		await new Promise((resolve) => setImmediate(resolve));
 		runtimeA.stop();
+		pushUpdate({ details: { progress: [{ agent: "worker", currentTool: "read" }] } }); assert.equal(updates, 0, "old-owner late update must be suppressed after stop");
 
 		const runtimeB = registerPromptTemplateDelegationBridge({
 			events, coordinator, runtimeId: "B", getContext: () => ({ cwd: "/repo" }), execute: async () => assert.fail(),

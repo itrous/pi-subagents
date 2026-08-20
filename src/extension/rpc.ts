@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { types as utilTypes } from "node:util";
 import { randomUUID } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -6,6 +7,7 @@ import { Compile } from "typebox/compile";
 import { resolveAsyncRunLocation } from "../runs/background/async-resume.ts";
 import { deliverStopRequest } from "../runs/background/control-channel.ts";
 import { reconcileAsyncRun } from "../runs/background/stale-run-reconciler.ts";
+import { resolveSubagentRunId } from "../runs/background/run-id-resolver.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import {
@@ -21,6 +23,7 @@ import { readStatus } from "../shared/utils.ts";
 import { SubagentParams } from "./schemas.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
+import { cloneJsonWithinByteLimit } from "../slash/delegation-json.ts";
 import { activeBoundPreflightTarget } from "../api/active-bound-preflight.ts";
 import type { ActiveBoundRuntimeService } from "../api/active-bound-runtime.ts";
 import type { ActiveRuntimeSourceIdentityResolution } from "./source-identity.ts";
@@ -97,6 +100,7 @@ export interface SubagentRpcFleetStatus {
 	omitted: number;
 }
 
+const MAX_RPC_ENVELOPE_BYTES = 9 * 1024 * 1024;
 const MAX_FLEET_ENTRIES = 16;
 const MAX_FLEET_CANDIDATES = 256;
 const MAX_AGENT_LENGTH = 96;
@@ -172,6 +176,7 @@ function buildFleetStatus(
 	};
 	for (const control of state.foregroundControls.values()) {
 		if (control.sessionId !== authoritativeSessionId) continue;
+		const publicDescription = control.activeBound ? undefined : control.description;
 		if (control.activeChildren?.size) {
 			for (const child of control.activeChildren.values()) addCandidate({
 				internalKey: `foreground:${control.runId}:${child.index}`,
@@ -180,7 +185,7 @@ function buildFleetStatus(
 				effort: child.thinking,
 				startedAt: child.startedAt,
 				tokens: { input: child.inputTokens ?? 0, output: child.outputTokens ?? 0, total: child.tokens ?? 0 },
-				goal: child.description ?? control.description,
+				goal: control.activeBound ? undefined : child.description ?? publicDescription,
 			});
 		} else {
 			addCandidate({
@@ -190,7 +195,7 @@ function buildFleetStatus(
 				effort: control.thinking,
 				startedAt: control.startedAt,
 				tokens: { input: control.inputTokens ?? 0, output: control.outputTokens ?? 0, total: control.tokens ?? 0 },
-				goal: control.description,
+				goal: publicDescription,
 			});
 		}
 	}
@@ -322,7 +327,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function assertRequestId(value: unknown): string {
+function assertRequestId(value: unknown, _allowLegacySpawnLength = false): string {
 	if (typeof value !== "string" || value.trim().length === 0 || /[\r\n]/.test(value)) {
 		throw new SubagentRpcError("invalid_request", "RPC requestId must be a non-empty string without newlines.");
 	}
@@ -547,6 +552,37 @@ function stopAsyncRun(
 	};
 }
 
+function privateBoundStatusRequested(params: SubagentParamsLike, options: RegisterSubagentRpcBridgeOptions, ctx: ExtensionContext, preferRunId = false): boolean {
+	const state = options.state; const sessionId = resolveCurrentSessionId(ctx.sessionManager);
+	if (!state || !sessionId) return false;
+	const isPrivate = (runId: string) => state.foregroundControls.get(runId)?.sessionId === sessionId && state.foregroundControls.get(runId)?.activeBound === true
+		|| state.foregroundRuns?.get(runId)?.sessionId === sessionId && state.foregroundRuns.get(runId)?.activeBound === true;
+	const privateIds = [...state.foregroundControls.keys(), ...(state.foregroundRuns?.keys() ?? [])].filter(isPrivate);
+	const target = preferRunId ? params.runId ?? params.id : params.id ?? params.runId;
+	if (!target) {
+		if (Boolean(params.dir)) return false;
+		const preferred = state.lastForegroundControlId ? state.foregroundControls.get(state.lastForegroundControlId) : undefined;
+		const latest = preferred ?? [...state.foregroundControls.values()].filter((control) => control.sessionId === sessionId).sort((left, right) => right.updatedAt - left.updatedAt)[0];
+		return latest?.activeBound === true;
+	}
+	if (typeof target !== "string") return false;
+	try {
+		const resolved = resolveSubagentRunId(target, { state });
+		if (resolved) return resolved.kind === "foreground" && isPrivate(resolved.id);
+		return privateIds.length > 0;
+	} catch { return privateIds.some((runId) => runId.startsWith(target)); }
+}
+
+function normalizedInterruptParams(params: unknown): SubagentParamsLike {
+	const target = normalizeTargetParams(params, "interrupt");
+	for (const value of [target.id, target.runId]) {
+		if (value !== undefined && (typeof value !== "string" || value.trim().length === 0)) throw new SubagentRpcError("invalid_params", "RPC interrupt id/runId must be a non-empty string.");
+	}
+	const normalized: SubagentParamsLike = { action: "interrupt", ...target };
+	assertSubagentParams(normalized, "RPC interrupt params");
+	return normalized;
+}
+
 async function handleRequest(
 	request: SubagentRpcRequestEnvelope,
 	options: RegisterSubagentRpcBridgeOptions,
@@ -565,46 +601,59 @@ async function handleRequest(
 		return executeChecked(options, ctx, request.requestId, request.method, spawnParams(request.params));
 	}
 	if (request.method === "status") {
-		const status = await executeChecked(
-			options,
-			ctx,
-			request.requestId,
-			request.method,
-			{ action: "status", ...normalizeTargetParams(request.params, "status") },
-		);
-		return {
-			...status,
-			fleet: buildFleetStatus(
-				options.state,
-				fleetKeys,
-				resolveCurrentSessionId(ctx.sessionManager),
-			),
-		};
+		const statusParams: SubagentParamsLike = { action: "status", ...normalizeTargetParams(request.params, "status") };
+		assertSubagentParams(statusParams, "RPC status params");
+		const fleet = buildFleetStatus(options.state, fleetKeys, resolveCurrentSessionId(ctx.sessionManager));
+		// The legacy management status text contains private foreground run IDs.
+		// While a bound leaf is live, expose only its bounded opaque Fleet projection.
+		if (privateBoundStatusRequested(statusParams, options, ctx)) return { text: "", fleet };
+		const status = await executeChecked(options, ctx, request.requestId, request.method, statusParams);
+		return { ...status, fleet };
 	}
 	if (request.method === "steer") {
-		return executeChecked(options, ctx, request.requestId, request.method, steerParams(request.params));
+		const params = steerParams(request.params);
+		if (privateBoundStatusRequested(params, options, ctx, true)) throw new SubagentRpcError("not_found", "No steerable run found in this session.");
+		return executeChecked(options, ctx, request.requestId, request.method, params);
 	}
 	if (request.method === "interrupt") {
-		return executeChecked(options, ctx, request.requestId, request.method, { action: "interrupt", ...normalizeTargetParams(request.params, "interrupt") });
+		const params = normalizedInterruptParams(request.params);
+		return executeChecked(options, ctx, request.requestId, request.method, params);
 	}
 	if (request.method === "stop") {
 		return stopAsyncRun(request.params, options, ctx);
 	}
 	if (request.method === "resume") {
-		return executeChecked(options, ctx, request.requestId, request.method, resumeParams(request.params));
+		const params = resumeParams(request.params);
+		if (privateBoundStatusRequested(params, options, ctx)) throw new SubagentRpcError("not_found", "No resumable run found in this session.");
+		return executeChecked(options, ctx, request.requestId, request.method, params);
 	}
 	throw new SubagentRpcError("unsupported_method", `Unsupported subagent RPC method: ${String(request.method)}`);
 }
 
-function parseRequest(raw: unknown): SubagentRpcRequestEnvelope {
-	if (!isRecord(raw)) throw new SubagentRpcError("invalid_request", "Subagent RPC request must be an object.");
-	const requestId = assertRequestId(raw.requestId);
+function parseRequest(input: unknown): SubagentRpcRequestEnvelope {
+	let raw: Record<string, unknown>;
+	if (ownDataField(input, "method") === "spawn") {
+		if (!input || typeof input !== "object" || Array.isArray(input) || utilTypes.isProxy(input)) throw new SubagentRpcError("invalid_request", "Subagent RPC request must be a plain object.");
+		const prototype = Object.getPrototypeOf(input); if (prototype !== Object.prototype && prototype !== null) throw new SubagentRpcError("invalid_request", "Subagent RPC request must be a plain object.");
+		raw = {};
+		for (const field of ["version", "requestId", "method", "params", "source"] as const) {
+			const descriptor = Object.getOwnPropertyDescriptor(input, field); if (descriptor && (!("value" in descriptor) || !descriptor.enumerable)) throw new SubagentRpcError("invalid_request", "Subagent RPC request fields must be plain data.");
+			if (!descriptor) continue;
+			if (field === "params" && descriptor.value !== undefined) { const cloned = cloneJsonWithinByteLimit(descriptor.value, Number.MAX_SAFE_INTEGER, { omitUndefinedProperties: true }); if (!cloned.ok) throw new SubagentRpcError("invalid_request", "RPC spawn params must be plain JSON data."); raw[field] = cloned.value; }
+			else raw[field] = descriptor.value;
+		}
+	} else {
+		const cloned = cloneJsonWithinByteLimit(input, MAX_RPC_ENVELOPE_BYTES, { omitUndefinedProperties: true });
+		if (!cloned.ok || !isRecord(cloned.value)) throw new SubagentRpcError("invalid_request", "Subagent RPC request must be bounded plain JSON data.");
+		raw = cloned.value;
+	}
 	if (raw.version !== SUBAGENT_RPC_PROTOCOL_VERSION) {
 		throw new SubagentRpcError("unsupported_version", `Unsupported subagent RPC version: ${String(raw.version)}.`);
 	}
 	if (typeof raw.method !== "string" || !(SUBAGENT_RPC_METHODS as readonly string[]).includes(raw.method)) {
 		throw new SubagentRpcError("unsupported_method", `Unsupported subagent RPC method: ${String(raw.method)}.`);
 	}
+	const requestId = assertRequestId(raw.requestId, raw.method === "spawn");
 	return {
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
 		requestId,
@@ -614,19 +663,21 @@ function parseRequest(raw: unknown): SubagentRpcRequestEnvelope {
 	};
 }
 
+function ownDataField(raw: unknown, field: "requestId" | "method" | "params"): unknown {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw) || utilTypes.isProxy(raw)) return undefined;
+	try { const descriptor = Object.getOwnPropertyDescriptor(raw, field); return descriptor && "value" in descriptor ? descriptor.value : undefined; }
+	catch { return undefined; }
+}
+
 function safeReplyRequestId(raw: unknown): string {
-	if (!isRecord(raw)) return "unknown";
-	const requestId = raw.requestId;
-	return typeof requestId === "string" && requestId.trim().length > 0 && !/[\r\n]/.test(requestId)
-		? requestId
-		: "unknown";
+	const requestId = ownDataField(raw, "requestId"); const method = ownDataField(raw, "method");
+	return typeof requestId === "string" && requestId.trim().length > 0 && (method === "spawn" || Buffer.byteLength(requestId, "utf8") <= MAX_RPC_ENVELOPE_BYTES) && !/[\r\n]/.test(requestId) ? requestId : "unknown";
 }
 
 function errorReply(raw: unknown, error: unknown): SubagentRpcReplyEnvelope {
 	const requestId = safeReplyRequestId(raw);
-	const method = isRecord(raw) && typeof raw.method === "string" && (SUBAGENT_RPC_METHODS as readonly string[]).includes(raw.method)
-		? raw.method as SubagentRpcMethod
-		: undefined;
+	const rawMethod = ownDataField(raw, "method");
+	const method = typeof rawMethod === "string" && (SUBAGENT_RPC_METHODS as readonly string[]).includes(rawMethod) ? rawMethod as SubagentRpcMethod : undefined;
 	const rpcError = error instanceof SubagentRpcError
 		? error
 		: new SubagentRpcError("execution_failed", error instanceof Error ? error.message : String(error));
@@ -674,6 +725,10 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 	};
 	const unsubscribe = options.events.on(SUBAGENT_RPC_REQUEST_EVENT, (raw) => {
 		if (lifecycle === "passive" || lifecycle === "stopped") return;
+		if (ownDataField(raw, "method") === "preflight") {
+			const earlyTarget = activeBoundPreflightTarget(ownDataField(raw, "params"));
+			if (earlyTarget && earlyTarget !== identity.serverInstanceId) return;
+		}
 		let request: SubagentRpcRequestEnvelope;
 		try {
 			request = parseRequest(raw);

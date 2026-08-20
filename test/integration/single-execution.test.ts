@@ -53,6 +53,7 @@ import {
 	SUBAGENT_PARENT_RUN_ID_ENV,
 } from "../../src/runs/shared/pi-args.ts";
 import { createNestedRoute, nestedRouteEnv, parseNestedEventRecords } from "../../src/runs/shared/nested-events.ts";
+import { collectFleetSnapshot } from "../../src/tui/fleet.ts";
 
 function makeTrustedCtx(cwd: string): ReturnType<typeof makeMinimalCtx> {
 	const ctx = makeMinimalCtx(cwd);
@@ -338,17 +339,18 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		piEvents = createEventBus(),
 		activeBoundRuntime?: Parameters<typeof createSubagentExecutor>[0]["activeBoundRuntime"],
 	) {
-		return createSubagentExecutor!({
+		const state = {
+			baseCwd: tempDir,
+			currentSessionId: initialSpawnState?.sessionId ?? null,
+			...(initialSpawnState ? { subagentSpawns: initialSpawnState } : {}),
+			asyncJobs: initialAsyncJobs,
+			...(workflowControllers ? { workflowControllers } : {}),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		} as SubagentState;
+		const executor = createSubagentExecutor!({
 			pi: { events: piEvents, getSessionName: () => undefined },
-			state: {
-				baseCwd: tempDir,
-				currentSessionId: initialSpawnState?.sessionId ?? null,
-				...(initialSpawnState ? { subagentSpawns: initialSpawnState } : {}),
-				asyncJobs: initialAsyncJobs,
-				...(workflowControllers ? { workflowControllers } : {}),
-				foregroundControls: new Map(),
-				lastForegroundControlId: null,
-			},
+			state,
 			config,
 			asyncByDefault,
 			tempArtifactsDir: tempDir,
@@ -359,6 +361,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			...(handleScheduledRunAction ? { handleScheduledRunAction } : {}),
 			...(activeBoundRuntime ? { activeBoundRuntime } : {}),
 		});
+		return Object.assign(executor, { testState: state });
 	}
 
 	it("spawns agent and captures output", async () => {
@@ -1452,6 +1455,34 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 1);
 		runtime.dispose();
 	});
+
+	it("keeps four active-bound foreground leaves visible and cancels one after child close", async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true }); fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "lifecycle-sessions"); fs.mkdirSync(base);
+		const ctx = makeTrustedCtx(tempDir) as any; ctx.hasUI = false; ctx.sessionManager.getSessionFile = () => path.join(tempDir, "lifecycle-parent.jsonl"); ctx.sessionManager.getSessionId = () => "lifecycle-session"; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }];
+		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => ctx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
+		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const releases = Array.from({ length: 4 }, (_, index) => path.join(tempDir, `release-bound-${index}`));
+		for (let index = 0; index < 4; index++) mockPi.onCall({ waitForPath: releases[index], output: `leaf-${index}`, ...(index === 1 ? { ignoreSigterm: true } : {}) });
+		const proofs = Array.from({ length: 4 }, (_, index) => {
+			const prospectiveRunId = `123e4567-e89b-12d3-a456-42661417410${index}`;
+			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: runtime.serverInstanceId, requestId: `lifecycle-${index}`, ownerRunId: "lifecycle-owner", nodeId: `lifecycle-node-${index}`, prospectiveRunId, agent: "echo", task: `Bound lifecycle leaf ${index} PRIVATE_PROMPT_MARKER`, cwd: tempDir, context: "fresh", model: "test/exact", thinking: "off", artifacts: false, result: { kind: "text" } });
+			assert.equal(parsed.ok, true); if (!parsed.ok) throw new Error("invalid lifecycle fixture"); const response = runtime.preflight(parsed.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) throw new Error("lifecycle preflight failed");
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken };
+			const admission = runtime.admit(parsed.request, binding); assert.equal(admission.ok, true, JSON.stringify(admission)); if (!admission.ok) throw new Error("lifecycle admission failed"); return admission.proof;
+		});
+		const controllers = Array.from({ length: 4 }, () => new AbortController());
+		const executions = proofs.map((proof, index) => executor.executeDelegated(`lifecycle-${index}`, { agent: "echo", task: `Bound lifecycle leaf ${index} PRIVATE_PROMPT_MARKER`, context: "fresh", cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false, mission: false, delegatedThinkingOverride: "off", activeBoundProof: proof, async: false, foregroundOnly: true, clarify: false }, controllers[index]!.signal, undefined, ctx));
+		const activeDeadline = Date.now() + 10_000; while ((mockPi.callCount() < 4 || executor.testState.foregroundControls.size < 4) && Date.now() < activeDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(mockPi.callCount(), 4); const active = collectFleetSnapshot(executor.testState).items.filter((item) => item.kind === "foreground-active"); assert.equal(active.length, 4); assert.equal(new Set(active.map((item) => item.key)).size, 4); assert.deepEqual(active.map((item) => item.agent), ["echo", "echo", "echo", "echo"]); assert.ok([...executor.testState.foregroundControls.values()].every((control) => control.activeBound === true && [...(control.activeChildren?.values() ?? [])].every((child) => child.detach === undefined)));
+		const cancelledAt = Date.now(); controllers[1]!.abort(); await new Promise((resolve) => setTimeout(resolve, 100)); assert.equal(executor.testState.foregroundControls.size, 4, "cancelled bound leaf remains owned until observed child close");
+		for (const index of [3, 0, 2]) fs.writeFileSync(releases[index]!, "release");
+		const results = await Promise.all(executions); assert.ok(Date.now() - cancelledAt >= 2_800, "hard-cancelled bound leaf must wait for SIGKILL and close");
+		for (const index of [0, 2, 3]) { assert.equal(results[index]!.isError, undefined, JSON.stringify(results[index])); assert.equal(results[index]!.details.results[0]?.finalOutput, `leaf-${index}`); }
+		assert.equal(controllers[1]!.signal.aborted, true); assert.equal(executor.testState.foregroundControls.size, 0); assert.equal(collectFleetSnapshot(executor.testState).items.filter((item) => item.kind === "foreground-active").length, 0);
+		runtime.dispose();
+	});
+
 
 	it("projects measured bound registry mismatch before accepting child output", async () => {
 		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: ["extra", "read"] });

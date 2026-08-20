@@ -883,6 +883,10 @@ export default function registerSubagentExtension(
 
 	// Publish only after every synchronous registration step succeeded. Until this
 	// point the candidate transport listeners are passive and rollback-owned.
+	// Complete every fallible candidate prepare before hardening reused coordinator
+	// state. A prepare failure therefore leaves the active old bridge unchanged.
+	rpcBridge.prepare();
+	promptTemplateBridge.prepare?.();
 	if (typeof previousRuntimeCleanup === "function") {
 		try { previousRuntimeCleanup(); } catch { /* stale cleanup is best effort */ }
 	}
@@ -892,7 +896,6 @@ export default function registerSubagentExtension(
 			try { unsubscribe(); } catch { /* stale cleanup is best effort */ }
 		}
 	}
-	rpcBridge.prepare();
 	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
 	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
 	} catch (error) {

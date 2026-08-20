@@ -428,6 +428,18 @@ function getForegroundControl(state: SubagentState, runId: string | undefined) {
 	return newest;
 }
 
+function hasPrivateBoundRuns(state: SubagentState): boolean {
+	return [...state.foregroundControls.values()].some((control) => control.activeBound && control.sessionId === state.currentSessionId)
+		|| [...(state.foregroundRuns?.values() ?? [])].some((run) => run.activeBound && run.sessionId === state.currentSessionId);
+}
+
+function matchesPrivateBoundPrefix(state: SubagentState, target: string | undefined): boolean {
+	if (!target) return false;
+	for (const [runId, control] of state.foregroundControls) if (control.activeBound && control.sessionId === state.currentSessionId && runId.startsWith(target)) return true;
+	for (const [runId, run] of state.foregroundRuns ?? []) if (run.activeBound && run.sessionId === state.currentSessionId && runId.startsWith(target)) return true;
+	return false;
+}
+
 function formatForegroundActivity(control: SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never): string | undefined {
 	const facts: string[] = [];
 	if (control.currentTool && control.currentToolStartedAt) facts.push(`tool ${control.currentTool} for ${Math.floor(Math.max(0, Date.now() - control.currentToolStartedAt) / 1000)}s`);
@@ -557,7 +569,7 @@ function foregroundChildActivityFromProgress(progress: SingleResult["progress"] 
 	};
 }
 
-function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId: string | null; results: SingleResult[]; checkpoint?: Details["checkpoint"] }): void {
+function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId: string | null; results: SingleResult[]; checkpoint?: Details["checkpoint"]; activeBound?: true }): void {
 	state.foregroundRuns ??= new Map();
 	const previous = state.foregroundRuns.get(input.runId);
 	const updatedAt = Date.now();
@@ -568,6 +580,7 @@ function rememberForegroundRun(state: SubagentState, input: { runId: string; mod
 		...(input.sessionId ? { sessionId: input.sessionId } : {}),
 		updatedAt,
 		...(input.checkpoint ? { checkpoint: input.checkpoint } : {}),
+		...(input.activeBound ? { activeBound: true as const } : {}),
 		children: input.results.map((result, index) => {
 			const child = {
 				agent: result.agent,
@@ -721,7 +734,7 @@ function updateRememberedForegroundChild(state: SubagentState, input: { runId: s
 function resolveForegroundResumeTarget(params: SubagentParamsLike, state: SubagentState): { runId: string; mode: SubagentRunMode; state: "complete"; agent: string; index: number; cwd: string; sessionFile: string; model?: string; thinking?: string; launchContractDigest?: string; capabilityCeiling?: ResolvedSubagentCapabilityCeiling } | undefined {
 	const requested = (params.id ?? params.runId)?.trim();
 	if (!requested || !state.foregroundRuns?.size || !state.currentSessionId) return undefined;
-	const sessionRuns = [...state.foregroundRuns.values()].filter((run) => run.sessionId === state.currentSessionId);
+	const sessionRuns = [...state.foregroundRuns.values()].filter((run) => run.sessionId === state.currentSessionId && run.activeBound !== true);
 	const direct = sessionRuns.find((run) => run.runId === requested);
 	const matches = direct ? [direct] : sessionRuns.filter((run) => run.runId.startsWith(requested));
 	if (matches.length === 0) return undefined;
@@ -3868,7 +3881,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				interruptController.abort();
 				return true;
 			},
-			detach: () => detachForeground?.("user request") === true,
+			...(data.activeBoundProof ? {} : { detach: () => detachForeground?.("user request") === true }),
 		}));
 	}
 
@@ -4023,7 +4036,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		totalCost,
 		usageBudget: usageBudgetState(data.usageBudget, totalCost),
 	}));
-	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, sessionId: data.parentSessionId, results: details.results });
+	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, sessionId: data.parentSessionId, results: details.results, ...(data.activeBoundProof ? { activeBound: true } : {}) });
 
 	const suppressRoutineResultIntercom = shouldSuppressRoutineResultIntercom({ suppressRoutineResultIntercom: params.suppressRoutineResultIntercom, results: [r] });
 	if (!r.detached && !r.interrupted && !suppressRoutineResultIntercom) {
@@ -5162,12 +5175,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				try {
 					resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: deps.state, nested: nestedResolutionScopeForExecutor(deps) }));
 				} catch (error) {
-					const text = error instanceof Error ? error.message : String(error);
+					const text = matchesPrivateBoundPrefix(deps.state, targetRunId) ? "No steerable run found in this session." : error instanceof Error ? error.message : String(error);
 					return { content: [{ type: "text", text }], isError: true, details: { mode: "management", results: [] } };
 				}
 				if (resolved?.kind === "nested") return steerNestedRun(omitUndefinedProperties({ target: resolved, message, mode: paramsWithResolvedCwd.mode, index: paramsWithResolvedCwd.index, signal }));
+				if (resolved?.kind === "foreground" && (deps.state.foregroundControls.get(resolved.id)?.activeBound || deps.state.foregroundRuns?.get(resolved.id)?.activeBound)) return { content: [{ type: "text", text: "No steerable run found in this session." }], isError: true, details: { mode: "management", results: [] } };
 				if (resolved?.kind === "foreground") return { content: [{ type: "text", text: "action='steer' currently supports live async Pi child sessions only; use action='interrupt' or action='resume' for foreground runs." }], isError: true, details: { mode: "management", results: [] } };
-				if (resolved?.kind !== "async") return { content: [{ type: "text", text: `No async run found for '${targetRunId}'.` }], isError: true, details: { mode: "management", results: [] } };
+				if (resolved?.kind !== "async") return { content: [{ type: "text", text: hasPrivateBoundRuns(deps.state) ? "No steerable run found in this session." : `No async run found for '${targetRunId}'.` }], isError: true, details: { mode: "management", results: [] } };
 				if (resolved.location.asyncDir) {
 					const unsupported = externalRunnerControlError(resolved.location.asyncDir, "steer");
 					if (unsupported) return unsupported;
@@ -5273,12 +5287,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					try {
 						resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: deps.state, nested: nestedResolutionScopeForExecutor(deps) }));
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = matchesPrivateBoundPrefix(deps.state, targetRunId) ? "No interrupt-capable run found in this session." : error instanceof Error ? error.message : String(error);
 						return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
 					}
 				}
 				if (resolved?.kind === "nested") return interruptNestedRun(resolved);
 				const foreground = getForegroundControl(deps.state, resolved?.kind === "foreground" ? resolved.id : targetRunId);
+				const rememberedBound = resolved?.kind === "foreground" && deps.state.foregroundRuns?.get(resolved.id)?.activeBound === true;
+				if (foreground?.activeBound || rememberedBound) return {
+					content: [{ type: "text", text: "No interrupt-capable run found in this session." }],
+					isError: true,
+					details: { mode: "management", results: [] },
+				};
 				if (foreground?.interrupt) {
 					const interrupted = foreground.interrupt();
 					if (interrupted) {
@@ -5699,6 +5719,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				currentAgent: undefined,
 				currentIndex: undefined,
 				description: foregroundDescription,
+				...(activeBoundProof ? { activeBound: true as const } : {}),
 				currentActivityState: undefined,
 				activeChildren: new Map(),
 				// The outer executor owns scheduling until its finally block settles.

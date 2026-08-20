@@ -1525,6 +1525,8 @@ export interface ForegroundResumeRun {
 	sessionId?: string;
 	updatedAt: number;
 	checkpoint?: ChainCheckpointState;
+	/** Public RPC must not expose active-bound identifiers, paths, prompts, or output. */
+	activeBound?: true;
 	children: ForegroundResumeChild[];
 }
 
@@ -1565,8 +1567,10 @@ export interface ForegroundRunControl {
 	cwd?: string;
 	currentAgent?: string;
 	currentIndex?: number;
-	/** Short caller-facing task/goal shown in fleet surfaces when available. */
+	/** Short caller-facing task/goal shown in local fleet surfaces when available. */
 	description?: string;
+	/** Active-bound controls require authenticated transport cancellation and private public-RPC projection. */
+	activeBound?: true;
 	currentActivityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;

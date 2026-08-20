@@ -12,6 +12,8 @@ interface MockPiResponse {
 	waitForPath?: string;
 	keepAliveAfterFinalMessageMs?: number;
 	ignoreSigterm?: boolean;
+	/** Test-only identifier copied into the child call record with its PID. */
+	recordMarker?: string;
 	jsonl?: unknown[];
 	stdoutRaw?: string;
 	stdoutBase64Chunks?: string[];

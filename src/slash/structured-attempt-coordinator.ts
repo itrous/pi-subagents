@@ -1,3 +1,4 @@
+import { types as utilTypes } from "node:util";
 import type { SubagentDelegationRequest, SubagentDelegationResponse, SubagentDelegationTerminalResponse } from "../api/delegation.ts";
 
 const DEFAULT_IDENTITY_CAPACITY = 8_192;
@@ -6,6 +7,7 @@ const GLOBAL_COORDINATOR_KEY = "__piSubagentStructuredAttemptCoordinatorV1";
 type TerminalSink = (terminal: SubagentDelegationResponse) => void;
 type AttemptIdentity = Pick<SubagentDelegationRequest, "requestId" | "ownerRunId" | "nodeId">;
 type RejectedCommitResult = "committed" | "duplicate_tuple" | "capacity";
+export type StructuredCancellationAuthority = "legacy" | "bound";
 
 interface AttemptRecord {
 	tupleKey: string;
@@ -17,11 +19,39 @@ interface AttemptRecord {
 	settled: boolean;
 	settledPromise: Promise<void>;
 	resolveSettled: () => void;
+	cancellationPolicy: StructuredCancellationAuthority;
+	cancellationBindingKey?: string;
 }
 
 export type StructuredAttemptAdmission =
 	| { accepted: true; signal: AbortSignal; isRunning: () => boolean; settle: (terminal: SubagentDelegationResponse) => void }
 	| { accepted: false; reason: "duplicate_tuple" | "duplicate_node" | "capacity" };
+
+export function structuredCancellationBindingKey(binding: SubagentDelegationRequest["binding"]): string | undefined {
+	if (!binding) return undefined;
+	try {
+		const values = [binding.targetServerInstanceId, binding.prospectiveRunId, binding.requestDigest, binding.expectedLaunchContractDigest, binding.cancellationToken?.mac];
+		return values.every((value) => typeof value === "string") ? JSON.stringify(values) : "invalid-bound-cancellation-key";
+	} catch { return "invalid-bound-cancellation-key"; }
+}
+
+function cancellationBindingKeyFromRequest(request: unknown): string | undefined {
+	if (!request || typeof request !== "object" || Array.isArray(request) || utilTypes.isProxy(request)) return "invalid-bound-cancellation-key";
+	try { const descriptor = Object.getOwnPropertyDescriptor(request, "binding"); return descriptor && "value" in descriptor ? structuredCancellationBindingKey(descriptor.value as SubagentDelegationRequest["binding"]) : descriptor ? "invalid-bound-cancellation-key" : undefined; }
+	catch { return "invalid-bound-cancellation-key"; }
+}
+
+function cancellationPolicyFromRequest(request: unknown): StructuredCancellationAuthority {
+	if (!request || typeof request !== "object" || Array.isArray(request) || utilTypes.isProxy(request)) return "bound";
+	try {
+		// Parsed unbound requests omit binding. Any own binding descriptor whose
+		// meaning is ambiguous (including an accessor or explicit undefined) is
+		// conservatively bound without invoking user code.
+		return Object.getOwnPropertyDescriptor(request, "binding") === undefined ? "legacy" : "bound";
+	} catch {
+		return "bound";
+	}
+}
 
 function effectiveTerminal(record: AttemptRecord, terminal: SubagentDelegationResponse): SubagentDelegationResponse {
 	const native = terminal as SubagentDelegationTerminalResponse;
@@ -42,7 +72,8 @@ function effectiveTerminal(record: AttemptRecord, terminal: SubagentDelegationRe
 }
 
 export class StructuredAttemptCoordinator {
-	readonly contractVersion = 2 as const;
+	readonly contractVersion!: 2;
+	readonly cancellationContractVersion!: 1;
 	private readonly attemptsByTuple = new Map<string, AttemptRecord>();
 	private readonly nodeOwners = new Map<string, AttemptRecord>();
 	private readonly terminalOutbox: Array<{ record: AttemptRecord; terminal: SubagentDelegationResponse }> = [];
@@ -54,6 +85,7 @@ export class StructuredAttemptCoordinator {
 
 	constructor(identityCapacity = DEFAULT_IDENTITY_CAPACITY) {
 		this.identityCapacity = identityCapacity;
+		Object.defineProperties(this, { contractVersion: { value: 2, enumerable: false, configurable: false, writable: false }, cancellationContractVersion: { value: 1, enumerable: false, configurable: false, writable: false } });
 	}
 
 	static tupleKey(requestId: string, ownerRunId: string, nodeId: string): string {
@@ -64,7 +96,7 @@ export class StructuredAttemptCoordinator {
 		return JSON.stringify([ownerRunId, nodeId]);
 	}
 
-	admit(request: SubagentDelegationRequest, ownerRuntimeId: string): StructuredAttemptAdmission {
+	admit(request: SubagentDelegationRequest, ownerRuntimeId: string, cancellationPolicy = cancellationPolicyFromRequest(request)): StructuredAttemptAdmission {
 		const tupleKey = StructuredAttemptCoordinator.tupleKey(request.requestId, request.ownerRunId, request.nodeId);
 		if (this.attemptsByTuple.has(tupleKey) || this.settledTuples.has(tupleKey)) {
 			return { accepted: false, reason: "duplicate_tuple" };
@@ -87,6 +119,8 @@ export class StructuredAttemptCoordinator {
 			settled: false,
 			settledPromise,
 			resolveSettled,
+			cancellationPolicy,
+			...(cancellationPolicy === "bound" ? { cancellationBindingKey: cancellationBindingKeyFromRequest(request) } : {}),
 		};
 		this.attemptsByTuple.set(tupleKey, record);
 		this.nodeOwners.set(nodeKey, record);
@@ -116,17 +150,23 @@ export class StructuredAttemptCoordinator {
 			settled: false,
 			settledPromise: new Promise<void>((resolve) => { resolveSettled = resolve; }),
 			resolveSettled: () => resolveSettled(),
+			cancellationPolicy: "bound",
 		};
 		this.attemptsByTuple.set(tupleKey, record);
 		this.settle(record, terminal);
 		return "committed";
 	}
 
-	cancel(requestId: string, ownerRunId: string, nodeId: string): boolean {
+	cancel(requestId: string, ownerRunId: string, nodeId: string, authority: StructuredCancellationAuthority = "legacy", cancellationBindingKey?: string): boolean {
 		const record = this.attemptsByTuple.get(StructuredAttemptCoordinator.tupleKey(requestId, ownerRunId, nodeId));
-		if (!record || record.settled) return false;
+		if (!record || record.settled || record.cancellationPolicy !== authority || (authority === "bound" && record.cancellationBindingKey !== cancellationBindingKey)) return false;
 		record.controller.abort();
 		return true;
+	}
+
+	canRememberCancellation(requestId: string, ownerRunId: string, nodeId: string): boolean {
+		const key = StructuredAttemptCoordinator.tupleKey(requestId, ownerRunId, nodeId);
+		return !this.attemptsByTuple.has(key) && !this.settledTuples.has(key);
 	}
 
 	stopOwner(ownerRuntimeId: string): void {
@@ -203,16 +243,121 @@ export class StructuredAttemptCoordinator {
 	}
 }
 
+interface LegacyStructuredAttemptCoordinator {
+	contractVersion?: number;
+	cancellationContractVersion?: number;
+	attemptsByTuple?: Map<string, unknown>;
+	admit?: (request: SubagentDelegationRequest, ownerRuntimeId: string, cancellationPolicy?: StructuredCancellationAuthority) => StructuredAttemptAdmission;
+	cancel?: (requestId: string, ownerRunId: string, nodeId: string, authority?: StructuredCancellationAuthority, cancellationBindingKey?: string) => boolean;
+	canRememberCancellation?: (requestId: string, ownerRunId: string, nodeId: string) => boolean;
+	settle?: (record: AttemptRecord, terminal: SubagentDelegationResponse) => void;
+	activateSink?: (runtimeId: string, sink: TerminalSink) => void;
+}
+
+function compatibleMethodTarget(target: object, name: "admit" | "cancel" | "canRememberCancellation"): boolean {
+	const own = Object.getOwnPropertyDescriptor(target, name);
+	return own === undefined
+		? Object.isExtensible(target)
+		: "value" in own && own.writable === true && (own.configurable === true || own.enumerable === false);
+}
+
+function coordinatorMarkerIsExact(legacy: LegacyStructuredAttemptCoordinator): boolean {
+	let descriptor: PropertyDescriptor | undefined;
+	try { descriptor = Object.getOwnPropertyDescriptor(legacy, "contractVersion"); } catch { return false; }
+	return Boolean(descriptor && "value" in descriptor && descriptor.value === 2 && descriptor.writable === false && descriptor.configurable === false);
+}
+
+function coordinatorMarkerCanFreeze(legacy: LegacyStructuredAttemptCoordinator): boolean {
+	let descriptor: PropertyDescriptor | undefined;
+	try { descriptor = Object.getOwnPropertyDescriptor(legacy, "contractVersion"); } catch { return false; }
+	return Boolean(descriptor && "value" in descriptor && descriptor.value === 2
+		&& (descriptor.configurable === true || (descriptor.configurable === false && descriptor.writable === false)));
+}
+
+function cancellationMarkerIsExact(legacy: LegacyStructuredAttemptCoordinator): boolean {
+	let descriptor: PropertyDescriptor | undefined;
+	try { descriptor = Object.getOwnPropertyDescriptor(legacy, "cancellationContractVersion"); } catch { return false; }
+	return Boolean(descriptor && "value" in descriptor && descriptor.value === 1 && descriptor.writable === false && descriptor.configurable === false);
+}
+
+function validateCancellationContract(legacy: LegacyStructuredAttemptCoordinator): void {
+	if (utilTypes.isProxy(legacy) || !coordinatorMarkerIsExact(legacy) || !cancellationMarkerIsExact(legacy) || !(legacy.attemptsByTuple instanceof Map) || !((legacy as { settledTuples?: unknown }).settledTuples instanceof Set)
+		|| typeof legacy.admit !== "function" || typeof legacy.cancel !== "function" || typeof legacy.canRememberCancellation !== "function") {
+		throw new Error("Incompatible process-global structured attempt cancellation coordinator.");
+	}
+}
+
+function upgradeCancellationContract(legacy: LegacyStructuredAttemptCoordinator): void {
+	let marker: PropertyDescriptor | undefined;
+	try { marker = Object.getOwnPropertyDescriptor(legacy, "cancellationContractVersion"); }
+	catch { throw new Error("Incompatible process-global structured attempt cancellation coordinator."); }
+	if (marker !== undefined) {
+		if (!cancellationMarkerIsExact(legacy)) throw new Error("Incompatible process-global structured attempt cancellation coordinator.");
+		validateCancellationContract(legacy);
+		return;
+	}
+	if (utilTypes.isProxy(legacy) || !coordinatorMarkerCanFreeze(legacy) || !(legacy.attemptsByTuple instanceof Map) || !((legacy as { settledTuples?: unknown }).settledTuples instanceof Set)
+		|| typeof legacy.admit !== "function" || typeof legacy.cancel !== "function"
+		|| !Object.isExtensible(legacy) || !compatibleMethodTarget(legacy, "admit") || !compatibleMethodTarget(legacy, "cancel") || !compatibleMethodTarget(legacy, "canRememberCancellation")) {
+		throw new Error("Incompatible process-global structured attempt cancellation coordinator.");
+	}
+	const policies = new WeakMap<object, StructuredCancellationAuthority>(); const bindingKeys = new WeakMap<object, string>();
+	for (const record of legacy.attemptsByTuple.values()) {
+		if (!record || typeof record !== "object") throw new Error("Incompatible process-global structured attempt cancellation record.");
+		const request = (record as { request?: SubagentDelegationRequest }).request; const policy = cancellationPolicyFromRequest(request); policies.set(record, policy); const bindingKey = policy === "bound" ? cancellationBindingKeyFromRequest(request) : undefined; if (bindingKey) bindingKeys.set(record, bindingKey);
+	}
+	const attempts = legacy.attemptsByTuple;
+	const originalAdmit = legacy.admit;
+	const originalCancel = legacy.cancel;
+	const admit = function (this: unknown, request: SubagentDelegationRequest, ownerRuntimeId: string, requestedPolicy?: StructuredCancellationAuthority): StructuredAttemptAdmission {
+		const policy = requestedPolicy === "bound" || requestedPolicy === "legacy" ? requestedPolicy : cancellationPolicyFromRequest(request);
+		const admitted = originalAdmit.call(this, request, ownerRuntimeId);
+		if (admitted.accepted) {
+			const record = attempts.get(StructuredAttemptCoordinator.tupleKey(request.requestId, request.ownerRunId, request.nodeId));
+			if (!record || typeof record !== "object") {
+				originalCancel.call(this, request.requestId, request.ownerRunId, request.nodeId);
+				throw new Error("Incompatible process-global structured attempt admission record.");
+			}
+			policies.set(record, policy); const bindingKey = policy === "bound" ? cancellationBindingKeyFromRequest(request) : undefined; if (bindingKey) bindingKeys.set(record, bindingKey);
+		}
+		return admitted;
+	};
+	const cancel = function (this: unknown, requestId: string, ownerRunId: string, nodeId: string, authority: StructuredCancellationAuthority = "legacy", cancellationBindingKey?: string): boolean {
+		if (authority !== "legacy" && authority !== "bound") return false;
+		const record = attempts.get(StructuredAttemptCoordinator.tupleKey(requestId, ownerRunId, nodeId));
+		if (!record || typeof record !== "object" || policies.get(record) !== authority || (authority === "bound" && bindingKeys.get(record) !== cancellationBindingKey)) return false;
+		return originalCancel.call(this, requestId, ownerRunId, nodeId);
+	};
+	const canRememberCancellation = function (this: unknown, requestId: string, ownerRunId: string, nodeId: string): boolean {
+		const key = StructuredAttemptCoordinator.tupleKey(requestId, ownerRunId, nodeId);
+		const settled = (this as { settledTuples?: Set<string> }).settledTuples;
+		return !attempts.has(key) && settled instanceof Set && !settled.has(key);
+	};
+	// All compatibility checks and existing-record classifications happen first.
+	// The immutable marker is defined last in the same descriptor operation, so
+	// consumers never observe a published v1 policy with the old methods.
+	Object.defineProperties(legacy, {
+		contractVersion: { value: 2, enumerable: Object.getOwnPropertyDescriptor(legacy, "contractVersion")?.enumerable ?? false, configurable: false, writable: false },
+		admit: { value: admit, enumerable: false, configurable: false, writable: false },
+		cancel: { value: cancel, enumerable: false, configurable: false, writable: false },
+		canRememberCancellation: { value: canRememberCancellation, enumerable: false, configurable: false, writable: false },
+		cancellationContractVersion: { value: 1, enumerable: false, configurable: false, writable: false },
+	});
+	validateCancellationContract(legacy);
+}
+
+/** Final publication barrier: call only after candidate registration can no longer roll back to the old bridge. */
+export function prepareStructuredAttemptCoordinator(coordinator: StructuredAttemptCoordinator): void {
+	upgradeCancellationContract(coordinator as unknown as LegacyStructuredAttemptCoordinator);
+}
+
 export function getStructuredAttemptCoordinator(): StructuredAttemptCoordinator {
 	const store = globalThis as Record<string, unknown>;
 	const existing = store[GLOBAL_COORDINATOR_KEY];
-	if (existing instanceof StructuredAttemptCoordinator) return existing;
-	// Across extension reloads the previous class identity can differ. Preserve any
-	// coordinator implementing the exact process-wide contract instead of replacing it.
 	if (existing && typeof existing === "object"
-		&& typeof (existing as StructuredAttemptCoordinator).admit === "function"
-		&& typeof (existing as StructuredAttemptCoordinator).activateSink === "function") {
-		const legacy = existing as { contractVersion?: number; settle?: (record: AttemptRecord, terminal: SubagentDelegationResponse) => void };
+		&& typeof (existing as LegacyStructuredAttemptCoordinator).admit === "function"
+		&& typeof (existing as LegacyStructuredAttemptCoordinator).activateSink === "function") {
+		const legacy = existing as LegacyStructuredAttemptCoordinator;
 		if (legacy.contractVersion !== 2) {
 			const originalSettle = legacy.settle;
 			if (typeof originalSettle !== "function") throw new Error("Incompatible process-global structured attempt coordinator.");

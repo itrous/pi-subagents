@@ -157,11 +157,13 @@ describe("subagent extension RPC bridge", () => {
 		const ping = await request(events, "bound-ping", "ping") as any;
 		assert.deepEqual(ping.data.capabilities.boundForegroundLeaf, { version: 1 });
 		let foreignReplies = 0; events.on(subagentRpcReplyEvent("foreign"), () => { foreignReplies++; });
-		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "foreign", method: "preflight", params: { targetServerInstanceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } });
+		events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "foreign", method: "preflight", params: { targetServerInstanceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", task: "x".repeat(10 * 1024 * 1024) } });
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(foreignReplies, 0); assert.equal(calls, 0);
 		const targeted = await request(events, "targeted", "preflight", { targetServerInstanceId: runtime.serverInstanceId }) as any;
 		assert.equal(targeted.success, true); assert.deepEqual(targeted.data, { version: 1, code: "invalid_request" }); assert.equal(calls, 1);
+		const large = await request(events, "targeted-large", "preflight", { targetServerInstanceId: runtime.serverInstanceId, task: "x".repeat(8 * 1024 * 1024) }) as any; assert.equal(large.success, true); assert.equal(calls, 2);
+		const oversized = await request(events, "targeted-oversized", "preflight", { targetServerInstanceId: runtime.serverInstanceId, task: "x".repeat(9 * 1024 * 1024) }) as any; assert.equal(oversized.success, false); assert.equal(oversized.error.code, "invalid_request"); assert.equal(calls, 2);
 		bridge.dispose();
 	});
 
@@ -260,8 +262,18 @@ describe("subagent extension RPC bridge", () => {
 		assert.equal(reply.requestId, "unknown");
 		assert.equal((reply as { error: { code: string } }).error.code, "invalid_request");
 		assert.equal(events.emitted.some((entry) => entry.event === subagentRpcReplyEvent(unsafeRequestId)), false);
+		const longRequestId = `ping-${"x".repeat(300)}`; const longReply = await request(events, longRequestId, "ping") as any; assert.equal(longReply.success, true); assert.equal(longReply.requestId, longRequestId);
 
 		bridge.dispose();
+	});
+
+	it("rejects accessor RPC params without invoking them", async () => {
+		const events = new FakeEvents(); let getterCalls = 0; const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx(), execute: async () => assert.fail("accessor request should not execute") }); bridge.prepare(); bridge.activate();
+		const raw: any = { version: 1, requestId: "accessor-rpc", method: "interrupt" }; Object.defineProperty(raw, "params", { enumerable: true, get() { getterCalls++; return { id: "target" }; } });
+		const replyPromise = once(events, subagentRpcReplyEvent("accessor-rpc")) as Promise<any>; events.emit(SUBAGENT_RPC_REQUEST_EVENT, raw); const reply = await replyPromise; assert.equal(reply.success, false); assert.equal(reply.error.code, "invalid_request"); assert.equal(getterCalls, 0);
+		const routing: any = { version: 1, method: "interrupt", params: {} }; Object.defineProperty(routing, "requestId", { enumerable: true, get() { getterCalls++; return "must-not-route"; } }); const unknownPromise = once(events, subagentRpcReplyEvent("unknown")) as Promise<any>; events.emit(SUBAGENT_RPC_REQUEST_EVENT, routing); const unknown = await unknownPromise; assert.equal(unknown.requestId, "unknown"); assert.equal(getterCalls, 0);
+		const spawnParams: any = {}; Object.defineProperty(spawnParams, "workflowScript", { enumerable: true, get() { getterCalls++; return "return 1"; } }); const spawnAccessorPromise = once(events, subagentRpcReplyEvent("spawn-accessor")) as Promise<any>; events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "spawn-accessor", method: "spawn", params: spawnParams }); assert.equal((await spawnAccessorPromise).success, false); assert.equal(getterCalls, 0);
+		const proxy = new Proxy({ version: 1, requestId: "proxy-route", method: "interrupt" }, { getOwnPropertyDescriptor() { getterCalls++; throw new Error("proxy trap"); } }); const proxyPromise = once(events, subagentRpcReplyEvent("unknown")) as Promise<any>; events.emit(SUBAGENT_RPC_REQUEST_EVENT, proxy); assert.equal((await proxyPromise).requestId, "unknown"); assert.equal(getterCalls, 0); bridge.dispose();
 	});
 
 	it("delegates status through the existing executor action", async () => {
@@ -379,6 +391,20 @@ describe("subagent extension RPC bridge", () => {
 		bridge.dispose();
 	});
 
+	it("omits active-bound prompt descriptions from public fleet status", async () => {
+		const events = new FakeEvents(); const marker = "PRIVATE_ACTIVE_BOUND_PROMPT_MARKER";
+		const state = { currentSessionId: "session-123", lastForegroundControlId: "private-bound-run", foregroundControls: new Map([["private-bound-run", { runId: "private-bound-run", sessionId: "session-123", mode: "single", startedAt: 90, description: marker, activeBound: true, activeChildren: new Map([[0, { index: 0, agent: "worker", description: marker, startedAt: 100, updatedAt: 110 }]]) }]]), asyncJobs: new Map() } as any;
+		const bridge = registerSubagentRpcBridge({ events, getContext: () => ctx("session-123", "session-123"), state, execute: async () => ({ content: [{ type: "text", text: "ordinary status" }], details: { mode: "management", results: [] } } as any) }); bridge.prepare(); bridge.activate();
+		const fleet = ((await request(events, "bound-fleet-redaction", "status")) as any).data.fleet;
+		assert.equal(fleet.totalActive, 1); assert.equal(fleet.entries.length, 1); assert.equal(fleet.entries[0].agent, "worker"); assert.equal(fleet.entries[0].goal, undefined); assert.equal(JSON.stringify(fleet).includes(marker), false); assert.equal(JSON.stringify(fleet).includes("private-bound-run"), false);
+		const status = ((await request(events, "bound-status-redaction", "status")) as any).data; assert.equal(status.text, ""); assert.equal(status.details, undefined); assert.equal(JSON.stringify(status).includes("private-bound-run"), false);
+		for (const [id, params] of [["bound-interrupt-empty-id", { id: "" }], ["bound-interrupt-empty-run", { runId: " " }]] as const) { const reply = await request(events, id, "interrupt", params) as any; assert.equal(reply.success, false); assert.equal(reply.error.code, "invalid_params"); }
+		const malformedStatus = await request(events, "bound-malformed-status", "status", { id: 42 }) as any; assert.equal(malformedStatus.success, false); assert.equal(malformedStatus.error.code, "invalid_params");
+		state.foregroundControls.set("ordinary-run", { runId: "ordinary-run", sessionId: "session-123", mode: "single", startedAt: 120, activeChildren: new Map() }); state.foregroundRuns = new Map([["remembered-bound", { runId: "remembered-bound", sessionId: "session-123", mode: "single", cwd: "/repo", updatedAt: 80, activeBound: true, children: [{ agent: "worker", index: 0, status: "completed" }] }]]); state.lastForegroundControlId = "ordinary-run"; const ordinaryInterrupt = await request(events, "ordinary-latest-interrupt", "interrupt", {}) as any; assert.equal(ordinaryInterrupt.success, true); const ordinaryDefaultStatus = await request(events, "ordinary-default-status", "status", {}) as any; assert.equal(ordinaryDefaultStatus.success, true); assert.notEqual(ordinaryDefaultStatus.data.text, ""); const ordinaryStatus = await request(events, "ordinary-target-status", "status", { id: "ordinary-run" }) as any; const ordinaryPrefix = await request(events, "ordinary-prefix-status", "status", { id: "ord" }) as any; assert.equal(ordinaryStatus.success, true); assert.notEqual(ordinaryStatus.data.text, ""); assert.equal(ordinaryPrefix.success, true); assert.notEqual(ordinaryPrefix.data.text, ""); const asyncDirStatus = await request(events, "ordinary-dir-status", "status", { dir: "/tmp/ordinary-async" }) as any; assert.equal(asyncDirStatus.success, true); assert.notEqual(asyncDirStatus.data.text, "");
+		state.foregroundControls.set("private-ordinary-run", { runId: "private-ordinary-run", sessionId: "session-123", mode: "single", startedAt: 130, activeChildren: new Map() }); const ambiguous = await request(events, "ambiguous-private-status", "status", { id: "private" }) as any; const unknown = await request(events, "unknown-private-status", "status", { id: "does-not-match" }) as any; assert.equal(ambiguous.success, true); assert.equal(ambiguous.data.text, ""); assert.equal(unknown.success, true); assert.deepEqual(unknown.data, ambiguous.data); assert.equal(JSON.stringify(ambiguous).includes("private-bound-run"), false);
+		bridge.dispose();
+	});
+
 	it("uses monotonic opaque keys across removal/insertion and resets them per session", async () => {
 		const events = new FakeEvents();
 		const jobs = new Map<string, any>([
@@ -461,6 +487,7 @@ describe("subagent extension RPC bridge", () => {
 		assert.equal(executedParams.async, true);
 		assert.equal("clarify" in executedParams, false);
 		assert.equal((reply as { data: { details?: { asyncId?: string } } }).data.details?.asyncId, "run-1");
+		const largeScript = `/*${"x".repeat(10 * 1024 * 1024)}*/ return runs.run('main', { agent: 'worker' })`; const legacyLongId = `spawn-${"i".repeat(300)}`; const largeReply = await request(events, legacyLongId, "spawn", { workflowScript: largeScript }); assert.equal(largeReply.success, true); assert.equal(largeReply.requestId, legacyLongId); assert.equal(executedParams.workflowScript.length, largeScript.length);
 
 		bridge.dispose();
 	});
