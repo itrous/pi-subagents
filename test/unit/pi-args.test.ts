@@ -38,6 +38,7 @@ import {
 	PI_INTERCOM_STABLE_ID_ENV,
 	PI_INTERCOM_SESSION_ID_ENV,
 	applyThinkingSuffix,
+	attestBoundRuntimeExtensions,
 	buildPiArgs,
 	projectLaunchResolvedChildExtensions,
 	resolvePiLaunchToolPlan,
@@ -770,6 +771,11 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			"fixture_search",
 			"structured_output",
 		]);
+		assert.throws(() => buildPiArgs({
+			baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false,
+			tools: ["structured_output"], activeBoundPackageMediator: true,
+			structuredOutput: { schema: { type: "object" }, schemaPath: "/tmp/schema.json", outputPath: "/tmp/output.json" },
+		}), /must not overlap/);
 	});
 
 	it("forwards the Pi package root to child processes for host peer resolution", () => {
@@ -1415,5 +1421,41 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		});
 
 		assert.ok(args.includes("--system-prompt"));
+	});
+});
+
+describe("bound runtime extension evidence", () => {
+	it("binds ordered runtime extension bytes", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "bound-runtime-evidence-"));
+		const first = path.join(root, "first.ts");
+		const second = path.join(root, "second.ts");
+		fs.writeFileSync(first, "first"); fs.writeFileSync(second, "second");
+		const before = attestBoundRuntimeExtensions([first, second]);
+		fs.writeFileSync(second, "changed");
+		const after = attestBoundRuntimeExtensions([first, second]);
+		assert.notDeepEqual(after, before);
+		assert.deepEqual(before.entries.map((entry) => entry.name), ["first.ts", "second.ts"]);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+});
+
+describe("active-bound mediated extension order", () => {
+	it("loads bootstrap, mediator and registry gate without direct package entries", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],
+			activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+		});
+		assert.equal(plan.disableAmbientExtensions, true);
+		assert.equal(plan.extensionArgs.length, 4);
+		assert.ok(plan.extensionArgs[0]!.endsWith(path.join("runs", "shared", "bound-tool-registry-bootstrap.ts")));
+		assert.ok(plan.extensionArgs[1]!.endsWith(path.join("runs", "shared", "subagent-prompt-runtime.ts")));
+		assert.ok(plan.extensionArgs[2]!.endsWith(path.join("runs", "shared", "bound-package-mediator.ts")));
+		assert.ok(plan.extensionArgs[3]!.endsWith(path.join("runs", "shared", "bound-tool-registry-gate.ts")));
+		assert.ok(!plan.extensionArgs.includes("/trusted/package-extension.ts"));
+		const evidenceNames = attestBoundRuntimeExtensions(plan.runtimeExtensions).entries.map((entry) => entry.name);
+		assert.ok(evidenceNames.includes("bound-tool-registry-runtime.ts"));
+		assert.ok(evidenceNames.includes("tool-registry-proof.ts"));
+		assert.ok(evidenceNames.includes("delegation-json.ts"));
+		assert.ok(evidenceNames.includes("canonical-json.ts"));
 	});
 });

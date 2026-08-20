@@ -26,6 +26,18 @@ export type SubagentDelegationResultRequest =
 	| { kind: "text" }
 	| { kind: "structured"; schema: SubagentDelegationJsonSchemaObject };
 
+export interface SubagentDelegationBindingV1 {
+	version: 1;
+	targetServerInstanceId: string;
+	prospectiveRunId: string;
+	expectedSourceIdentityDigest: string;
+	expectedActiveSessionDigest: string;
+	requestDigest: string;
+	expectedLaunchContractDigest: string;
+	receipt: import("./launch-receipt.ts").LaunchReceiptV1;
+	cancellationToken: import("./launch-receipt.ts").LaunchCancellationTokenV1;
+}
+
 export interface SubagentDelegationRequest {
 	requestId: string;
 	ownerRunId: string;
@@ -40,8 +52,13 @@ export interface SubagentDelegationRequest {
 	turnBudget?: SubagentDelegationTurnBudget;
 	toolBudget?: SubagentDelegationToolBudget;
 	skill?: string | string[] | boolean;
+	/** Bound-only per-request environment. Public unbound delegation rejects it. */
+	environment?: import("./active-bound-environment.ts").ActiveBoundEnvironmentV1;
 	artifacts?: boolean;
+	/** Bound-only artifact placement. */
+	artifactDir?: "session";
 	result: SubagentDelegationResultRequest;
+	binding?: SubagentDelegationBindingV1;
 }
 
 export interface SubagentDelegationStarted {
@@ -63,6 +80,11 @@ export interface SubagentDelegationUpdate extends SubagentDelegationStarted {
 	tokens?: number;
 }
 
+export interface SubagentDelegationTargetedCancel extends SubagentDelegationStarted {
+	targetServerInstanceId: string;
+	binding: SubagentDelegationBindingV1;
+}
+
 export type SubagentDelegationStatus =
 	| "completed"
 	| "failed"
@@ -75,7 +97,10 @@ export type SubagentDelegationStatus =
 	| "acceptance_failed"
 	| "invalid_request"
 	| "unavailable_context"
-	| "duplicate_node";
+	| "duplicate_node"
+	| "native_tool_registry_mismatch"
+	| "native_tool_registry_protocol_error"
+	| "native_denied_tools_protocol_error";
 
 export type SubagentDelegationValue =
 	| { kind: "text"; text: string }
@@ -101,6 +126,14 @@ export interface SubagentDelegationTerminalResponse extends SubagentDelegationSt
 	thinking?: string;
 	exitCode?: number;
 	launchContractDigest?: string;
+	toolRegistry?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProjectionV1;
+	toolsMissing?: string[];
+	toolsExtra?: string[];
+	toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
+	deniedToolCalls?: import("../runs/shared/denied-tool-proof.ts").DeniedToolCallV1[];
+	deniedToolCallsOverflow?: true;
+	deniedToolCallsError?: import("../runs/shared/denied-tool-proof.ts").DeniedToolProofErrorCode;
+	transportIncomplete?: boolean;
 	result?: SubagentDelegationValue;
 	usage?: SubagentDelegationUsage;
 }

@@ -1,0 +1,89 @@
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type { MockPi } from "../support/helpers.ts";
+import { createEventBus, createMockPi, createTempDir, makeMinimalCtx, removeTempDir } from "../support/helpers.ts";
+import registerSubagentExtension from "../../src/extension/index.ts";
+import {
+	SUBAGENT_DELEGATION_CANCEL_EVENT,
+	SUBAGENT_DELEGATION_REQUEST_EVENT,
+	SUBAGENT_DELEGATION_RESPONSE_EVENT,
+	SUBAGENT_DELEGATION_STARTED_EVENT,
+	SUBAGENT_DELEGATION_UPDATE_EVENT,
+} from "../../src/api/delegation.ts";
+import { SUBAGENT_RPC_REQUEST_EVENT, subagentRpcReplyEvent } from "../../src/extension/rpc.ts";
+
+function makeTrustedCtx(cwd: string): ReturnType<typeof makeMinimalCtx> {
+	const ctx = makeMinimalCtx(cwd);
+	ctx.isProjectTrusted = () => true;
+	return ctx;
+}
+
+describe("active-bound registered-extension lifecycle", () => {
+	let tempDir: string;
+	let mockPi: MockPi;
+	before(() => { mockPi = createMockPi(); mockPi.install(); });
+	after(() => { mockPi.uninstall(); });
+	beforeEach(() => { tempDir = createTempDir(); mockPi.reset(); });
+	afterEach(() => { removeTempDir(tempDir); });
+	it("routes four bound leaves, Fleet, exact cancel, and reload through one registered responder", async () => {
+		const priorAgentDir = process.env.PI_CODING_AGENT_DIR; const isolatedAgentDir = path.join(tempDir, "agent-home"); process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+		const configPath = path.join(isolatedAgentDir, "extensions", "subagent", "config.json"); const sessionBase = path.join(tempDir, "registered-lifecycle-sessions"); fs.mkdirSync(path.dirname(configPath), { recursive: true }); fs.mkdirSync(sessionBase); fs.writeFileSync(configPath, JSON.stringify({ defaultSessionDir: sessionBase, asyncByDefault: false, fleetView: false, asyncWidget: false }));
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true }); fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const extensionEvents = createEventBus(); const sourceIdentity = { version: 1 as const, kind: "git" as const, repository: "https://github.com/itrous/pi-subagents.git", commit: "0123456789abcdef0123456789abcdef01234567", digest: "a".repeat(64) };
+		const makeRuntime = (sessionId: string, serverInstanceId: string) => {
+			const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>(); let uiCalls = 0;
+			const pi = new Proxy({ events: extensionEvents, on(event: string, handler: (event: any, ctx: any) => unknown) { const list = handlers.get(event) ?? []; list.push(handler); handlers.set(event, list); return () => handlers.set(event, (handlers.get(event) ?? []).filter((entry) => entry !== handler)); }, registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; } }, { get(target, prop) { if (prop in target) return target[prop as keyof typeof target]; return () => undefined; } });
+			const ctx = { ...makeTrustedCtx(tempDir), hasUI: false, modelRegistry: { getAvailable: () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }] }, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => path.join(tempDir, `${sessionId}.jsonl`), getEntries: () => [] }, ui: new Proxy({}, { get() { return () => { uiCalls++; throw new Error("headless lifecycle invoked UI"); }; } }) };
+			registerSubagentExtension(pi as never, { resolveSourceIdentity: () => ({ available: true as const, sourceIdentity }), createServerInstanceId: () => serverInstanceId });
+			const startHandlers = [...handlers.get("session_start") ?? []]; const shutdownHandlers = [...handlers.get("session_shutdown") ?? []];
+			return { handlers, ctx, uiCalls: () => uiCalls, start: async (reason: string) => { for (const handler of startHandlers) await handler({ reason }, ctx); }, shutdown: async (reason: string) => { for (const handler of shutdownHandlers) await handler({ reason }, ctx); } };
+		};
+		const rpc = async (requestId: string, method: string, params?: unknown) => await new Promise<any>((resolve, reject) => { const channel = subagentRpcReplyEvent(requestId); let off: (() => void) | void; const timer = setTimeout(() => { off?.(); reject(new Error(`Timed out waiting for RPC ${method} ${requestId}`)); }, 10_000); off = extensionEvents.on(channel, (value) => { clearTimeout(timer); off?.(); resolve(value); }); extensionEvents.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId, method, ...(params === undefined ? {} : { params }) }); });
+		const allRpcReplies = async (requestId: string, method: string, params?: unknown) => { const replies: any[] = []; const off = extensionEvents.on(subagentRpcReplyEvent(requestId), (value) => replies.push(value)); extensionEvents.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId, method, ...(params === undefined ? {} : { params }) }); await new Promise((resolve) => setTimeout(resolve, 50)); off?.(); return replies; };
+		const preflight = async (serverInstanceId: string, prefix: string, ordinal: number) => {
+			const prospectiveRunId = `223e4567-e89b-12d3-a456-4266141741${String(ordinal).padStart(2, "0")}`; const marker = `PRIVATE_REGISTERED_PROMPT_${prefix}_${ordinal}`;
+			const params = { version: 1, targetServerInstanceId: serverInstanceId, requestId: `${prefix}-${ordinal}`, ownerRunId: `${prefix}-owner`, nodeId: `${prefix}-node-${ordinal}`, prospectiveRunId, agent: "echo", task: `${marker} lifecycle`, cwd: tempDir, context: "fresh", model: "test/exact", thinking: "off", artifacts: false, result: { kind: "text" } };
+			const reply = await rpc(`preflight-${prefix}-${ordinal}`, "preflight", params); assert.equal(reply.success, true, JSON.stringify(reply)); const response = reply.data;
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken };
+			return { request: { requestId: params.requestId, ownerRunId: params.ownerRunId, nodeId: params.nodeId, agent: "echo", task: params.task, context: "fresh" as const, cwd: tempDir, model: "test/exact", thinking: "off" as const, artifacts: false, result: { kind: "text" as const }, binding }, marker, preflightParams: params };
+		};
+		const started: any[] = []; const updates: any[] = []; const responses: Array<any & { observedAt: number; childAliveAtTerminal?: boolean }> = []; const terminalPidByRequest = new Map<string, number>();
+		extensionEvents.on(SUBAGENT_DELEGATION_STARTED_EVENT, (value) => started.push(value)); extensionEvents.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (value) => updates.push(value)); extensionEvents.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (value: any) => { const pid = terminalPidByRequest.get(value?.requestId); let childAliveAtTerminal: boolean | undefined; if (pid !== undefined) { try { process.kill(pid, 0); childAliveAtTerminal = true; } catch { childAliveAtTerminal = false; } } responses.push({ ...(value as object), observedAt: Date.now(), ...(childAliveAtTerminal === undefined ? {} : { childAliveAtTerminal }) }); });
+		const serverA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"; const serverB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"; const runtimeA = makeRuntime("registered-lifecycle-a", serverA); let runtimeB: ReturnType<typeof makeRuntime> | undefined;
+		try {
+			await runtimeA.start("startup"); const pingA = await allRpcReplies("ping-a", "ping"); assert.equal(pingA.length, 1); assert.equal(pingA[0].data.serverInstanceId, serverA);
+			const phase1 = await Promise.all(Array.from({ length: 4 }, (_, index) => preflight(serverA, "registered-four", index))); const releases = phase1.map((_, index) => path.join(tempDir, `release-registered-${index}`));
+			for (let index = 0; index < 4; index++) mockPi.onCall({ waitForPath: releases[index], output: `registered-leaf-${index}`, ...(index === 1 ? { ignoreSigterm: true } : {}) });
+			for (const leaf of phase1) extensionEvents.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, leaf.request);
+			const fourDeadline = Date.now() + 10_000; while ((mockPi.callCount() < 4 || started.filter((entry) => entry.ownerRunId === "registered-four-owner").length < 4) && Date.now() < fourDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(mockPi.callCount(), 4); assert.equal(started.filter((entry) => entry.ownerRunId === "registered-four-owner").length, 4);
+			const publicStatus = (await rpc("fleet-four", "status")).data; const fleet = publicStatus.fleet; assert.equal(publicStatus.text, ""); assert.equal(publicStatus.details, undefined); assert.equal(fleet.totalActive, 4); assert.equal(fleet.entries.length, 4); assert.equal(new Set(fleet.entries.map((entry: any) => entry.key)).size, 4); for (const leaf of phase1) { assert.equal(JSON.stringify(publicStatus).includes(leaf.marker), false); assert.equal(JSON.stringify(publicStatus).includes(leaf.request.binding.prospectiveRunId), false); }
+			for (const [requestId, params] of [["interrupt-bound-latest", {}], ["interrupt-bound-exact", { id: phase1[0]!.request.binding.prospectiveRunId }], ["interrupt-bound-prefix", { id: phase1[0]!.request.binding.prospectiveRunId.slice(0, -2) }]] as const) { const interrupt = await rpc(requestId, "interrupt", params); assert.equal(interrupt.success, false); assert.equal(interrupt.error.code, "execution_failed"); }
+			const privateSteer = await rpc("steer-private", "steer", { id: phase1[0]!.request.binding.prospectiveRunId.slice(0, -2), message: "x" }); const unknownSteer = await rpc("steer-unknown", "steer", { id: "unknown-run", message: "x" }); assert.deepEqual(privateSteer.error, unknownSteer.error); assert.equal(responses.filter((entry) => entry.ownerRunId === "registered-four-owner").length, 0);
+			const cancelAt = Date.now(); const selected = phase1[1]!.request; extensionEvents.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId: selected.requestId, ownerRunId: selected.ownerRunId, nodeId: selected.nodeId, targetServerInstanceId: serverA, binding: selected.binding });
+			await new Promise((resolve) => setTimeout(resolve, 100)); assert.equal(responses.some((entry) => entry.requestId === selected.requestId), false, "bound terminal must wait for child close");
+			for (const index of [3, 0, 2]) fs.writeFileSync(releases[index]!, "release"); const phase1Deadline = Date.now() + 15_000; while (responses.filter((entry) => entry.ownerRunId === "registered-four-owner").length < 4 && Date.now() < phase1Deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+			const phase1Responses = responses.filter((entry) => entry.ownerRunId === "registered-four-owner"); assert.equal(phase1Responses.length, 4); assert.equal(phase1Responses.find((entry) => entry.requestId === selected.requestId)?.status, "cancelled"); assert.ok((phase1Responses.find((entry) => entry.requestId === selected.requestId)?.observedAt ?? 0) - cancelAt >= 2_800); assert.ok(phase1Responses.filter((entry) => entry.requestId !== selected.requestId).every((entry) => entry.status === "completed")); const emptyStatus = (await rpc("fleet-empty", "status")).data; assert.equal(emptyStatus.fleet.totalActive, 0); for (const leaf of phase1) assert.equal(JSON.stringify(emptyStatus).includes(leaf.request.binding.prospectiveRunId), false); const privateTerminalStatus = (await rpc("private-terminal-status", "status", { id: selected.binding.prospectiveRunId })).data; assert.equal(privateTerminalStatus.text, ""); assert.equal(privateTerminalStatus.details, undefined); assert.equal(JSON.stringify(privateTerminalStatus).includes(selected.binding.prospectiveRunId), false); const staleInterrupt = await rpc("private-terminal-interrupt", "interrupt", { id: selected.binding.prospectiveRunId }); assert.equal(staleInterrupt.success, false); const privateResume = await rpc("private-terminal-resume", "resume", { id: selected.binding.prospectiveRunId }); assert.equal(privateResume.success, false); assert.equal(JSON.stringify(privateResume).includes("session.jsonl"), false); assert.equal(JSON.stringify(privateResume).includes("registered-leaf"), false);
+
+			const oldLeaves = await Promise.all([preflight(serverA, "registered-old", 10), preflight(serverA, "registered-old", 11)]); const stale = await preflight(serverA, "registered-stale", 12); mockPi.onCall({ waitForPath: path.join(tempDir, "never-old-0"), output: "old-0", recordMarker: "registered-old-0" }); mockPi.onCall({ waitForPath: path.join(tempDir, "never-old-1"), output: "old-1", ignoreSigterm: true, recordMarker: "registered-old-1" }); for (const leaf of oldLeaves) extensionEvents.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, leaf.request);
+			const oldSpawnDeadline = Date.now() + 10_000; while (mockPi.callCount() < 6 && Date.now() < oldSpawnDeadline) await new Promise((resolve) => setTimeout(resolve, 20)); assert.equal(mockPi.callCount(), 6); assert.equal(started.filter((entry) => entry.ownerRunId === "registered-old-owner").length, 2);
+			for (const name of fs.readdirSync(mockPi.dir).filter((entry) => entry.startsWith("call-") && entry.endsWith(".json"))) { const record = JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf8")); if (record.recordMarker === "registered-old-0") terminalPidByRequest.set(oldLeaves[0]!.request.requestId, record.pid); if (record.recordMarker === "registered-old-1") terminalPidByRequest.set(oldLeaves[1]!.request.requestId, record.pid); } assert.equal(terminalPidByRequest.size, 2);
+			const oldUpdatesAtReplacement = updates.filter((entry) => entry.ownerRunId === "registered-old-owner").length; const replacementAt = Date.now(); runtimeB = makeRuntime("registered-lifecycle-b", serverB); const pingPrepared = await allRpcReplies("ping-b-prepared", "ping"); assert.equal(pingPrepared.length, 1); assert.equal(pingPrepared[0].data.serverInstanceId, serverB);
+			let oldTargetReplies = 0; const oldTargetChannel = subagentRpcReplyEvent("old-target-after-reload"); const offOldTarget = extensionEvents.on(oldTargetChannel, () => { oldTargetReplies++; }); extensionEvents.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "old-target-after-reload", method: "preflight", params: stale.preflightParams }); await new Promise((resolve) => setTimeout(resolve, 50)); offOldTarget?.(); assert.equal(oldTargetReplies, 0);
+			const staleResponsesBefore = responses.length; extensionEvents.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, stale.request); await new Promise((resolve) => setTimeout(resolve, 50)); assert.equal(responses.length, staleResponsesBefore); assert.equal(started.some((entry) => entry.requestId === stale.request.requestId), false); assert.equal(updates.some((entry) => entry.requestId === stale.request.requestId), false); assert.equal(mockPi.callCount(), 6);
+			await runtimeB.start("reload"); await runtimeA.shutdown("reload"); const pingAfterLateShutdown = await allRpcReplies("ping-b-after-old-shutdown", "ping"); assert.equal(pingAfterLateShutdown.length, 1); assert.equal(pingAfterLateShutdown[0].data.serverInstanceId, serverB);
+			mockPi.onCall({ output: "replacement-leaf" }); const newLeaf = await preflight(serverB, "registered-new", 20); extensionEvents.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, newLeaf.request);
+			const reloadDeadline = Date.now() + 15_000; while ((!responses.some((entry) => entry.requestId === newLeaf.request.requestId) || responses.filter((entry) => entry.ownerRunId === "registered-old-owner").length < 2) && Date.now() < reloadDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+			const oldResponses = responses.filter((entry) => entry.ownerRunId === "registered-old-owner"); assert.equal(oldResponses.length, 2); assert.ok(oldResponses.every((entry) => entry.status === "cancelled" && entry.childAliveAtTerminal === false), JSON.stringify(oldResponses)); assert.ok(Math.max(...oldResponses.map((entry) => entry.observedAt)) - replacementAt >= 2_800, "replacement terminal waits for stubborn old child close"); assert.equal(updates.filter((entry) => entry.ownerRunId === "registered-old-owner").length, oldUpdatesAtReplacement, "old updates stop at replacement"); assert.equal(responses.find((entry) => entry.requestId === newLeaf.request.requestId)?.status, "completed"); assert.equal(mockPi.callCount(), 7); assert.equal(runtimeB.uiCalls(), 0);
+			const staleAfterStart = responses.length; const startedAfterStart = started.length; const updatesAfterStart = updates.length; extensionEvents.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, stale.request); extensionEvents.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { requestId: newLeaf.request.requestId, ownerRunId: newLeaf.request.ownerRunId, nodeId: newLeaf.request.nodeId, targetServerInstanceId: serverA, binding: stale.request.binding }); await new Promise((resolve) => setTimeout(resolve, 50)); assert.equal(responses.length, staleAfterStart); assert.equal(started.length, startedAfterStart); assert.equal(updates.length, updatesAfterStart); assert.equal(mockPi.callCount(), 7);
+			await runtimeB.shutdown("quit");
+		} finally {
+			try { await runtimeB?.shutdown("quit"); } catch {}
+			try { await runtimeA.shutdown("quit"); } catch {}
+			if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+		}
+	});
+
+});

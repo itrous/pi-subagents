@@ -1,6 +1,10 @@
+import { types as utilTypes } from "node:util";
 import {
+	type SubagentDelegationBindingV1,
 	type SubagentDelegationRequest,
 } from "../api/delegation.ts";
+import type { LaunchReceiptV1 } from "../api/launch-receipt.ts";
+import { parseActiveBoundEnvironment } from "../api/active-bound-environment.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { cloneJsonWithinByteLimit } from "./delegation-json.ts";
@@ -23,8 +27,11 @@ const supportedFields = new Set([
 	"turnBudget",
 	"toolBudget",
 	"skill",
+	"environment",
 	"artifacts",
+	"artifactDir",
 	"result",
+	"binding",
 ]);
 
 const thinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -44,11 +51,120 @@ function validateId(value: unknown): string | undefined {
 	return value;
 }
 
-export function parseSubagentDelegationRequest(data: unknown): SubagentDelegationParseResult {
-	if (!data || typeof data !== "object" || Array.isArray(data)) {
-		return { ok: false, error: "Delegation request must be an object." };
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const DIGEST = /^[0-9a-f]{64}$/;
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	return Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key));
+}
+function record(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+export function subagentDelegationBindingTarget(input: unknown): string | undefined {
+	if (!input || typeof input !== "object" || Array.isArray(input) || utilTypes.isProxy(input)) return undefined;
+	const descriptor = Object.getOwnPropertyDescriptor(input, "binding");
+	if (!descriptor || !("value" in descriptor) || !descriptor.value || typeof descriptor.value !== "object"
+		|| Array.isArray(descriptor.value) || utilTypes.isProxy(descriptor.value)) return undefined;
+	const prototype = Object.getPrototypeOf(descriptor.value);
+	if (prototype !== Object.prototype && prototype !== null) return undefined;
+	const target = Object.getOwnPropertyDescriptor(descriptor.value, "targetServerInstanceId");
+	return target && "value" in target && typeof target.value === "string" && UUID.test(target.value) ? target.value : undefined;
+}
+
+export function parseSubagentDelegationBinding(input: unknown): SubagentDelegationBindingV1 | undefined {
+	const inspected = cloneJsonWithinByteLimit(input, 32 * 1024);
+	if (!inspected.ok || !record(inspected.value)) return undefined;
+	const value = inspected.value;
+	if (!exactKeys(value, ["version", "targetServerInstanceId", "prospectiveRunId", "expectedSourceIdentityDigest", "expectedActiveSessionDigest", "requestDigest", "expectedLaunchContractDigest", "receipt", "cancellationToken"])) return undefined;
+	if (value.version !== 1 || typeof value.targetServerInstanceId !== "string" || !UUID.test(value.targetServerInstanceId)
+		|| typeof value.prospectiveRunId !== "string" || !UUID.test(value.prospectiveRunId)
+		|| ![value.expectedSourceIdentityDigest, value.expectedActiveSessionDigest, value.requestDigest, value.expectedLaunchContractDigest].every((entry) => typeof entry === "string" && DIGEST.test(entry))) return undefined;
+	const receipt = value.receipt;
+	if (!record(receipt) || !exactKeys(receipt, ["version", "algorithm", "payload", "mac"])
+		|| receipt.version !== 1 || receipt.algorithm !== "HMAC-SHA256" || typeof receipt.mac !== "string" || !DIGEST.test(receipt.mac)
+		|| !record(receipt.payload) || !exactKeys(receipt.payload, ["version", "serverInstanceId", "sourceIdentityDigest", "activeSessionDigest", "prospectiveRunId", "requestDigest", "launchContractDigest", "issuedAt", "expiresAt"])) return undefined;
+	const cancellationToken = value.cancellationToken;
+	if (!record(cancellationToken) || !exactKeys(cancellationToken, ["version", "algorithm", "payload", "mac"])
+		|| cancellationToken.version !== 1 || cancellationToken.algorithm !== "HMAC-SHA256" || typeof cancellationToken.mac !== "string" || !DIGEST.test(cancellationToken.mac)
+		|| !record(cancellationToken.payload) || !exactKeys(cancellationToken.payload, ["version", "serverInstanceId", "sourceIdentityDigest", "activeSessionDigest", "prospectiveRunId", "requestDigest", "launchContractDigest", "issuedAt", "expiresAt", "requestId", "ownerRunId", "nodeId"])) return undefined;
+	return {
+		version: 1,
+		targetServerInstanceId: value.targetServerInstanceId,
+		prospectiveRunId: value.prospectiveRunId,
+		expectedSourceIdentityDigest: value.expectedSourceIdentityDigest as string,
+		expectedActiveSessionDigest: value.expectedActiveSessionDigest as string,
+		requestDigest: value.requestDigest as string,
+		expectedLaunchContractDigest: value.expectedLaunchContractDigest as string,
+		receipt: receipt as unknown as LaunchReceiptV1,
+		cancellationToken: cancellationToken as unknown as import("../api/launch-receipt.ts").LaunchCancellationTokenV1,
+	};
+}
+
+function descriptorIdentity(data: unknown): Partial<Pick<SubagentDelegationRequest, "requestId" | "ownerRunId" | "nodeId">> {
+	if (!data || typeof data !== "object" || Array.isArray(data) || utilTypes.isProxy(data)) return {};
+	const prototype = Object.getPrototypeOf(data);
+	if (prototype !== Object.prototype && prototype !== null) return {};
+	const descriptors = Object.getOwnPropertyDescriptors(data);
+	const result: Partial<Pick<SubagentDelegationRequest, "requestId" | "ownerRunId" | "nodeId">> = {};
+	for (const key of ["requestId", "ownerRunId", "nodeId"] as const) {
+		const descriptor = descriptors[key];
+		if (descriptor && "value" in descriptor) {
+			const validated = validateId(descriptor.value);
+			if (validated) result[key] = validated;
+		}
 	}
-	const value = data as Record<string, unknown>;
+	return result;
+}
+
+function omitKnownOptionalUndefined(value: unknown, allowed: ReadonlySet<string>): unknown {
+	if (!value || typeof value !== "object" || Array.isArray(value) || utilTypes.isProxy(value)) return value;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return value;
+	const keys = Reflect.ownKeys(value);
+	if (!keys.every((key): key is string => typeof key === "string" && allowed.has(key))) return value;
+	const output: Record<string, unknown> = Object.create(null);
+	for (const key of keys) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+		if (!("value" in descriptor) || !descriptor.enumerable) return value;
+		if (descriptor.value !== undefined) output[key] = descriptor.value;
+	}
+	return output;
+}
+
+export function parseSubagentDelegationRequest(data: unknown): SubagentDelegationParseResult {
+	const safeIdentity = descriptorIdentity(data);
+	let cloneInput = data;
+	if (data && typeof data === "object" && !Array.isArray(data) && !utilTypes.isProxy(data)) {
+		const prototype = Object.getPrototypeOf(data);
+		if (prototype === Object.prototype || prototype === null) {
+			const keys = Reflect.ownKeys(data);
+			const unsupported = keys.find((key) => typeof key === "string" && !supportedFields.has(key));
+			if (typeof unsupported === "string") return { ok: false, ...safeIdentity, error: `Unsupported delegation field: ${unsupported}.` };
+			if (keys.every((key): key is string => typeof key === "string")) {
+				const descriptors = Object.getOwnPropertyDescriptors(data);
+				const prepared: Record<string, unknown> = Object.create(null);
+				let safe = true;
+				for (const key of keys) {
+					const descriptor = descriptors[key]!;
+					if (!("value" in descriptor) || !descriptor.enumerable) { safe = false; break; }
+					if (descriptor.value !== undefined) {
+						prepared[key] = key === "turnBudget"
+							? omitKnownOptionalUndefined(descriptor.value, new Set(["maxTurns", "graceTurns"]))
+							: key === "toolBudget"
+								? omitKnownOptionalUndefined(descriptor.value, new Set(["soft", "hard", "block"]))
+								: key === "environment"
+									? omitKnownOptionalUndefined(descriptor.value, new Set(["ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH"]))
+									: descriptor.value;
+					}
+				}
+				if (safe) cloneInput = prepared;
+			}
+		}
+	}
+	const cloned = cloneJsonWithinByteLimit(cloneInput, 8 * 1024 * 1024);
+	if (!cloned.ok || !record(cloned.value)) {
+		return { ok: false, ...safeIdentity, error: "Delegation request must be closed plain data." };
+	}
+	const value = cloned.value;
 	const requestId = validateId(value.requestId);
 	if (!requestId) {
 		return { ok: false, error: "Delegation requestId must be a non-empty string of at most 256 characters without newlines." };
@@ -100,6 +216,17 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 	}
 	if (value.artifacts !== undefined && typeof value.artifacts !== "boolean") {
 		return { ok: false, ...identity, error: "artifacts must be a boolean." };
+	}
+	if (value.artifactDir !== undefined && value.artifactDir !== "session") return { ok: false, ...identity, error: "artifactDir must be session when provided." };
+	const binding = value.binding === undefined ? undefined : parseSubagentDelegationBinding(value.binding);
+	if (value.binding !== undefined && !binding) return { ok: false, ...identity, error: "binding must be a closed active-bound v1 proof." };
+	if (!binding && value.environment !== undefined) return { ok: false, ...identity, error: "environment is supported only for bound delegation." };
+	if (!binding && value.artifactDir !== undefined) return { ok: false, ...identity, error: "artifactDir is supported only for bound delegation." };
+	const parsedEnvironment = parseActiveBoundEnvironment(value.environment);
+	if (!parsedEnvironment.ok) return { ok: false, ...identity, error: "environment must contain only bounded active-bound keys." };
+	if (binding && (value.context !== "fresh" || typeof value.model !== "string" || typeof value.thinking !== "string" || value.skill === true
+		|| ((value.artifacts !== false || value.artifactDir !== undefined) && (value.artifacts !== true || value.artifactDir !== "session")))) {
+		return { ok: false, ...identity, error: "bound delegation requires fresh context, explicit model/thinking, a closed artifact policy, and explicit project skills." };
 	}
 	if (Buffer.byteLength(value.task as string, "utf8") > MAX_TASK_BYTES) {
 		return { ok: false, ...identity, error: "Delegation task exceeds 1 MiB when UTF-8 encoded." };
@@ -154,10 +281,13 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 	} else {
 		return { ok: false, ...identity, error: "result.kind must be text or structured." };
 	}
+	const { environment: _rawEnvironment, ...requestValue } = value;
 	return {
 		ok: true,
 		request: {
-			...value,
+			...requestValue,
+			...(Object.keys(parsedEnvironment.environment).length ? { environment: parsedEnvironment.environment } : {}),
+			...(binding ? { binding } : {}),
 			result: structuredSchema
 				? { kind: "structured", schema: structuredSchema }
 				: { kind: "text" },

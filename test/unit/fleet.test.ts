@@ -404,6 +404,7 @@ describe("native subagent fleet", () => {
 				cwd,
 				sessionId: "session-current",
 				updatedAt: 200,
+				activeBound: true,
 				children: [{ agent: "worker", index: 0, status: "completed", finalOutput: "do not persist this when an artifact exists", savedOutputPath: outputPath }],
 			});
 			state.foregroundRuns!.set("other-session", {
@@ -419,6 +420,7 @@ describe("native subagent fleet", () => {
 			const restored = stateForTest();
 			restored.baseCwd = cwd;
 			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 1);
+			assert.equal(restored.foregroundRuns?.get("restored")?.activeBound, true);
 			const snapshot = collectFleetSnapshot(restored);
 			assert.deepEqual(snapshot.items.map((item) => item.key), ["foreground-recent:restored:0"]);
 
@@ -439,6 +441,11 @@ describe("native subagent fleet", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("migrates A1.7 full-UUID single history to private active-bound records", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-bound-history-migration-")); try { const resultsDir = path.join(root, "results"); fs.mkdirSync(resultsDir, { recursive: true }); const runId = "123e4567-e89b-12d3-a456-426614174000"; fs.writeFileSync(path.join(resultsDir, "foreground-history.json"), JSON.stringify({ version: 1, runs: [{ runId, mode: "single", cwd: root, sessionId: "session-current", updatedAt: 1, children: [{ agent: "worker", index: 0, status: "completed", finalOutput: "private" }] }] })); const restored = stateForTest(); assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 1); assert.equal(restored.foregroundRuns?.get(runId)?.activeBound, true); }
+		finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
 	it("does not restore nonterminal foreground history rows", () => {

@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
+import { canonicalSha256 } from "../../src/shared/canonical-json.ts";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
@@ -27,6 +28,8 @@ import {
 	tryImport,
 } from "../support/helpers.ts";
 import registerSubagentExtension from "../../src/extension/index.ts";
+import { parseActiveBoundPreflightRequest } from "../../src/api/active-bound-preflight.ts";
+import { createActiveBoundRuntimeService } from "../../src/api/active-bound-runtime.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import {
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
@@ -43,6 +46,7 @@ import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/wait-config.ts"
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV } from "../../src/runs/shared/tool-budget.ts";
 import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
 import { MAX_CHILD_PENDING_LINE_BYTES, MAX_CHILD_STDERR_BYTES } from "../../src/runs/shared/child-protocol.ts";
+import { PI_SUBAGENT_PI_BINARY_ENV } from "../../src/runs/shared/pi-spawn.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_STEER_ACK_DIR_ENV,
@@ -55,6 +59,13 @@ import {
 	SUBAGENT_PARENT_RUN_ID_ENV,
 } from "../../src/runs/shared/pi-args.ts";
 import { createNestedRoute, nestedRouteEnv, parseNestedEventRecords } from "../../src/runs/shared/nested-events.ts";
+import { collectFleetSnapshot } from "../../src/tui/fleet.ts";
+
+function makeTrustedCtx(cwd: string): ReturnType<typeof makeMinimalCtx> {
+	const ctx = makeMinimalCtx(cwd);
+	ctx.isProjectTrusted = () => true;
+	return ctx;
+}
 
 interface ModelAttempt {
 	success?: boolean;
@@ -322,6 +333,11 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		return readCall().args;
 	}
 
+	function futureBaseRoots() {
+		const parent = fs.lstatSync(tempDir);
+		return { baseRootParentIdentityDigest: canonicalSha256({ dev: parent.dev, ino: parent.ino }) };
+	}
+
 	function makeExecutor(
 		agents = [makeAgent("echo")],
 		config: Record<string, unknown> = {},
@@ -332,18 +348,20 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		workflowControllers?: Map<string, AbortController>,
 		handleScheduledRunAction?: Parameters<typeof createSubagentExecutor>[0]["handleScheduledRunAction"],
 		piEvents = createEventBus(),
+		activeBoundRuntime?: Parameters<typeof createSubagentExecutor>[0]["activeBoundRuntime"],
 	) {
-		return createSubagentExecutor!({
+		const state = {
+			baseCwd: tempDir,
+			currentSessionId: initialSpawnState?.sessionId ?? null,
+			...(initialSpawnState ? { subagentSpawns: initialSpawnState } : {}),
+			asyncJobs: initialAsyncJobs,
+			...(workflowControllers ? { workflowControllers } : {}),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		} as SubagentState;
+		const executor = createSubagentExecutor!({
 			pi: { events: piEvents, getSessionName: () => undefined },
-			state: {
-				baseCwd: tempDir,
-				currentSessionId: initialSpawnState?.sessionId ?? null,
-				...(initialSpawnState ? { subagentSpawns: initialSpawnState } : {}),
-				asyncJobs: initialAsyncJobs,
-				...(workflowControllers ? { workflowControllers } : {}),
-				foregroundControls: new Map(),
-				lastForegroundControlId: null,
-			},
+			state,
 			config,
 			asyncByDefault,
 			tempArtifactsDir: tempDir,
@@ -352,7 +370,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			discoverAgents: () => ({ agents }),
 			allowMutatingManagementActions,
 			...(handleScheduledRunAction ? { handleScheduledRunAction } : {}),
+			...(activeBoundRuntime ? { activeBoundRuntime } : {}),
 		});
+		return Object.assign(executor, { testState: state });
 	}
 
 	it("spawns agent and captures output", async () => {
@@ -1412,6 +1432,423 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 1);
 	});
 
+	it("commits bound spawn budget on spawn and keeps the full prospective UUID", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const skillDir = path.join(tempDir, ".pi", "skills", "bound-skill"); fs.mkdirSync(skillDir, { recursive: true });
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: bound-skill\ndescription: Bound skill\n---\nBOUND_SKILL_MARKER\n");
+		const aliasCwd = path.join(tempDir, "cwd-alias"); fs.symlinkSync(tempDir, aliasCwd, "dir");
+		const base = path.join(tempDir, "bound-sessions");
+		const executionCtx = makeMinimalCtx(tempDir) as any;
+		executionCtx.isProjectTrusted = () => true;
+		executionCtx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
+		executionCtx.sessionManager.getSessionId = () => "pi-session";
+		executionCtx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }];
+		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => executionCtx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
+		const runtimeRecheck = runtime.recheck.bind(runtime); let artifactAbsenceChecks = 0;
+		runtime.recheck = (activeProof, options) => { if (activeProof.request.artifacts) { artifactAbsenceChecks++; assert.equal(fs.existsSync(path.join(base, activeProof.request.prospectiveRunId, "artifacts")), false); } return runtimeRecheck(activeProof, options); };
+		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const proof = (runId: string) => {
+			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: `request-${runId}`, ownerRunId: "owner", nodeId: `node-${runId}`, prospectiveRunId: runId, agent: "echo", task: "Bound", cwd: aliasCwd, context: "fresh", model: "test/exact", thinking: "off", skill: ["bound-skill", "bound-skill"], environment: { ONECPI_REVIEW_ROOT: "/requested/root", ONECPI_REVIEW_SUBJECT_PATH: "/requested/subject" }, artifacts: true, artifactDir: "session", result: { kind: "text" } });
+			assert.equal(parsed.ok, true); if (!parsed.ok) throw new Error("invalid fixture");
+			const response = runtime.preflight(parsed.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) throw new Error("preflight failed");
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId: parsed.request.prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken };
+			const admitted = runtime.admit(parsed.request, binding); assert.equal(admitted.ok, true, JSON.stringify(admitted)); if (!admitted.ok) throw new Error("admission failed");
+			assert.match(admitted.proof.contract.launchInputsDigest, /^[0-9a-f]{64}$/);
+			return admitted.proof;
+		};
+		const params = (runId: string) => ({
+			agent: "echo", task: "Bound", context: "fresh", cwd: aliasCwd, model: "test/exact", skill: ["bound-skill", "bound-skill"],
+			output: false, acceptance: false, artifacts: true, share: false, mission: false,
+			delegatedThinkingOverride: "off" as const, activeBoundProof: proof(runId),
+			async: false as const, foregroundOnly: true as const, clarify: false as const,
+		});
+		const tampered = params("123e4567-e89b-12d3-a456-426614174009") as any;
+		tampered.activeBoundProof = { ...tampered.activeBoundProof, contract: { ...tampered.activeBoundProof.contract, launchInputsDigest: "0".repeat(64) } };
+		const rejectedDigest = await executor.executeDelegated("bound-digest-mismatch", tampered, new AbortController().signal, undefined, executionCtx);
+		assert.equal(rejectedDigest.isError, true); assert.equal(mockPi.callCount(), 0);
+		const poisonedEnv = ["PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE", "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR", "PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_STEER_INBOX", "PI_SUBAGENT_STEER_CAPABILITY", "PI_SUBAGENT_STEER_ACK_DIR", "PI_SUBAGENT_WATCHDOG_CHILD_CONFIG", "PI_SUBAGENT_PERMISSION_POLICY", "PI_SUBAGENT_TOOL_BUDGET", "PI_SUBAGENT_INTERCOM_SESSION_NAME", "PI_INTERCOM_STABLE_ID", "PI_INTERCOM_SESSION_ID", "PI_INTERCOM_UNLISTED_STALE", "PI_SUBAGENT_UNLISTED_STALE", "Pi_Subagent_Mixed_Stale", "pi_intercom_mixed_stale", "ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH", "Onecpi_Review_Root", "Onecpi_Review_Subject_Path", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH"];
+		const previousEnv = Object.fromEntries(poisonedEnv.map((key) => [key, process.env[key]]));
+		for (const key of poisonedEnv) process.env[key] = path.join(tempDir, `stale-${key}`);
+		mockPi.onCall({ echoEnv: poisonedEnv });
+		const firstId = "123e4567-e89b-12d3-a456-426614174000";
+		let first;
+		try {
+			first = await executor.executeDelegated("bound-first", params(firstId), new AbortController().signal, undefined, executionCtx);
+			for (const key of poisonedEnv) assert.equal(process.env[key], path.join(tempDir, `stale-${key}`), key);
+		}
+		finally { for (const key of poisonedEnv) { const previous = previousEnv[key]; if (previous === undefined) delete process.env[key]; else process.env[key] = previous; } }
+		assert.equal(first.isError, undefined, JSON.stringify(first));
+		assert.equal(first.details.runId, firstId);
+		assert.deepEqual(first.details.results[0]?.toolRegistry?.effectiveCallerTools, ["read"]);
+		assert.deepEqual(first.details.results[0]?.toolRegistry?.missing, []);
+		assert.deepEqual(first.details.results[0]?.deniedToolCalls, []);
+		const childEnv = JSON.parse(first.details.results[0]?.finalOutput ?? "{}") as Record<string, string | null>;
+		assert.equal(childEnv.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE, null);
+		assert.equal(childEnv.PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR, null);
+		assert.equal(childEnv.PI_SUBAGENT_STEER_INBOX, null);
+		assert.equal(childEnv.PI_SUBAGENT_DEPTH, "1");
+		assert.equal(childEnv.PI_SUBAGENT_MAX_DEPTH, "1");
+		assert.equal(childEnv.ONECPI_REVIEW_ROOT, "/requested/root");
+		assert.equal(childEnv.ONECPI_REVIEW_SUBJECT_PATH, "/requested/subject");
+		for (const key of poisonedEnv.filter((key) => !["PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_MAX_DEPTH", "ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH"].includes(key))) assert.equal(childEnv[key], null, key);
+		assert.match(childEnv.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH ?? "", /tool-diagnostic\.json$/);
+		assert.notEqual(childEnv.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH, path.join(tempDir, "stale-PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH"));
+		const call = readCall(); const toolsIndex = call.args.indexOf("--tools");
+		assert.equal(call.args.includes("--no-extensions"), true);
+		assert.equal(call.args.includes("--no-tools"), false);
+		assert.deepEqual(call.args.slice(toolsIndex, toolsIndex + 2), ["--tools", "read"]);
+		assert.equal(call.cwd, tempDir);
+		const promptRecord = JSON.stringify(call.systemPrompts);
+		assert.equal(promptRecord.split(path.join(skillDir, "SKILL.md")).length - 1, 2);
+		assert.equal(promptRecord.split("BOUND_SKILL_MARKER").length - 1, 2);
+		assert.equal(fs.existsSync(path.join(base, firstId)), true);
+		assert.ok(artifactAbsenceChecks >= 2);
+		const artifactRoot = path.join(base, firstId, "artifacts");
+		const artifactPaths = first.details.results[0]?.artifactPaths; assert.ok(artifactPaths);
+		for (const artifactPath of Object.values(artifactPaths)) { assert.equal(path.relative(artifactRoot, artifactPath).startsWith(".."), false, artifactPath); assert.equal(fs.lstatSync(artifactPath).isFile(), true, artifactPath); }
+		assert.match(fs.readFileSync(artifactPaths.inputPath, "utf8"), /Bound/);
+		assert.match(fs.readFileSync(artifactPaths.transcriptPath, "utf8"), /Bound/);
+		assert.equal(fs.existsSync(path.join(tempDir, ".pi-subagents")), false);
+		const second = await executor.executeDelegated("bound-second", params("123e4567-e89b-12d3-a456-426614174001"), new AbortController().signal, undefined, executionCtx);
+		assert.equal(second.isError, true);
+		assert.match(second.content[0]?.text ?? "", /spawn limit reached/i);
+		assert.equal(mockPi.callCount(), 1);
+		runtime.dispose();
+	});
+
+	it("keeps four active-bound foreground leaves visible and cancels one after child close", async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true }); fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "lifecycle-sessions"); fs.mkdirSync(base);
+		const ctx = makeTrustedCtx(tempDir) as any; ctx.hasUI = false; ctx.sessionManager.getSessionFile = () => path.join(tempDir, "lifecycle-parent.jsonl"); ctx.sessionManager.getSessionId = () => "lifecycle-session"; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }];
+		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => ctx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
+		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const releases = Array.from({ length: 4 }, (_, index) => path.join(tempDir, `release-bound-${index}`));
+		for (let index = 0; index < 4; index++) mockPi.onCall({ waitForPath: releases[index], output: `leaf-${index}`, ...(index === 1 ? { ignoreSigterm: true } : {}) });
+		const proofs = Array.from({ length: 4 }, (_, index) => {
+			const prospectiveRunId = `123e4567-e89b-12d3-a456-42661417410${index}`;
+			const parsed = parseActiveBoundPreflightRequest({ version: 1, targetServerInstanceId: runtime.serverInstanceId, requestId: `lifecycle-${index}`, ownerRunId: "lifecycle-owner", nodeId: `lifecycle-node-${index}`, prospectiveRunId, agent: "echo", task: `Bound lifecycle leaf ${index} PRIVATE_PROMPT_MARKER`, cwd: tempDir, context: "fresh", model: "test/exact", thinking: "off", artifacts: false, result: { kind: "text" } });
+			assert.equal(parsed.ok, true); if (!parsed.ok) throw new Error("invalid lifecycle fixture"); const response = runtime.preflight(parsed.request); assert.equal("code" in response, false, JSON.stringify(response)); if ("code" in response) throw new Error("lifecycle preflight failed");
+			const binding = { version: 1 as const, targetServerInstanceId: response.serverInstanceId, prospectiveRunId, expectedSourceIdentityDigest: response.sourceIdentityDigest, expectedActiveSessionDigest: response.activeSessionDigest, requestDigest: response.requestDigest, expectedLaunchContractDigest: response.launchContractDigest, receipt: response.receipt, cancellationToken: response.cancellationToken };
+			const admission = runtime.admit(parsed.request, binding); assert.equal(admission.ok, true, JSON.stringify(admission)); if (!admission.ok) throw new Error("lifecycle admission failed"); return admission.proof;
+		});
+		const controllers = Array.from({ length: 4 }, () => new AbortController());
+		const executions = proofs.map((proof, index) => executor.executeDelegated(`lifecycle-${index}`, { agent: "echo", task: `Bound lifecycle leaf ${index} PRIVATE_PROMPT_MARKER`, context: "fresh", cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false, mission: false, delegatedThinkingOverride: "off", activeBoundProof: proof, async: false, foregroundOnly: true, clarify: false }, controllers[index]!.signal, undefined, ctx));
+		const activeDeadline = Date.now() + 10_000; while ((mockPi.callCount() < 4 || executor.testState.foregroundControls.size < 4) && Date.now() < activeDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(mockPi.callCount(), 4); const active = collectFleetSnapshot(executor.testState).items.filter((item) => item.kind === "foreground-active"); assert.equal(active.length, 4); assert.equal(new Set(active.map((item) => item.key)).size, 4); assert.deepEqual(active.map((item) => item.agent), ["echo", "echo", "echo", "echo"]); assert.ok([...executor.testState.foregroundControls.values()].every((control) => control.activeBound === true && [...(control.activeChildren?.values() ?? [])].every((child) => child.detach === undefined)));
+		const cancelledAt = Date.now(); controllers[1]!.abort(); await new Promise((resolve) => setTimeout(resolve, 100)); assert.equal(executor.testState.foregroundControls.size, 4, "cancelled bound leaf remains owned until observed child close");
+		for (const index of [3, 0, 2]) fs.writeFileSync(releases[index]!, "release");
+		const results = await Promise.all(executions); assert.ok(Date.now() - cancelledAt >= 2_800, "hard-cancelled bound leaf must wait for SIGKILL and close");
+		for (const index of [0, 2, 3]) { assert.equal(results[index]!.isError, undefined, JSON.stringify(results[index])); assert.equal(results[index]!.details.results[0]?.finalOutput, `leaf-${index}`); }
+		assert.equal(controllers[1]!.signal.aborted, true); assert.equal(executor.testState.foregroundControls.size, 0); assert.equal(collectFleetSnapshot(executor.testState).items.filter((item) => item.kind === "foreground-active").length, 0);
+		runtime.dispose();
+	});
+
+
+	it("projects measured bound registry mismatch before accepting child output", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: ["extra", "read"] });
+		const previousNodeOptions = process.env.NODE_OPTIONS; process.env.NODE_OPTIONS = "--require=/ambient-preload-must-not-run.cjs";
+		let result;
+		try {
+			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch", {
+				runId: "bound-registry-mismatch", acceptance: false, disableWatchdog: true,
+				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			});
+		} finally { if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previousNodeOptions; }
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.nativeStatus, "native_tool_registry_mismatch");
+		assert.deepEqual(result.toolsMissing, []);
+		assert.deepEqual(result.toolsExtra, ["extra"]);
+		assert.equal(result.transportIncomplete, true);
+		assert.deepEqual(result.toolRegistry?.effectiveCallerTools, ["extra", "read"]);
+		assert.deepEqual(result.deniedToolCalls, []);
+	});
+
+	it("projects redacted denied-tool proof without replacing successful output", async () => {
+		mockPi.onCall({ output: "bounded", deniedToolCalls: [{ tool: "read", reason: "permission_rule" }] });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denied tool", {
+			runId: "bound-denied-tool", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 0); assert.equal(result.finalOutput, "bounded");
+		assert.deepEqual(result.deniedToolCalls, [{ tool: "read", reason: "permission_rule" }]);
+		assert.equal(result.transportIncomplete, true); assert.equal(JSON.stringify(result.deniedToolCalls).includes("args"), false);
+	});
+
+	it("waits for active-bound agent settlement before final drain", async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [events.assistantMessage("waiting"), { type: "agent_end", willRetry: false }] },
+			{ delay: 1400, jsonl: [{ type: "agent_settled" }] },
+		] });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound settle", {
+			runId: "bound-denial-settle", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 0); assert.ok(Date.now() - startedAt >= 1200); assert.deepEqual(result.deniedToolCalls, []);
+	});
+
+	it("starts active-bound final drain from a valid fallback denial frame", async () => {
+		mockPi.onCall({ jsonl: [events.assistantMessage("fallback proof"), { type: "agent_end", willRetry: false }], deniedToolProofBeforeKeepAlive: true, keepAliveAfterFinalMessageMs: 5_000 });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fallback", {
+			runId: "bound-denial-fallback", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 0); assert.deepEqual(result.deniedToolCalls, []);
+		assert.ok(Date.now() - startedAt < 4_000, "valid fallback proof must release final drain before process keep-alive");
+	});
+
+	it("fails normal active-bound completion without a denial proof", async () => {
+		mockPi.onCall({ output: "must not succeed", skipDeniedToolProof: true });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound missing denial proof", {
+			runId: "bound-missing-denial", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.deniedToolCalls, undefined);
+	});
+
+	it("classifies denial fail-stop after exact registry proof as denial protocol", async () => {
+		mockPi.onCall({ output: "must not succeed", skipDeniedToolProof: true, exitCode: 78 });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fail-stop", {
+			runId: "bound-denial-fail-stop", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("rejects a syntactically valid registry frame without the parent nonce", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNonce: "0".repeat(64) });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound forged registry", {
+			runId: "bound-registry-forged", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.equal(result.toolRegistry, undefined);
+	});
+
+	it("rejects a transport projection with more than 128 actual tools", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: Array.from({ length: 129 }, (_, index) => `tool_${index}`) });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound oversized registry", {
+			runId: "bound-registry-actual-bound", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+	});
+
+	it("requires a proof frame before classifying package-mutation exit", async () => {
+		mockPi.onCall({ output: "must not succeed", exitCode: 76, skipBoundToolRegistryProof: true });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound unproved mutation exit", {
+			runId: "bound-registry-unproved-mutation", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "missing_frame");
+	});
+
+	it("keeps a valid measured mismatch ahead of package-mutation exit", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: ["extra", "read"], exitCode: 76 });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch mutation exit", {
+			runId: "bound-registry-mismatch-mutation", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_mismatch");
+		assert.deepEqual(result.toolsExtra, ["extra"]);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("does not publish an exact projection when the gate exits with mismatch code", async () => {
+		mockPi.onCall({ output: "must not succeed", exitCode: 78 });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound exact exit", {
+			runId: "bound-registry-exact-exit", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.equal(result.toolRegistry, undefined);
+	});
+
+	it("does not publish a projection whose measured missing list is invalid", async () => {
+		mockPi.onCall({ output: "must not succeed", boundToolRegistryMissing: ["read"] });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound invalid projection", {
+			runId: "bound-registry-invalid-projection", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.equal(result.toolRegistry, undefined);
+	});
+
+	it("rejects a proof channel kept open by a descendant writer", async () => {
+		mockPi.onCall({ output: "bounded", holdBoundToolRegistryFdMs: 2_000 });
+		const startedAt = Date.now();
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound inherited fd", {
+			runId: "bound-registry-inherited-fd", acceptance: false, disableWatchdog: true,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
+		assert.equal(result.toolRegistryError, "invalid_frame");
+		assert.ok(Date.now() - startedAt < 1_500, "inherited proof writer must not hold terminal completion");
+	});
+
+	it("preserves timeout status when the bound gate has not emitted a frame", async () => {
+		mockPi.onCall({ waitForPath: path.join(tempDir, "never-release-bound-registry") });
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound timeout", {
+			runId: "bound-registry-timeout", acceptance: false, disableWatchdog: true, timeoutMs: 20,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.timedOut, true);
+		assert.equal(result.nativeStatus, undefined);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("preserves cancellation before the bound gate emits a frame", async () => {
+		mockPi.onCall({ waitForPath: path.join(tempDir, "never-release-bound-registry-cancel"), ignoreSigterm: true });
+		const controller = new AbortController(); const startedAt = Date.now();
+		setTimeout(() => controller.abort(), 500);
+		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound cancel", {
+			runId: "bound-registry-cancel", acceptance: false, disableWatchdog: true, signal: controller.signal,
+			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(controller.signal.aborted, true);
+		assert.ok(Date.now() - startedAt >= 2_800, "active-bound cancellation must wait for SIGKILL and observed close");
+		assert.equal(result.nativeStatus, undefined);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("does not require a proof frame when the child fails to spawn", async () => {
+		const previousBinary = process.env.PI_SUBAGENT_PI_BINARY;
+		process.env.PI_SUBAGENT_PI_BINARY = path.join(tempDir, "definitely-missing-pi");
+		let result;
+		try {
+			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound spawn error", {
+				runId: "bound-registry-spawn-error", acceptance: false, disableWatchdog: true,
+				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			});
+		} finally {
+			if (previousBinary === undefined) delete process.env.PI_SUBAGENT_PI_BINARY;
+			else process.env.PI_SUBAGENT_PI_BINARY = previousBinary;
+		}
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.nativeStatus, undefined);
+		assert.equal(result.toolRegistryError, undefined);
+	});
+
+	it("preserves ambient ONECPI keys but clears bound gate activation for legacy children", async () => {
+		const keys = ["ONECPI_REVIEW_ROOT", "ONECPI_REVIEW_SUBJECT_PATH", "PI_SUBAGENT_TOOL_REGISTRY_ACTIVE", "PI_SUBAGENT_TOOL_REGISTRY_POLICY", "PI_SUBAGENT_TOOL_REGISTRY_FD"];
+		const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+		process.env.ONECPI_REVIEW_ROOT = "/legacy/root"; process.env.ONECPI_REVIEW_SUBJECT_PATH = "/legacy/subject";
+		process.env.PI_SUBAGENT_TOOL_REGISTRY_ACTIVE = "1"; process.env.PI_SUBAGENT_TOOL_REGISTRY_POLICY = "poison"; process.env.PI_SUBAGENT_TOOL_REGISTRY_FD = "3";
+		mockPi.onCall({ echoEnv: keys });
+		let result;
+		try { result = await runSync(tempDir, [makeAgent("echo")], "echo", "legacy env", { runId: "legacy-onecpi-env", acceptance: false }); }
+		finally { for (const key of keys) { const value = previous[key]; if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
+		assert.equal(result.exitCode, 0); assert.deepEqual(JSON.parse(result.finalOutput ?? "{}"), { ONECPI_REVIEW_ROOT: "/legacy/root", ONECPI_REVIEW_SUBJECT_PATH: "/legacy/subject", PI_SUBAGENT_TOOL_REGISTRY_ACTIVE: null, PI_SUBAGENT_TOOL_REGISTRY_POLICY: null, PI_SUBAGENT_TOOL_REGISTRY_FD: null });
+	});
+
+	it("keeps bound budget committed when a spawned child fails", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\nfallbackModels:\n  - test/fallback\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions"); const runtime = { claimBase: () => true, recheck: () => true } as any;
+		const ctx = makeTrustedCtx(tempDir) as any; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", api: "openai-responses" }, { provider: "test", id: "fallback", api: "openai-responses" }];
+		const executor = makeExecutor([makeAgent("echo", { fallbackModels: ["test/fallback"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const params = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: futureBaseRoots(), policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
+		mockPi.onCall({ jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "temporary provider failure" }], model: "test/exact", errorMessage: "rate limit exceeded", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }], exitCode: 1 });
+		mockPi.onCall({ output: "fallback must not run" });
+		const failed = await executor.executeDelegated("bound-spawned-failure", params("123e4567-e89b-12d3-a456-426614174010"), new AbortController().signal, undefined, ctx);
+		assert.equal(failed.isError, true); assert.equal(mockPi.callCount(), 1);
+		const blocked = await executor.executeDelegated("bound-after-spawned-failure", params("123e4567-e89b-12d3-a456-426614174011"), new AbortController().signal, undefined, ctx);
+		assert.equal(blocked.isError, true); assert.match(blocked.content[0]?.text ?? "", /spawn limit reached/i); assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("rolls back bound budget and empty owned root when the immediate spawn barrier drifts", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions");
+		let checks = 0;
+		const runtime = { claimBase: () => true, recheck: () => ++checks !== 3 } as any;
+		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const runId = "123e4567-e89b-12d3-a456-426614174002";
+		const makeParams = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: futureBaseRoots(), policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
+		const rejected = await executor.executeDelegated("bound-drift", makeParams(runId), new AbortController().signal, undefined, makeTrustedCtx(tempDir));
+		assert.equal(rejected.isError, true);
+		assert.equal(mockPi.callCount(), 0);
+		assert.equal(fs.existsSync(path.join(base, runId)), false);
+		assert.equal(fs.existsSync(base), false, "attempt-created base root must roll back before spawn");
+		checks = 10;
+		mockPi.onCall({ output: "retry ok" });
+		const retried = await executor.executeDelegated("bound-retry", makeParams("123e4567-e89b-12d3-a456-426614174005"), new AbortController().signal, undefined, makeTrustedCtx(tempDir));
+		assert.equal(retried.isError, undefined, JSON.stringify(retried));
+		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("refuses a session root occupied immediately before atomic publication", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions"); const runId = "123e4567-e89b-12d3-a456-426614174012"; const rootPath = path.join(base, runId);
+		const runtime = { claimBase: () => { fs.mkdirSync(rootPath); fs.writeFileSync(path.join(rootPath, "sentinel"), "keep"); return true; }, recheck: () => true } as any;
+		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const proof = { version: 1, request: { prospectiveRunId: runId }, launchContractDigest: "a".repeat(64), contract: { roots: futureBaseRoots(), policy: { maxSubagentDepth: 1 } } } as any;
+		const result = await executor.executeDelegated("bound-publish-collision", { agent: "echo", task: "Bound", context: "fresh", cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false, mission: false, delegatedThinkingOverride: "off", activeBoundProof: proof, async: false, foregroundOnly: true, clarify: false }, new AbortController().signal, undefined, makeTrustedCtx(tempDir));
+		assert.equal(result.isError, true);
+		assert.equal(fs.readFileSync(path.join(rootPath, "sentinel"), "utf8"), "keep");
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("preserves a replacement root after pre-spawn rejection", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions"); const runId = "123e4567-e89b-12d3-a456-426614174004"; const rootPath = path.join(base, runId);
+		let checks = 0;
+		const runtime = { claimBase: () => true, recheck: () => { checks++; if (checks !== 3) return true; fs.rmSync(rootPath, { recursive: true }); fs.mkdirSync(rootPath); fs.writeFileSync(path.join(rootPath, "sentinel"), "keep"); return false; } } as any;
+		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const proof = { version: 1, request: { prospectiveRunId: runId }, launchContractDigest: "a".repeat(64), contract: { roots: futureBaseRoots(), policy: { maxSubagentDepth: 1 } } } as any;
+		const result = await executor.executeDelegated("bound-replaced", { agent: "echo", task: "Bound", context: "fresh", cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false, mission: false, delegatedThinkingOverride: "off", activeBoundProof: proof, async: false, foregroundOnly: true, clarify: false }, new AbortController().signal, undefined, makeTrustedCtx(tempDir));
+		assert.equal(result.isError, true);
+		assert.equal(fs.readFileSync(path.join(rootPath, "sentinel"), "utf8"), "keep");
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rolls back bound budget when the child errors before spawn", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
+		const base = path.join(tempDir, "bound-sessions");
+		const runtime = { claimBase: () => true, recheck: () => true } as any;
+		const executor = makeExecutor([makeAgent("echo")], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
+		const runId = "123e4567-e89b-12d3-a456-426614174003";
+		const params = (prospectiveRunId: string) => ({ agent: "echo", task: "Bound", context: "fresh" as const, cwd: tempDir, model: "test/exact", output: false, acceptance: false, artifacts: false, share: false as const, mission: false as const, delegatedThinkingOverride: "off" as const, activeBoundProof: { version: 1, request: { prospectiveRunId }, launchContractDigest: "a".repeat(64), contract: { roots: futureBaseRoots(), policy: { maxSubagentDepth: 1 } } } as any, async: false as const, foregroundOnly: true as const, clarify: false as const });
+		const previousBinary = process.env[PI_SUBAGENT_PI_BINARY_ENV];
+		process.env[PI_SUBAGENT_PI_BINARY_ENV] = path.join(tempDir, "missing-pi");
+		let failed;
+		try { failed = await executor.executeDelegated("bound-error", params(runId), new AbortController().signal, undefined, makeTrustedCtx(tempDir)); }
+		finally { if (previousBinary === undefined) delete process.env[PI_SUBAGENT_PI_BINARY_ENV]; else process.env[PI_SUBAGENT_PI_BINARY_ENV] = previousBinary; }
+		assert.equal(failed.isError, true);
+		assert.equal(fs.existsSync(path.join(base, runId)), false);
+		mockPi.onCall({ output: "retry ok" });
+		const retried = await executor.executeDelegated("bound-error-retry", params("123e4567-e89b-12d3-a456-426614174006"), new AbortController().signal, undefined, makeTrustedCtx(tempDir));
+		assert.equal(retried.isError, undefined, JSON.stringify(retried));
+		assert.equal(mockPi.callCount(), 1);
+	});
+
 	it("keeps delegated agent and config tool budgets at a minimum of one", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const ctx = makeMinimalCtx(tempDir);
 		const cases = [
@@ -1626,7 +2063,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const ctx = {
 			...makeMinimalCtx(tempDir),
 			modelRegistry: {
-				getAvailable: () => [{ provider: "mock", id: "test-model", reasoning: true }],
+				getAvailable: () => [{ provider: "mock", id: "test-model", api: "openai-responses", reasoning: true }],
 			},
 			sessionManager: {
 				getSessionId: () => "registered-delegation-session",
@@ -1684,7 +2121,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			while (mockPi.callCount() < 2 && responses.length < 2 && Date.now() < callDeadlineAt) {
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
-			assert.equal(mockPi.callCount(), 2, `different logical nodes should use the concurrent delegated execution path: ${JSON.stringify(responses)}`);
+			assert.equal(mockPi.callCount(), 2, `different logical nodes should use the concurrent delegated execution path: ${JSON.stringify({ responses, started })}`);
 			assert.deepEqual(started.map(({ requestId, ownerRunId, nodeId }) => ({ requestId, ownerRunId, nodeId })).sort((a, b) => a.nodeId.localeCompare(b.nodeId)), [
 				{ requestId: "registered-a", ownerRunId: "owner-delegation", nodeId: "node-a" },
 				{ requestId: "registered-b", ownerRunId: "owner-delegation", nodeId: "node-b" },
@@ -1795,6 +2232,37 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			grantRemaining: 3,
 			grantHistory: [],
 		});
+	});
+
+	it("hides private active-bound runs from direct status", async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		const marker = "private-bound-status-marker";
+		executor.testState.currentSessionId = "session-123";
+		executor.testState.lastForegroundControlId = marker;
+		executor.testState.foregroundControls.set(marker, { runId: marker, sessionId: "session-123", mode: "single", startedAt: 1, updatedAt: 2, description: "PRIVATE_TASK", activeBound: true, activeChildren: new Map() } as never);
+		const exact = await executor.execute("private-status", { action: "status", id: marker }, new AbortController().signal, undefined, ctx);
+		const unknown = await executor.execute("unknown-status", { action: "status", id: "does-not-exist" }, new AbortController().signal, undefined, ctx);
+		const implicit = await executor.execute("implicit-status", { action: "status" }, new AbortController().signal, undefined, ctx);
+		const fleet = await executor.execute("fleet-status", { action: "status", view: "fleet" }, new AbortController().signal, undefined, ctx);
+		for (const result of [exact, unknown]) {
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /No matching run found in this session/);
+		}
+		for (const result of [exact, unknown, implicit, fleet]) {
+			assert.equal(JSON.stringify(result).includes(marker), false);
+			assert.equal(JSON.stringify(result).includes("PRIVATE_TASK"), false);
+		}
+		assert.equal(JSON.stringify(fleet).includes(marker), false);
+		assert.equal(JSON.stringify(fleet).includes("PRIVATE_TASK"), false);
+		let ordinaryInterrupted = false;
+		executor.testState.foregroundControls.set("ordinary-run", { runId: "ordinary-run", sessionId: "session-123", mode: "single", startedAt: 3, updatedAt: 4, description: "PUBLIC_TASK", activeChildren: new Map(), interrupt: () => { ordinaryInterrupted = true; return true; } } as never);
+		const ordinary = await executor.execute("ordinary-status", { action: "status", id: "ordinary-run" }, new AbortController().signal, undefined, ctx);
+		assert.equal(ordinary.isError, undefined);
+		assert.doesNotMatch(ordinary.content[0]?.text ?? "", /No matching run found/);
+		assert.equal(JSON.stringify(ordinary).includes(marker), false);
+		const interrupted = await executor.execute("ordinary-interrupt", { action: "interrupt" }, new AbortController().signal, undefined, ctx);
+		assert.equal(interrupted.isError, undefined); assert.equal(ordinaryInterrupted, true);
 	});
 
 	it("preflights static chains before creating run artifacts", async () => {

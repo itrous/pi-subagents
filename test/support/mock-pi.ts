@@ -12,6 +12,8 @@ interface MockPiResponse {
 	waitForPath?: string;
 	keepAliveAfterFinalMessageMs?: number;
 	ignoreSigterm?: boolean;
+	/** Test-only identifier copied into the child call record with its PID. */
+	recordMarker?: string;
 	jsonl?: unknown[];
 	stdoutRaw?: string;
 	stdoutBase64Chunks?: string[];
@@ -31,6 +33,16 @@ interface MockPiResponse {
 	/** Writes the structured-output capture file without emitting a structured_output tool event. */
 	structuredOutputCapture?: unknown;
 	runtimeAcknowledgedExtensions?: unknown;
+	boundToolRegistryNames?: string[];
+	boundToolRegistryMissing?: string[];
+	boundToolRegistryNonce?: string;
+	skipBoundToolRegistryProof?: boolean;
+	holdBoundToolRegistryFdMs?: number;
+	deniedToolCalls?: Array<{ tool: string; reason: "permission_rule" | "tool_budget" }>;
+	deniedToolProofBeforeKeepAlive?: boolean;
+	deniedToolCallsOverflow?: boolean;
+	skipDeniedToolProof?: boolean;
+	deniedToolProofNonce?: string;
 }
 
 export interface MockPi {
