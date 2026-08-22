@@ -124,3 +124,13 @@ factory загружается через jiti). Базовый механизм
 2. Хост-алиасы (`@earendil-works/pi-coding-agent`) при компиляции jiti.
 3. Состав дерева owner (onecpi несёт corpus/scenarios и собственные
    extensions) против минимального дерева.
+
+## Эксперимент typebox-sibling (WIP, нестабильно)
+
+Драйвер получил env-гейты `A2_DEP_IMPORTS_TYPEBOX=1` (dep entry импортирует
+typebox), `A2_DEP_PEER_TYPEBOX=1` (объявить peerDependencies) и materialize
+typebox в owner node_modules. Прогон показал недетерминизм ДО фазы
+dependency: rel-leaf то `completed`, то `invalid_request` между прогонами —
+стабилизировать в первую очередь (подозрение: межфазовое состояние
+координатора/реестров в одной сессии или гонка pending-cancel), затем
+снимать вывод по гипотезе 1.

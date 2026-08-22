@@ -88,10 +88,23 @@ fs.writeFileSync(path.join(depDir, "package.json"), JSON.stringify({
 	main: "./index.ts",
 	pi: { extensions: ["./index.ts"] },
 }, null, 2));
-fs.writeFileSync(path.join(depDir, "index.ts"),
-	`export default function depExtension(pi: any) {\n` +
-	`\tpi.registerTool({ name: "dep_tool", label: "dep", description: "dep tool", parameters: { type: "object", properties: {}, required: [] }, async execute() { return { content: [], details: {} }; } });\n` +
-	`}\n`);
+	const importTypebox = process.env.A2_DEP_IMPORTS_TYPEBOX === "1";
+	const declarePeer = process.env.A2_DEP_PEER_TYPEBOX === "1";
+	fs.writeFileSync(path.join(depDir, "index.ts"),
+		(importTypebox ? `import { Type } from "typebox";\nconst flag = Type.Never();\n` : "") +
+		`export default function depExtension(pi: any) {\n` +
+		`\tpi.registerTool({ name: "dep_tool", label: "dep", description: "dep tool", parameters: { type: "object", properties: {}, required: [] }, async execute() { return { content: [], details: {} }; } });\n` +
+		`}\n`);
+	if (declarePeer) {
+		const mf = path.join(depDir, "package.json");
+		const d = JSON.parse(fs.readFileSync(mf, "utf8"));
+		d.peerDependencies = { typebox: "*" };
+		fs.writeFileSync(mf, JSON.stringify(d, null, 2));
+	}
+	{
+		const tbSrc = process.env.A2_TYPEBOX_DIR || path.join(realHome, ".pi", "agent", "npm", "node_modules", "typebox");
+		if (fs.existsSync(tbSrc)) fs.cpSync(tbSrc, path.join(ownerDir, "node_modules", "typebox"), { recursive: true });
+	}
 
 // Owner: агенты. rel-leaf - контрольный относительный ref; dep-leaf - package:ref.
 fs.writeFileSync(path.join(ownerDir, "package.json"), JSON.stringify({
