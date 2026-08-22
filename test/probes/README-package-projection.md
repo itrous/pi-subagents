@@ -1,0 +1,87 @@
+# Repro recipe: issue #4 (package-projection lost in delegated spawn)
+
+Status: **reproduced externally, fix pending.** This file is the working
+handoff for the fix branch. Do not delete until `test/probes/active-runtime-package-projection.mjs`
+lands and goes green.
+
+## Symptom (pinned 57174db, feat/active-runtime-contract-a1)
+
+Delegated foreground bound spawn of a **package** agent whose frontmatter has
+`subagentOnlyExtensions: package:<dep>` fails before any provider request:
+
+```
+status: native_tool_registry_protocol_error
+error:  Native tool registry proof failed: package_load_error
+```
+
+Child-side transform hook log (instrumented copy of
+`bound-tool-registry-runtime.ts`, see "instrumentation" below):
+
+```
+TX   <ownerPkg>/node_modules/<dep>/index.ts     ← jiti compiles the ENTRY itself
+ESC  <ownerPkg>/node_modules/<dep>/index.ts     ← then the guard rejects IT
+LOAD-FAIL Error: Package factory transform escaped its attested resolution roots.
+```
+
+So the attestation **is delivered** (`loadBoundPackageFactories` attempts
+exactly the dependency entry), but `evidenceRoots` computed by
+`verifyPackageEvidence()` in the child does **not contain the dependency
+root** at factory-load time — otherwise `within(root, entry)` would pass and
+no escape would be logged for that path.
+
+## What works
+
+- Package agent with a **relative** ref (`./ext/x.ts`) from a *small separate*
+  owner package: full cycle OK (factory loads, registry proof clean).
+- Ordinary bound leaves (builtin tools only): full cycle OK.
+- Parent-side preflight for the package-ref agent: projection `kind:"package"`,
+  digests computed correctly.
+
+## External reproducer
+
+onecpi branch `feat/a2-native-agents-attestation`, `bin/a2-bound-probe.mjs`
+(1С phase; env `A2_SKIP_1C=1 A2_SKIP_LEAK=1 A2_PROBE_DEBUG=1 A2_PROBE_KEEP=1`;
+child logs in `<root>/load-debug.log`). Owner = packed onecpi with exact deps
+(`pi-mcp-adapter`, `typebox`), agent `1c-review-native` with ten `mcp:` selectors
++ `package:pi-mcp-adapter`.
+
+## In-fork repro to build (this branch)
+
+`test/probes/active-runtime-package-projection.mjs`, modeled on
+`test/probes/active-runtime-git-installed.mjs`:
+
+1. Throwaway HOME/agentDir; installExactCommit not needed (running from repo),
+   but children need the runtime extensions — same layout as the existing
+   probe (extensionDir = repo checkout).
+2. Two tiny local packages, **materialized as real directories**
+   (resolver rejects symlinks):
+   - `deppkg`: `pi.extensions: ["./index.ts"]`, index registers one tool;
+   - `ownpkg`: depends on deppkg declared in `dependencies`
+     (`{"a1dep": "file:./deppkg"}`), `node_modules/a1dep` materialized as a
+     REAL copied directory (not symlink), agent `proj-leaf.md` with
+     `subagentOnlyExtensions: package:a1dep`.
+3. Seed `settings.json` packages with both roots; models.json → faux provider.
+4. Parent SDK session (faux setResponses forces the probe tool), delegate the
+   agent; assert child terminal `completed` and factory tool present in wire.
+5. Currently expected to fail exactly like the external reproducer.
+
+## Instrumentation hint
+
+The four self-verified runtime files cannot be patched in attestation runs
+(`runtime_bytes_drift`), but for DEBUG runs patching before parent creation is
+consistent on both sides. Transform-guard condition + per-call filename logging
+was sufficient to localize ESC on the entry file. Note: jiti keeps no on-disk
+transpile cache here (checked), so stale-cache explanations are ruled out.
+
+## Fix hypotheses (in priority order)
+
+1. Policy assembly for delegated spawns: `execution.ts`
+   `boundPackageExtensions = options.activeBoundProjectSkills ?
+   resolveActiveBoundPackageExtensions(agent) : undefined` — verify the value
+   actually reaches `spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV]` on this path
+   (log `policy.packageExtensions.length` child-side first).
+2. Double guard installation: `registerBoundPackageMediator` may run for
+   extension loads without bound context, installing the resolver/transform
+   guard with empty roots; last-installed guard wins.
+3. `within()`/path normalization mismatch between evidenceRoot recorded at
+   preflight and the child-side realpath comparison.
