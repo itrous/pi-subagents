@@ -179,7 +179,7 @@ function within(root: string, target: string): boolean {
 
 function installPackageResolutionGuard(roots: readonly string[], deniedPaths: ReadonlySet<string>): void {
 	if (!runtimeHolder.state || roots.length === 0) return;
-	const measured = (target: string): boolean => roots.some((root) => {
+	const measured = (target: string): boolean => [...roots, ...peerDirs].some((root) => {
 		if (!within(root, target)) return false;
 		return !path.relative(root, target).split(path.sep).includes("node_modules");
 	});
@@ -233,15 +233,32 @@ function verifyRuntimeEvidence(): ReturnType<typeof attestBoundRuntimeExtensions
 
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
-	const mediated = createBoundPackageApi(pi); const sharedDir = path.dirname(fileURLToPath(import.meta.url));
+	const mediated = createBoundPackageApi(pi);
+	const hostNm = process.env.A1_HOST_NODE_MODULES;
+	const peerAlias: Record<string, string> = {};
+	const peerDirs: string[] = [];
+	if (hostNm) {
+	 for (const attestation of runtimeHolder.state.policy.packageExtensions) {
+	  try {
+	   const mf = JSON.parse(fs.readFileSync(path.join(path.dirname(attestation.path), "package.json"), "utf8"));
+	   for (const name of Object.keys(mf.peerDependencies ?? {})) {
+	    try {
+	     const resolved = fs.realpathSync(path.join(hostNm, ...name.split("/")));
+	     if (!peerAlias[name]) { peerAlias[name] = resolved; peerDirs.push(resolved); }
+	    } catch {}
+	   }
+	  } catch {}
+	 }
+	}
+ const sharedDir = path.dirname(fileURLToPath(import.meta.url));
 	const runtimeEvidence = verifyRuntimeEvidence();
 	const evidenceRoots = verifyPackageEvidence();
 			try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD roots=" + JSON.stringify(evidenceRoots) + " policyCount=" + runtimeHolder.state.policy.packageExtensions.length + "\n"); } catch {}
 const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
-	installPackageResolutionGuard(evidenceRoots, deniedRuntimePaths);
-	const transformer = createJiti(import.meta.url, { moduleCache: false, tsconfigPaths: true });
+	installPackageResolutionGuard([...evidenceRoots, ...peerDirs], deniedRuntimePaths);
+	const transformer = createJiti(import.meta.url, { moduleCache: false, tsconfigPaths: true, alias: peerAlias });
 	const jiti = createJiti(import.meta.url, {
-		moduleCache: false, tsconfigPaths: true, tryNative: false,
+		moduleCache: false, tsconfigPaths: true, tryNative: false, alias: peerAlias,
 		transform(options) {
 			const __deny = typeof options.filename === "string" && path.isAbsolute(options.filename)
 				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !evidenceRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")));
