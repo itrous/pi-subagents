@@ -85,3 +85,22 @@ transpile cache here (checked), so stale-cache explanations are ruled out.
    guard with empty roots; last-installed guard wins.
 3. `within()`/path normalization mismatch between evidenceRoot recorded at
    preflight and the child-side realpath comparison.
+
+## Статус реализации (WIP, ветка fix/package-projection-delegated-spawn)
+
+- `package-projection-parent.mts` — родительский probe-extension (ping,
+  preflight+delegation двух листов, диагностика на stderr).
+- `active-runtime-package-projection.mjs` — драйвер (throwaway HOME,
+  installExactCommit текущего HEAD, owner/dep пакеты materialized копией,
+  faux-провайдер, SDK-родитель с принудительным tool call).
+- Под `A2_PROBE_DEBUG=1` резолвер инструментируется логами всех
+  `failure(...)`-сайтов со стеком.
+
+**Текущий блокер воспроизведения:** минимальная фикстура получает
+`unsupported_mode` на preflight rel-leaf ещё до слоя #4. Причина не
+идентифицирована (подозрения: restricted-discovery без доверия проекта в
+SDK-сессии, либо дополнительное ограничение forbiddenAgentMode для
+минимальных манифестов). Метод дальнейшей отладки: читать стек из
+A2RESOLVE-логов (каждый сайт отказа резолвера пишет место), сравнить с
+рабочим воспроизведением onecpi (`bin/a2-bound-probe.mjs`, где preflight
+проходит) и свести различия окружения (settings.json, состав packages).
