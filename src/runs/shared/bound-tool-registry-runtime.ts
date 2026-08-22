@@ -257,14 +257,14 @@ const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !en
 				|| createHash("sha256").update(fs.readFileSync(attestation.path)).digest("hex") !== attestation.contentDigest) throw new Error("attestation drift");
 			factory = await jiti.import(attestation.path, { default: true });
 		}
-		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
+		catch (e) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "LOAD-FAIL " + String(e && (e.stack || e)) + "\n"); } catch {} protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		if (typeof factory !== "function") protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		try {
 			const manifest = JSON.parse(fs.readFileSync(path.join(attestation.evidenceRoot, "package.json"), "utf8")) as { name?: unknown };
 			runtimeHolder.state!.allowInputRegistrationNoop = manifest.name === "pi-mcp-adapter";
 			await factory(mediated);
 		}
-		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
+		catch (e) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "LOAD-FAIL " + String(e && (e.stack || e)) + "\n"); } catch {} protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		finally { if (runtimeHolder.state) runtimeHolder.state.allowInputRegistrationNoop = false; }
 	}
 }
