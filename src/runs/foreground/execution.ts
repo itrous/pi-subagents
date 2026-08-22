@@ -1311,7 +1311,7 @@ spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
 			if (code !== 0 && rawStdout.trim() && !closeError && !forcedDrainAfterFinalSuccess) {
 				closeError = rawStdout.trim();
 			}
-			if (stderr.trim()) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD-STDERR " + stderr.slice(-1500) + "\n"); } catch {} }
+			{ try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD-EXIT status=" + result.status + " sig=" + signal + " diag=" + String(toolDiagnosticError).slice(0,200) + " err=" + String(result.error).slice(0,300) + "\nSTDERR[" + stderr.slice(-1200) + "]\nSTDOUT[" + rawStdout.slice(-400) + "]\n"); } catch {} }
 			if (code !== 0 && stderr.trim() && !closeError && !forcedDrainAfterFinalSuccess) {
 				closeError = stderr.trim();
 			}
