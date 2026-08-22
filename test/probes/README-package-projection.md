@@ -104,3 +104,23 @@ SDK-сессии, либо дополнительное ограничение f
 A2RESOLVE-логов (каждый сайт отказа резолвера пишет место), сравнить с
 рабочим воспроизведением onecpi (`bin/a2-bound-probe.mjs`, где preflight
 проходит) и свести различия окружения (settings.json, состав packages).
+
+
+## Результат минимальной пробы (зелёный)
+
+С `main: "./index.ts"` в manifest зависимости ОБА листа завершаются
+`completed`: rel-leaf (относительный ref) и dep-leaf (`package:a1dep`,
+factory загружается через jiti). Базовый механизм package-projection в
+делегированном спавне **работает**.
+
+## Сужение #4 до реального кейса onecpi
+
+Различия minimal ↔ onecpi, кандидаты на причину `package_load_error`:
+
+1. Импорт `typebox` (peerDependency адаптера) разрешается вверх из
+   `<owner>/node_modules/pi-mcp-adapter` в `<owner>/node_modules/typebox` —
+   соседний каталог ВНУТРИ owner root, но вне корня самой зависимости;
+   проверять `evidenceRoots`/guard на этот путь.
+2. Хост-алиасы (`@earendil-works/pi-coding-agent`) при компиляции jiti.
+3. Состав дерева owner (onecpi несёт corpus/scenarios и собственные
+   extensions) против минимального дерева.

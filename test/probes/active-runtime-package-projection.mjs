@@ -61,8 +61,20 @@ execGit(extensionDir, ["remote", "set-url", "origin", "https://github.com/itrous
 		// Лог каждого отказа резолвера с местом в коде (только для отладки).
 		const resolverPath = path.join(extensionDir, "src", "api", "active-bound-resolver.ts");
 		let resolver = fs.readFileSync(resolverPath, "utf8");
-		resolver = resolver.split('return failure("').join('return (console.error("A2RESOLVE", new Error("t").stack), failure("');
+		resolver = resolver.replace(
+			'function failure(code: ActiveBoundResolutionErrorCode): ResolveActiveBoundLaunchContractResult {\n\treturn { ok: false, code } as ResolveActiveBoundLaunchContractResult;\n}',
+			'function failure(code: ActiveBoundResolutionErrorCode): ResolveActiveBoundLaunchContractResult {\n\tconst __e = new Error();\n\tError.captureStackTrace(__e, failure);\n\tconsole.error("A2RESOLVE", code, __e.stack?.split("\\n").slice(1, 3).join(" | "));\n\treturn { ok: false, code } as ResolveActiveBoundLaunchContractResult;\n}'
+		);
+		resolver = resolver.replace(
+			'} catch { return failure("unsupported_mode"); }\n\tconst resolved = resolveAgentName',
+			'} catch (e) { console.error("A2DISCOVER-FAIL", String(e && (e.stack || e))); return failure("unsupported_mode"); }\n\tconst resolved = resolveAgentName'
+		);
 		fs.writeFileSync(resolverPath, resolver);
+		// Коммитим локально: identity резолвера = f(remote, HEAD), и bound-путь
+		// в debug-прогоне должен существовать.
+		spawnSync("git", ["add", "-A"], { cwd: extensionDir });
+		const cr = spawnSync("git", ["commit", "-q", "-m", "a2-debug-instrumentation"], { cwd: extensionDir, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "probe", GIT_AUTHOR_EMAIL: "probe@local", GIT_COMMITTER_NAME: "probe", GIT_COMMITTER_EMAIL: "probe@local" } });
+		if (cr.status !== 0) process.stderr.write("debug commit skipped\n");
 	}
 
 // --- 2. Owner + dependency пакеты (реальные каталоги) ---
@@ -73,6 +85,7 @@ fs.mkdirSync(path.join(depDir), { recursive: true });
 // Dependency: единственная pi.extensions запись, фабрика регистрирует тул.
 fs.writeFileSync(path.join(depDir, "package.json"), JSON.stringify({
 	name: "a1dep", version: "1.0.0", private: true, type: "module",
+	main: "./index.ts",
 	pi: { extensions: ["./index.ts"] },
 }, null, 2));
 fs.writeFileSync(path.join(depDir, "index.ts"),
