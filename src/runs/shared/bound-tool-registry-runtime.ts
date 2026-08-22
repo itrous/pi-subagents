@@ -243,8 +243,9 @@ const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !en
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false, tsconfigPaths: true, tryNative: false,
 		transform(options) {
-			if (typeof options.filename === "string" && path.isAbsolute(options.filename)
-				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !evidenceRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")))) throw new Error("Package factory transform escaped its attested resolution roots.");
+			const __deny = typeof options.filename === "string" && path.isAbsolute(options.filename)
+				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !evidenceRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")));
+			if (__deny) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "ESC " + String(options.filename) + " roots=" + JSON.stringify(evidenceRoots) + "\n"); } catch {} throw new Error("Package factory transform escaped its attested resolution roots."); }
 			return { code: transformer.transform(options) };
 		},
 	});
