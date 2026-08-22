@@ -236,7 +236,8 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 	const mediated = createBoundPackageApi(pi); const sharedDir = path.dirname(fileURLToPath(import.meta.url));
 	const runtimeEvidence = verifyRuntimeEvidence();
 	const evidenceRoots = verifyPackageEvidence();
-	const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
+			try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD roots=" + JSON.stringify(evidenceRoots) + " policyCount=" + runtimeHolder.state.policy.packageExtensions.length + "\n"); } catch {}
+const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
 	installPackageResolutionGuard(evidenceRoots, deniedRuntimePaths);
 	const transformer = createJiti(import.meta.url, { moduleCache: false, tsconfigPaths: true });
 	const jiti = createJiti(import.meta.url, {

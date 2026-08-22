@@ -596,7 +596,8 @@ async function runSingleAttempt(
 	const toolRegistryProofNonce = options.activeBoundToolRegistry ? randomBytes(32).toString("hex") : undefined;
 	if (options.activeBoundToolRegistry) {
 		spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
-		spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
+				try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "PARENT pkg=" + JSON.stringify((boundPackageExtensions?.attestations ?? []).map((x) => ({ p: x.path, r: x.evidenceRoot }))) + "\n"); } catch {}
+spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
 			...options.activeBoundToolRegistry,
 			proofNonce: toolRegistryProofNonce,
 			denialFd: 4,
