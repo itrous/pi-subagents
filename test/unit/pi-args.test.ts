@@ -1188,6 +1188,26 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.equal(args[args.indexOf("--tools") + 1], "read,s_foo");
 	});
 
+	it("drops URL-bound credentials when a higher-precedence source changes URL", () => {
+		const fixture = createMcpFixture();
+		const effective = { url: "https://new.test/mcp" };
+		writeJson(path.join(fixture.agentDir, "mcp.json"), { mcpServers: { s: { url: "https://old.test/mcp", headers: { Authorization: "Bearer old" } } } });
+		writeJson(path.join(fixture.projectDir, ".mcp.json"), { mcpServers: { s: effective } });
+		writeJson(path.join(fixture.agentDir, "mcp-cache.json"), { version: 1, servers: { s: { configHash: computeMcpServerHash(effective), cachedAt: Date.now(), tools: [{ name: "foo" }] } } });
+		const { args } = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["s"] });
+		assert.equal(args[args.indexOf("--tools") + 1], "read,s_foo");
+	});
+
+	it("merges local server overrides with imported definitions", () => {
+		const fixture = createMcpFixture();
+		const merged = { command: "server", includeTools: ["foo"] };
+		writeJson(path.join(fixture.projectDir, ".vscode", "mcp.json"), { mcpServers: { s: { command: "server" } } });
+		writeJson(path.join(fixture.agentDir, "mcp.json"), { imports: ["vscode"], mcpServers: { s: { includeTools: ["foo"] } } });
+		writeJson(path.join(fixture.agentDir, "mcp-cache.json"), { version: 1, servers: { s: { configHash: computeMcpServerHash(merged), cachedAt: Date.now(), tools: [{ name: "foo" }] } } });
+		const { args } = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["s"] });
+		assert.equal(args[args.indexOf("--tools") + 1], "read,s_foo");
+	});
+
 	it("keeps tool extension paths when explicit extensions are allowlisted", () => {
 		const fixture = createMcpFixture();
 		writeMcpFixture(fixture, { tools: [{ name: "take_screenshot" }] });

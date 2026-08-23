@@ -34,6 +34,7 @@ interface ServerEntry {
 	headers?: Record<string, string>;
 	requestHeadersCommand?: { command: string; args?: string[]; env?: Record<string, string>; timeoutMs?: number };
 	auth?: "oauth" | "bearer" | false;
+	oauth?: unknown;
 	bearerToken?: string;
 	bearerTokenEnv?: string;
 	exposeResources?: boolean;
@@ -153,12 +154,31 @@ function validateConfig(raw: unknown): McpConfig {
 	};
 }
 
+function mergeServerMaps(base: Record<string, ServerEntry>, next: Record<string, ServerEntry>): Record<string, ServerEntry> {
+	const merged = { ...base };
+	for (const [name, definition] of Object.entries(next)) {
+		const existing = merged[name];
+		let baseEntry: ServerEntry = existing ?? {};
+		if (existing && typeof definition.socket === "string") {
+			baseEntry = { ...existing };
+			for (const field of ["command", "args", "env", "cwd", "url", "headers", "auth", "bearerToken", "bearerTokenEnv", "oauth"] as const) delete baseEntry[field];
+		} else if (existing?.socket && (typeof definition.command === "string" || typeof definition.url === "string")) {
+			baseEntry = { ...existing }; delete baseEntry.socket;
+		}
+		if (existing && typeof definition.url === "string" && definition.url !== existing.url) {
+			if (baseEntry === existing) baseEntry = { ...existing };
+			for (const field of ["headers", "bearerToken", "bearerTokenEnv", "requestHeadersCommand"] as const) delete baseEntry[field];
+			if (baseEntry.oauth !== false) delete baseEntry.oauth;
+		}
+		merged[name] = { ...baseEntry, ...definition };
+	}
+	return merged;
+}
+
 function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
 	const imports = [...(base.imports ?? []), ...(next.imports ?? [])];
-	const mcpServers = { ...base.mcpServers };
-	for (const [name, definition] of Object.entries(next.mcpServers)) mcpServers[name] = { ...(mcpServers[name] ?? {}), ...definition };
 	return {
-		mcpServers,
+		mcpServers: mergeServerMaps(base.mcpServers, next.mcpServers),
 		imports: imports.length ? [...new Set(imports)] : undefined,
 		settings: next.settings ? { ...base.settings, ...next.settings } : base.settings,
 	};
@@ -185,7 +205,7 @@ function expandImports(config: McpConfig, cwd: string): McpConfig {
 	return {
 		imports: config.imports,
 		settings: config.settings,
-		mcpServers: { ...importedServers, ...config.mcpServers },
+		mcpServers: mergeServerMaps(importedServers, config.mcpServers),
 	};
 }
 
@@ -216,10 +236,10 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 		const candidateCache = cache.servers[candidateServer];
 		if (!isServerCacheValid(candidateCache, candidateDefinition)) continue;
 		const candidatePrefix = getToolPrefix(candidateDefinition.toolPrefix ?? prefix);
-		for (const tool of candidateCache.tools ?? []) if (typeof tool.name === "string" && (tool.uiVisibility === undefined || tool.uiVisibility.includes("model"))) {
+		for (const tool of Array.isArray(candidateCache.tools) ? candidateCache.tools : []) if (tool && typeof tool.name === "string" && (tool.uiVisibility === undefined || (Array.isArray(tool.uiVisibility) && tool.uiVisibility.includes("model")))) {
 			for (const candidate of toolNameCandidates(tool.name, candidateServer, candidatePrefix, false)) allCurrentCandidates.add(candidate);
 		}
-		if (candidateDefinition.exposeResources !== false) for (const resource of candidateCache.resources ?? []) if (typeof resource.name === "string") {
+		if (candidateDefinition.exposeResources !== false) for (const resource of Array.isArray(candidateCache.resources) ? candidateCache.resources : []) if (resource && typeof resource.name === "string") {
 			for (const candidate of toolNameCandidates(`read_${resourceNameToToolName(resource.name)}`, candidateServer, candidatePrefix, false)) allCurrentCandidates.add(candidate);
 		}
 	}

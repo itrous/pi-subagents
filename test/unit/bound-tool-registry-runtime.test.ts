@@ -231,6 +231,20 @@ describe("bound tool registry child runtime", () => {
 		assert.deepEqual(registrations, ["a", "a"]);
 	});
 
+	it("rejects one package factory replacing another package factory tool", () => {
+		const registrations: string[] = [];
+		const ownership = { occupiedToolNames: new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]), packageToolOwners: new Map<string, symbol>() };
+		const pi = { registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any;
+		const first = (createBoundPackageApi as any)(pi, ownership);
+		const second = (createBoundPackageApi as any)(pi, ownership);
+		const originalExit = process.exit; (process as any).exit = (code: number) => { throw new Error(`exit:${code}`); };
+		try {
+			first.registerTool({ name: "a", execute() {} });
+			assert.throws(() => second.registerTool({ name: "a", execute() {} }));
+		} finally { process.exit = originalExit; }
+		assert.deepEqual(registrations, ["a"]);
+	});
+
 	it("suppresses command surfaces and exposes detached immutable model views", () => {
 		const registered: string[] = [];
 		const model = { id: "m", api: "openai-responses", baseUrl: "https://trusted.example" };
