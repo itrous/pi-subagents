@@ -158,9 +158,13 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 		if (property === "registerTool") return (tool: unknown) => {
 			try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "REGISTER " + String(tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined) + "\n"); } catch {}
 			if (runtimeHolder.state?.barrierCommitted) packageMutationExit();
-			const name = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
-			if (typeof name !== "string" || !name || occupiedToolNames.has(name)) packageMutationExit();
-			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(tool));
+			const packageName = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
+			if (typeof packageName !== "string" || !packageName) packageMutationExit();
+			const normalized = packageName.replace(/-/g, "_");
+			const name = runtimeHolder.state?.policy.required.includes(normalized) ? normalized : packageName;
+			if (occupiedToolNames.has(name)) packageMutationExit();
+			const projectedTool = name === packageName ? tool : { ...(tool as Record<string, unknown>), name };
+			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(projectedTool));
 			runtimeHolder.state?.placeholderTools.delete(name);
 			occupiedToolNames.add(name);
 			return result;
