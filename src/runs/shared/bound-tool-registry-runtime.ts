@@ -242,7 +242,7 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 	if (hostNm) {
 	 for (const attestation of runtimeHolder.state.policy.packageExtensions) {
 	  try {
-	   const mf = JSON.parse(fs.readFileSync(path.join(attestation.evidenceRoot, "package.json"), "utf8"));
+	   const mf = JSON.parse(fs.readFileSync(path.join(path.dirname(attestation.path), "package.json"), "utf8"));
 	   for (const name of Object.keys(mf.peerDependencies ?? {})) {
 	    try {
 	     const resolved = fs.realpathSync(path.join(hostNm, ...name.split("/")));
