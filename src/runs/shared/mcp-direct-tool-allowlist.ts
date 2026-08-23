@@ -226,6 +226,10 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
 	return servers && typeof servers === "object" && !Array.isArray(servers) ? servers as Record<string, ServerEntry> : {};
 }
 
+function visibleToModel(value: unknown): boolean {
+	return value === undefined || ((typeof value === "string" || Array.isArray(value)) && value.includes("model"));
+}
+
 function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, prefix: ToolPrefix, envOverride: string[]): ResolvedMcpDirectToolSelection[] {
 	const names: ResolvedMcpDirectToolSelection[] = [];
 	const seenNames = new Set<string>();
@@ -236,7 +240,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 		const candidateCache = cache.servers[candidateServer];
 		if (!isServerCacheValid(candidateCache, candidateDefinition)) continue;
 		const candidatePrefix = getToolPrefix(candidateDefinition.toolPrefix ?? prefix);
-		for (const tool of Array.isArray(candidateCache.tools) ? candidateCache.tools : []) if (tool && typeof tool.name === "string" && (tool.uiVisibility === undefined || (Array.isArray(tool.uiVisibility) && tool.uiVisibility.includes("model")))) {
+		for (const tool of Array.isArray(candidateCache.tools) ? candidateCache.tools : []) if (tool && typeof tool.name === "string" && visibleToModel(tool.uiVisibility)) {
 			for (const candidate of toolNameCandidates(tool.name, candidateServer, candidatePrefix, false)) allCurrentCandidates.add(candidate);
 		}
 		if (candidateDefinition.exposeResources !== false) for (const resource of Array.isArray(candidateCache.resources) ? candidateCache.resources : []) if (resource && typeof resource.name === "string") {
@@ -257,7 +261,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 
 		for (const tool of Array.isArray(serverCache.tools) ? serverCache.tools : []) {
 			if (typeof tool?.name !== "string" || !tool.name) continue;
-			if (tool.uiVisibility !== undefined && !tool.uiVisibility.includes("model")) continue;
+			if (!visibleToModel(tool.uiVisibility)) continue;
 			if (toolFilter !== true && !toolFilter.has(tool.name)) continue;
 			if (!isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools, allCurrentCandidates)) continue;
 			const prefixedName = formatToolName(tool.name, serverName, effectivePrefix);
