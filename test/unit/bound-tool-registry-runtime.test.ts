@@ -223,6 +223,14 @@ describe("bound tool registry child runtime", () => {
 		fs.rmSync(parent, { recursive: true, force: true });
 	});
 
+	it("allows a package to refresh its own tool before the barrier", () => {
+		const registrations: string[] = [];
+		const mediated = createBoundPackageApi({ registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any) as any;
+		mediated.registerTool({ name: "a", execute() {} });
+		mediated.registerTool({ name: "a", execute() {} });
+		assert.deepEqual(registrations, ["a", "a"]);
+	});
+
 	it("suppresses command surfaces and exposes detached immutable model views", () => {
 		const registered: string[] = [];
 		const model = { id: "m", api: "openai-responses", baseUrl: "https://trusted.example" };

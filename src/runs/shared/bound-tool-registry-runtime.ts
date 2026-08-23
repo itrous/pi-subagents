@@ -144,6 +144,7 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 	// Supported Pi 0.84.1/0.84.2 expose this exact builtin registry. Protect it and
 	// runtime-owned internal tools without calling action APIs during extension load.
 	const occupiedToolNames = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...(runtimeHolder.state?.policy.internalTools ?? [])]);
+	const packageToolNames = new Set<string>();
 	return opaqueFacade(pi, (property) => {
 		if (typeof property !== "string") return undefined;
 		if (ALWAYS_DENIED_METHODS.has(property)) return packageMutationExit;
@@ -159,10 +160,11 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 			const packageName = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
 			if (typeof packageName !== "string" || !packageName) packageMutationExit();
 			const name = packageName;
-			if (occupiedToolNames.has(name)) packageMutationExit();
+			if (occupiedToolNames.has(name) && !packageToolNames.has(name)) packageMutationExit();
 			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(tool));
 			runtimeHolder.state?.placeholderTools.delete(name);
 			occupiedToolNames.add(name);
+			packageToolNames.add(name);
 			return result;
 		};
 		if (POST_BARRIER_MUTATORS.has(property)) return (...args: unknown[]) => {

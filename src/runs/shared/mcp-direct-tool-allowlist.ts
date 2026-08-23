@@ -155,8 +155,10 @@ function validateConfig(raw: unknown): McpConfig {
 
 function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
 	const imports = [...(base.imports ?? []), ...(next.imports ?? [])];
+	const mcpServers = { ...base.mcpServers };
+	for (const [name, definition] of Object.entries(next.mcpServers)) mcpServers[name] = { ...(mcpServers[name] ?? {}), ...definition };
 	return {
-		mcpServers: { ...base.mcpServers, ...next.mcpServers },
+		mcpServers,
 		imports: imports.length ? [...new Set(imports)] : undefined,
 		settings: next.settings ? { ...base.settings, ...next.settings } : base.settings,
 	};
@@ -285,9 +287,11 @@ function parseSelections(selections: string[]): { servers: Set<string>; tools: M
 }
 
 function isServerCacheValid(entry: ServerCacheEntry | undefined, definition: ServerEntry): entry is ServerCacheEntry {
-	if (!entry || entry.configHash !== computeMcpServerHash(definition)) return false;
-	if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
-	return Date.now() - entry.cachedAt <= CACHE_MAX_AGE_MS;
+	try {
+		if (!entry || entry.configHash !== computeMcpServerHash(definition)) return false;
+		if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
+		return Date.now() - entry.cachedAt <= CACHE_MAX_AGE_MS;
+	} catch { return false; }
 }
 
 export function computeMcpServerHash(definition: ServerEntry): string {
@@ -345,7 +349,7 @@ function formatToolName(toolName: string, serverName: string, prefix: ToolPrefix
 
 function globMatches(value: string, pattern: string): boolean {
 	const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
-	return new RegExp(`^${escaped}$`, "u").test(value);
+	return new RegExp(`^${escaped}$`).test(value);
 }
 
 function legacyServerPrefix(serverName: string, mode: ToolPrefix): string {

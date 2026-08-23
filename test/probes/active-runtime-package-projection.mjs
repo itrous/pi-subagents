@@ -40,7 +40,9 @@ function execGit(cwd, args) {
 	return r.stdout.trim();
 }
 
-const root = fs.mkdtempSync(path.join(os.homedir(), ".cache", "a1-pkg-projection-"));
+const cacheRoot = path.join(os.homedir(), ".cache");
+fs.mkdirSync(cacheRoot, { recursive: true });
+const root = fs.mkdtempSync(path.join(cacheRoot, "a1-pkg-projection-"));
 const cleanup = () => { if (process.env.A2_PROBE_KEEP !== "1") fs.rmSync(root, { recursive: true, force: true }); };
 process.once("exit", cleanup);
 
@@ -102,6 +104,7 @@ fs.writeFileSync(path.join(depDir, "package.json"), JSON.stringify({
 		fs.writeFileSync(mf, JSON.stringify(d, null, 2));
 	}
 	{
+		fs.mkdirSync(path.join(ownerDir, "node_modules"), { recursive: true });
 		const tbSrc = process.env.A2_TYPEBOX_DIR || path.join(realHome, ".pi", "agent", "npm", "node_modules", "typebox");
 		if (fs.existsSync(tbSrc)) fs.cpSync(tbSrc, path.join(ownerDir, "node_modules", "typebox"), { recursive: true });
 	}

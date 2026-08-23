@@ -1166,6 +1166,28 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.equal(args[args.indexOf("--tools") + 1], "read,project-mcp_inspect");
 	});
 
+	it("keeps selected tools when an unselected server has invalid cache identity", () => {
+		const fixture = createMcpFixture();
+		const good = { command: "good" };
+		writeJson(path.join(fixture.agentDir, "mcp.json"), { mcpServers: { good, bad: { url: "${MISSING_URL}" } } });
+		writeJson(path.join(fixture.agentDir, "mcp-cache.json"), { version: 1, servers: {
+			good: { configHash: computeMcpServerHash(good), cachedAt: Date.now(), tools: [{ name: "t" }] },
+			bad: { configHash: "invalid", cachedAt: Date.now(), tools: [{ name: "x" }] },
+		} });
+		const { args } = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["good"] });
+		assert.equal(args[args.indexOf("--tools") + 1], "read,good_t");
+	});
+
+	it("merges partial server definitions field by field", () => {
+		const fixture = createMcpFixture();
+		const merged = { command: "server", requestHeadersCommand: { command: "sign" } };
+		writeJson(path.join(fixture.agentDir, "mcp.json"), { mcpServers: { s: { command: "server" } } });
+		writeJson(path.join(fixture.projectDir, ".mcp.json"), { mcpServers: { s: { requestHeadersCommand: { command: "sign" } } } });
+		writeJson(path.join(fixture.agentDir, "mcp-cache.json"), { version: 1, servers: { s: { configHash: computeMcpServerHash(merged), cachedAt: Date.now(), tools: [{ name: "foo" }] } } });
+		const { args } = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["s"] });
+		assert.equal(args[args.indexOf("--tools") + 1], "read,s_foo");
+	});
+
 	it("keeps tool extension paths when explicit extensions are allowlisted", () => {
 		const fixture = createMcpFixture();
 		writeMcpFixture(fixture, { tools: [{ name: "take_screenshot" }] });

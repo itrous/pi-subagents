@@ -117,6 +117,8 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 	const owner = agent.activeBoundPackageOwner; const paths: string[] = []; const projection: ActiveBoundPackageExtensionProjectionV1[] = []; const evidenceRootByPath = new Map<string, string>();
 	const treeDigestByRoot = new Map<string, string>();
 	const treeDigest = (entry: string, evidenceRoot: string): string => {
+		const relative = path.relative(evidenceRoot, entry);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Package entry escapes its package root.");
 		const cached = treeDigestByRoot.get(evidenceRoot); if (cached) return cached;
 		const measured = packageTreeDigest(entry, evidenceRoot, owner.rootPath); treeDigestByRoot.set(evidenceRoot, measured); return measured;
 	};
