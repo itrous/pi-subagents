@@ -114,8 +114,8 @@ fs.writeFileSync(path.join(ownerDir, "package.json"), JSON.stringify({
 }, null, 2));
 const leaf = (name, taskMarker, extra) => fs.writeFileSync(path.join(ownerDir, "agents", `${name}.md`),
 	`---\nname: "${name}"\ndescription: "${name} leaf"\ndefaultContext: fresh\nmodel: "probe/child"\nthinking: off\ntools: read${extra}\n---\n${taskMarker}\n`);
-leaf("rel-leaf", "REL_OK", "\nsubagentOnlyExtensions: ./ext/ref.ts");
-leaf("dep-leaf", "DEP_OK", "\nsubagentOnlyExtensions: package:a1dep");
+leaf("rel-leaf", "REL_OK", ", ref_tool\nsubagentOnlyExtensions: ./ext/ref.ts");
+leaf("dep-leaf", "DEP_OK", ", dep_tool\nsubagentOnlyExtensions: package:a1dep");
 fs.mkdirSync(path.join(ownerDir, "agents", "ext"), { recursive: true });
 fs.writeFileSync(path.join(ownerDir, "agents", "ext", "ref.ts"),
 	'export default function refExtension(pi: any) {\n\tpi.registerTool({ name: "ref_tool", label: "ref", description: "ref tool", parameters: { type: "object", properties: {}, required: [] }, async execute() { return { content: [], details: {} }; } });\n}\n');
