@@ -63,7 +63,7 @@ export default function registerProbe(pi: ExtensionAPI): void {
 						}});
 					});
 					process.stderr.write(`PREFLIGHT ${spec.agent}: ${JSON.stringify(reply).slice(0, 400)}\n`);
-					assert(reply?.success === true, `${spec.agent} preflight failed: ${JSON.stringify(reply)}`);
+					assert(reply?.success === true && !reply?.data?.code, `${spec.agent} preflight failed: ${JSON.stringify(reply)}`);
 					const d = reply.data;
 					const binding = { version: 1, targetServerInstanceId: d.serverInstanceId, prospectiveRunId, expectedSourceIdentityDigest: d.sourceIdentityDigest, expectedActiveSessionDigest: d.activeSessionDigest, requestDigest: d.requestDigest, expectedLaunchContractDigest: d.launchContractDigest, receipt: d.receipt, cancellationToken: d.cancellationToken };
 					const req = { requestId, ownerRunId, nodeId, agent: spec.agent, task: spec.task, context: "fresh", cwd: ctx.cwd, model: MODEL, thinking: "off", artifacts: false, result: { kind: "text" }, binding };

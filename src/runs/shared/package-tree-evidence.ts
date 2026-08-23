@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 const MAX_TREE_ENTRIES = 32768;
-const MAX_TREE_BYTES = 128 * 1024 * 1024;
+const MAX_TREE_BYTES = 256 * 1024 * 1024;
 const MAX_PACKAGE_ROOTS = 512;
 
 export interface PackageTreeEvidence {
