@@ -236,9 +236,9 @@ function verifyRuntimeEvidence(): ReturnType<typeof attestBoundRuntimeExtensions
 
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
-	const available = new Set((pi.getAllTools() as Array<{ name?: string }>).map((tool) => tool.name).filter((name): name is string => typeof name === "string"));
+	const runtimeOwned = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...runtimeHolder.state.policy.internalTools]);
 	for (const name of runtimeHolder.state.policy.required) {
-		if (available.has(name)) continue;
+		if (runtimeOwned.has(name)) continue;
 		(pi.registerTool as unknown as (tool: unknown) => unknown)({
 			name, label: name, description: "Attested package tool awaiting session initialization.",
 			parameters: { type: "object", additionalProperties: true },
