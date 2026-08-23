@@ -252,6 +252,7 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 	  } catch {}
 	 }
 	}
+ try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "ALIAS host=" + String(hostNm) + " map=" + JSON.stringify(peerAlias) + "\n"); } catch {}
  const sharedDir = path.dirname(fileURLToPath(import.meta.url));
 	const runtimeEvidence = verifyRuntimeEvidence();
 	const evidenceRoots = verifyPackageEvidence();
