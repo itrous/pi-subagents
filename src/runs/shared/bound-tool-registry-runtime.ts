@@ -213,7 +213,7 @@ function verifyPackageEvidence(): string[] {
 		}
 		const resolutionRoots = new Set<string>();
 		for (const attestation of byRoot.values()) {
-			const evidence = packageTreeEvidence(attestation.path, attestation.evidenceRoot);
+			const evidence = packageTreeEvidence(attestation.path, attestation.evidenceRoot, attestation.evidenceRoot);
 			if (evidence.digest !== attestation.packageTreeDigest) throw new Error("package bytes drift");
 			for (const root of evidence.roots) resolutionRoots.add(root);
 		}

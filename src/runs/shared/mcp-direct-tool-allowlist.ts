@@ -208,6 +208,19 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 	const names: ResolvedMcpDirectToolSelection[] = [];
 	const seenNames = new Set<string>();
 	const { servers: selectedServers, tools: selectedTools } = parseSelections(envOverride);
+	const allCurrentCandidates = new Set<string>();
+	for (const [candidateServer, candidateDefinition] of Object.entries(config.mcpServers)) {
+		if (candidateDefinition.disabled === true) continue;
+		const candidateCache = cache.servers[candidateServer];
+		if (!isServerCacheValid(candidateCache, candidateDefinition)) continue;
+		const candidatePrefix = getToolPrefix(candidateDefinition.toolPrefix ?? prefix);
+		for (const tool of candidateCache.tools ?? []) if (typeof tool.name === "string" && (tool.uiVisibility === undefined || tool.uiVisibility.includes("model"))) {
+			for (const candidate of toolNameCandidates(tool.name, candidateServer, candidatePrefix, false)) allCurrentCandidates.add(candidate);
+		}
+		if (candidateDefinition.exposeResources !== false) for (const resource of candidateCache.resources ?? []) if (typeof resource.name === "string") {
+			for (const candidate of toolNameCandidates(`read_${resourceNameToToolName(resource.name)}`, candidateServer, candidatePrefix, false)) allCurrentCandidates.add(candidate);
+		}
+	}
 
 	for (const [serverName, definition] of Object.entries(config.mcpServers)) {
 		if (definition.disabled === true) continue;
@@ -224,7 +237,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 			if (typeof tool?.name !== "string" || !tool.name) continue;
 			if (tool.uiVisibility !== undefined && !tool.uiVisibility.includes("model")) continue;
 			if (toolFilter !== true && !toolFilter.has(tool.name)) continue;
-			if (!isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools)) continue;
+			if (!isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools, allCurrentCandidates)) continue;
 			const prefixedName = formatToolName(tool.name, serverName, effectivePrefix);
 			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
@@ -236,7 +249,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 			if (typeof resource?.name !== "string" || !resource.name || typeof resource.uri !== "string" || !resource.uri) continue;
 			const baseName = `read_${resourceNameToToolName(resource.name)}`;
 			if (toolFilter !== true && !toolFilter.has(baseName)) continue;
-			if (!isToolAllowed(baseName, serverName, effectivePrefix, definition.includeTools, definition.excludeTools)) continue;
+			if (!isToolAllowed(baseName, serverName, effectivePrefix, definition.includeTools, definition.excludeTools, allCurrentCandidates)) continue;
 			const prefixedName = formatToolName(baseName, serverName, effectivePrefix);
 			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
@@ -335,15 +348,52 @@ function globMatches(value: string, pattern: string): boolean {
 	return new RegExp(`^${escaped}$`, "u").test(value);
 }
 
-function matchesToolSelector(toolName: string, serverName: string, prefix: ToolPrefix, patterns: unknown): boolean {
-	if (!Array.isArray(patterns) || patterns.length === 0) return false;
-	const candidates = [toolName, formatToolName(toolName, serverName, prefix), formatToolName(toolName, serverName, "server"), formatToolName(toolName, serverName, "short"), formatToolName(toolName, serverName, "mcp")];
-	return patterns.some((pattern) => typeof pattern === "string" && candidates.some((candidate) => globMatches(candidate, pattern)));
+function legacyServerPrefix(serverName: string, mode: ToolPrefix): string {
+	const sanitize = (value: string) => Array.from(value, (char) => /^[A-Za-z0-9]$/.test(char) ? char : `_${char.codePointAt(0)!.toString(16)}_`).join("");
+	if (mode === "none") return "";
+	if (mode === "short") return sanitize(serverName.replace(/-?mcp$/i, "")) || "mcp";
+	if (mode === "mcp") return `mcp__${sanitize(serverName)}`;
+	return sanitize(serverName);
 }
 
-function isToolAllowed(toolName: string, serverName: string, prefix: ToolPrefix, includeTools: unknown, excludeTools: unknown): boolean {
-	const included = !Array.isArray(includeTools) || includeTools.length === 0 || matchesToolSelector(toolName, serverName, prefix, includeTools);
-	return included && !matchesToolSelector(toolName, serverName, prefix, excludeTools);
+function legacyToolName(toolName: string, serverName: string, prefix: ToolPrefix): string {
+	const serverPrefix = legacyServerPrefix(serverName, prefix);
+	const sanitized = toolName.replace(/[.-]/g, "_");
+	return serverPrefix ? `${serverPrefix}_${sanitized}` : sanitized;
+}
+
+function toolNameCandidates(toolName: string, serverName: string, prefix: ToolPrefix, includeLegacy = true): Set<string> {
+	const modes: ToolPrefix[] = [prefix, "server", "short", "mcp"];
+	const candidates = new Set<string>([toolName, ...modes.map((mode) => formatToolName(toolName, serverName, mode))]);
+	if (includeLegacy) {
+		const legacyName = toolName.replace(/-/g, "_");
+		candidates.add(legacyName);
+		for (const mode of modes) {
+			candidates.add(formatToolName(legacyName, serverName, mode));
+			candidates.add(legacyToolName(toolName, serverName, mode));
+			candidates.add(formatToolName(toolName, serverName, mode).replace(/-/g, "_"));
+		}
+	}
+	return candidates;
+}
+
+function matchesToolSelector(toolName: string, serverName: string, prefix: ToolPrefix, patterns: unknown, allCurrentCandidates: ReadonlySet<string>): boolean {
+	if (!Array.isArray(patterns) || patterns.length === 0) return false;
+	const current = toolNameCandidates(toolName, serverName, prefix, false);
+	const legacy = toolNameCandidates(toolName, serverName, prefix, true);
+	for (const candidate of current) legacy.delete(candidate);
+	for (const pattern of patterns) {
+		if (typeof pattern !== "string") continue;
+		if ([...current].some((candidate) => globMatches(candidate, pattern))) return true;
+		if (![...legacy].some((candidate) => globMatches(candidate, pattern))) continue;
+		if (![...allCurrentCandidates].some((candidate) => !current.has(candidate) && globMatches(candidate, pattern))) return true;
+	}
+	return false;
+}
+
+function isToolAllowed(toolName: string, serverName: string, prefix: ToolPrefix, includeTools: unknown, excludeTools: unknown, allCurrentCandidates: ReadonlySet<string>): boolean {
+	const included = !Array.isArray(includeTools) || includeTools.length === 0 || matchesToolSelector(toolName, serverName, prefix, includeTools, allCurrentCandidates);
+	return included && !matchesToolSelector(toolName, serverName, prefix, excludeTools, allCurrentCandidates);
 }
 
 function resourceNameToToolName(name: string): string {

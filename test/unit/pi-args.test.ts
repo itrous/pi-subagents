@@ -1021,6 +1021,34 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.equal(args[args.indexOf("--tools") + 1], "read,git-hub_foo-bar");
 	});
 
+	it("supports non-colliding legacy adapter filter aliases", () => {
+		const fixture = createMcpFixture();
+		writeMcpFixture(fixture, {
+			serverName: "git-hub",
+			definition: { excludeTools: ["git_hub_foo_bar"] },
+			tools: [{ name: "foo-bar" }],
+		});
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"], task: "hello", sessionEnabled: false,
+			inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["git-hub"],
+		});
+		assert.equal(args[args.indexOf("--tools") + 1], "read");
+	});
+
+	it("does not apply a legacy alias that collides with another current tool", () => {
+		const fixture = createMcpFixture();
+		writeMcpFixture(fixture, {
+			serverName: "git-hub",
+			definition: { excludeTools: ["git-hub_foo_bar"] },
+			tools: [{ name: "foo-bar" }, { name: "foo_bar" }],
+		});
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"], task: "hello", sessionEnabled: false,
+			inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["git-hub"],
+		});
+		assert.equal(args[args.indexOf("--tools") + 1], "read,git-hub_foo-bar");
+	});
+
 	it("matches adapter prefix modes for direct MCP names", () => {
 		for (const [prefix, expected] of [
 			["server", "read,linear-mcp_list_issues"],

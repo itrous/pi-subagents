@@ -118,7 +118,7 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 	const treeDigestByRoot = new Map<string, string>();
 	const treeDigest = (entry: string, evidenceRoot: string): string => {
 		const cached = treeDigestByRoot.get(evidenceRoot); if (cached) return cached;
-		const measured = packageTreeDigest(entry, evidenceRoot); treeDigestByRoot.set(evidenceRoot, measured); return measured;
+		const measured = packageTreeDigest(entry, evidenceRoot, owner.rootPath); treeDigestByRoot.set(evidenceRoot, measured); return measured;
 	};
 	for (const ref of refs) {
 		if (typeof ref !== "string") throw new Error("Invalid active-bound extension ref.");

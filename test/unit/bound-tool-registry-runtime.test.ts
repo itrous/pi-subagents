@@ -22,7 +22,7 @@ function policy(packageExtensionPaths: string[] = [], modelApi = "openai-respons
 	process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
 	const packageExtensions = packageExtensionPaths.map((entry) => {
 		const evidenceRoot = packageEvidenceRoot(path.dirname(entry));
-		return { path: entry, contentDigest: createHash("sha256").update(fs.readFileSync(entry)).digest("hex"), evidenceRoot, evidenceRootDigest: createHash("sha256").update(evidenceRoot).digest("hex"), packageTreeDigest: packageTreeDigest(entry, evidenceRoot) };
+		return { path: entry, contentDigest: createHash("sha256").update(fs.readFileSync(entry)).digest("hex"), evidenceRoot, evidenceRootDigest: createHash("sha256").update(evidenceRoot).digest("hex"), packageTreeDigest: packageTreeDigest(entry, evidenceRoot, evidenceRoot) };
 	});
 	const sharedDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../src/runs/shared");
 	const runtimeExtensions = attestBoundRuntimeExtensions([
@@ -193,9 +193,17 @@ describe("bound tool registry child runtime", () => {
 		fs.writeFileSync(path.join(dependency, "index.ts"), "export default function () {}\n");
 		fs.writeFileSync(path.join(ambientPeer, "package.json"), JSON.stringify({ name: "ambient-peer" }));
 		fs.writeFileSync(path.join(ambientPeer, "index.js"), "globalThis.ambientPeerExecuted = true;\n");
-		const evidence = packageTreeEvidence(path.join(dependency, "index.ts"), owner);
+		const evidence = packageTreeEvidence(path.join(dependency, "index.ts"), owner, owner);
 		assert.equal(evidence.roots.includes(ambientPeer), false);
 		fs.rmSync(parent, { recursive: true, force: true });
+	});
+
+	it("rejects traversal segments in dependency names", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-dependency-traversal-"));
+		fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "owner", dependencies: { "../../ambient": "1" } }));
+		fs.writeFileSync(path.join(root, "index.ts"), "export default function () {}\n");
+		assert.throws(() => packageTreeEvidence(path.join(root, "index.ts"), root, root), /Invalid package dependency name/);
+		fs.rmSync(root, { recursive: true, force: true });
 	});
 
 	it("rejects package imports which escape the attested resolution root", async () => {
