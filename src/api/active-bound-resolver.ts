@@ -104,6 +104,7 @@ export type ResolveActiveBoundLaunchContractResult =
 	| { ok: false; code: ActiveBoundResolutionErrorCode };
 
 function failure(code: ActiveBoundResolutionErrorCode): ResolveActiveBoundLaunchContractResult {
+	console.error("ABFAIL", code, new Error().stack?.split("\n").slice(1, 4).join(" | "));
 	return { ok: false, code } as ResolveActiveBoundLaunchContractResult;
 }
 function fileDigest(filePath: string): string {
