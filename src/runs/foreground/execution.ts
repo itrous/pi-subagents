@@ -5,7 +5,7 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import type { Readable } from "node:stream";
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, realpathSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
@@ -57,7 +57,7 @@ import {
 import { buildBoundSkillInjection, buildSkillInjection, resolveProjectSkillsUncached, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
-import { getPiSpawnCommand, resolvePiPackageRoot } from "../shared/pi-spawn.ts";
+import { findPiPackageRootFromEntry, getPiSpawnCommand, PI_SUBAGENT_PI_BINARY_ENV, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../shared/pi-spawn.ts";
 import { attestPiSpawnCommand } from "../shared/pi-command-evidence.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
@@ -597,7 +597,12 @@ async function runSingleAttempt(
 	const toolRegistryProofNonce = options.activeBoundToolRegistry ? randomBytes(32).toString("hex") : undefined;
 	if (options.activeBoundToolRegistry) {
 		spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
-		const piPackageRoot = resolvePiPackageRoot();
+		let piPackageRoot: string | undefined;
+		try {
+			const configuredPiBinary = process.env[PI_SUBAGENT_PI_BINARY_ENV]?.trim();
+			piPackageRoot = configuredPiBinary ? findPiPackageRootFromEntry(realpathSync(configuredPiBinary)) : undefined;
+		} catch {}
+		piPackageRoot ??= resolvePiPackageRoot() ?? resolveInstalledPiPackageRoot();
 		if (piPackageRoot) spawnEnv[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV] = path.join(piPackageRoot, "node_modules");
 		spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
 			...options.activeBoundToolRegistry,
