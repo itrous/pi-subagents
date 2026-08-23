@@ -114,8 +114,8 @@ fs.writeFileSync(path.join(ownerDir, "package.json"), JSON.stringify({
 }, null, 2));
 const leaf = (name, taskMarker, extra) => fs.writeFileSync(path.join(ownerDir, "agents", `${name}.md`),
 	`---\nname: "${name}"\ndescription: "${name} leaf"\ndefaultContext: fresh\nmodel: "probe/child"\nthinking: off\ntools: read${extra}\n---\n${taskMarker}\n`);
-leaf("rel-leaf", "REL_OK", ", ref_tool\nsubagentOnlyExtensions: ./ext/ref.ts");
-leaf("dep-leaf", "DEP_OK", ", dep_tool\nsubagentOnlyExtensions: package:a1dep");
+leaf("rel-leaf", "REL_OK", "\nsubagentOnlyExtensions: ./ext/ref.ts");
+leaf("dep-leaf", "DEP_OK", "\nsubagentOnlyExtensions: package:a1dep");
 fs.mkdirSync(path.join(ownerDir, "agents", "ext"), { recursive: true });
 fs.writeFileSync(path.join(ownerDir, "agents", "ext", "ref.ts"),
 	'export default function refExtension(pi: any) {\n\tpi.registerTool({ name: "ref_tool", label: "ref", description: "ref tool", parameters: { type: "object", properties: {}, required: [] }, async execute() { return { content: [], details: {} }; } });\n}\n');
@@ -206,8 +206,8 @@ const resultText = toolResult.content?.map((c) => c.text).join("\n");
 assert.equal(resultText, "PKG_PROJECTION_OK", resultText);
 assert.deepEqual(toolResult.details?.statuses, { "rel-leaf": "completed", "dep-leaf": "completed" });
 assert.ok(parsedRequests >= 2, `expected at least two provider requests, got ${parsedRequests}`);
-assert.ok(bodies.get("REL_0")?.wireNames.includes("ref_tool"), "rel_tool missing from provider wire");
-assert.ok(bodies.get("DEP_0")?.wireNames.includes("dep_tool"), "dep_tool missing from provider wire");
+assert.equal(bodies.get("REL_0")?.wireNames.includes("ref_tool"), false, "dormant rel tool leaked into provider wire");
+assert.equal(bodies.get("DEP_0")?.wireNames.includes("dep_tool"), false, "dormant dep tool leaked into provider wire");
 
 try {
 	await created.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
