@@ -158,11 +158,9 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 			if (runtimeHolder.state?.barrierCommitted) packageMutationExit();
 			const packageName = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
 			if (typeof packageName !== "string" || !packageName) packageMutationExit();
-			const normalized = packageName.replace(/[.-]/g, "_");
-			const name = runtimeHolder.state?.policy.required.includes(normalized) ? normalized : packageName;
+			const name = packageName;
 			if (occupiedToolNames.has(name)) packageMutationExit();
-			const projectedTool = name === packageName ? tool : { ...(tool as Record<string, unknown>), name };
-			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(projectedTool));
+			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(tool));
 			runtimeHolder.state?.placeholderTools.delete(name);
 			occupiedToolNames.add(name);
 			return result;

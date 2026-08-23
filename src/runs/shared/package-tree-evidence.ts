@@ -23,7 +23,7 @@ function manifestAt(root: string): { bytes: Buffer; value: Record<string, unknow
 	return { bytes, value: value as Record<string, unknown> };
 }
 
-function resolvedPackageRoot(fromRoot: string, packageName: string): string | undefined {
+function resolvedPackageRoot(fromRoot: string, packageName: string, ownerRoot: string): string | undefined {
 	const parts = packageName.split("/"); let current = fromRoot;
 	while (true) {
 		const candidate = path.join(current, "node_modules", ...parts);
@@ -32,7 +32,7 @@ function resolvedPackageRoot(fromRoot: string, packageName: string): string | un
 			if (canonical !== candidate || manifestAt(canonical).value.name !== packageName) throw new Error("Unsafe package evidence dependency root.");
 			return canonical;
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-		const parent = path.dirname(current); if (parent === current) return undefined; current = parent;
+		const parent = path.dirname(current); if (current === ownerRoot || parent === current) return undefined; current = parent;
 	}
 }
 
@@ -54,7 +54,7 @@ export function packageTreeEvidence(entryPath: string, packageRoot: string): Pac
 			const dependencies = manifest[field]; if (dependencies === undefined) continue;
 			if (!dependencies || typeof dependencies !== "object" || Array.isArray(dependencies)) throw new Error("Invalid package dependency evidence.");
 			for (const packageName of Object.keys(dependencies as Record<string, unknown>).sort()) {
-				const dependencyRoot = resolvedPackageRoot(current, packageName);
+				const dependencyRoot = resolvedPackageRoot(current, packageName, root);
 				if (dependencyRoot) pendingRoots.push(dependencyRoot);
 				else if (field === "dependencies") throw new Error(`Missing package evidence dependency: ${packageName}`);
 			}

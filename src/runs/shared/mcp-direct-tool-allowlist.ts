@@ -39,6 +39,7 @@ interface ServerEntry {
 	exposeResources?: boolean;
 	includeTools?: string[];
 	excludeTools?: string[];
+	disabled?: boolean;
 	protocolVersion?: string;
 	directTools?: boolean | string[];
 	toolPrefix?: ToolPrefix;
@@ -55,6 +56,7 @@ interface McpConfig {
 
 interface CachedTool {
 	name?: string;
+	uiVisibility?: Array<"model" | "app">;
 }
 
 interface CachedResource {
@@ -208,6 +210,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 	const { servers: selectedServers, tools: selectedTools } = parseSelections(envOverride);
 
 	for (const [serverName, definition] of Object.entries(config.mcpServers)) {
+		if (definition.disabled === true) continue;
 		const effectivePrefix = getToolPrefix(definition.toolPrefix ?? prefix);
 		const serverCache = cache.servers[serverName];
 		if (!isServerCacheValid(serverCache, definition)) continue;
@@ -219,8 +222,9 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 
 		for (const tool of Array.isArray(serverCache.tools) ? serverCache.tools : []) {
 			if (typeof tool?.name !== "string" || !tool.name) continue;
+			if (tool.uiVisibility !== undefined && !tool.uiVisibility.includes("model")) continue;
 			if (toolFilter !== true && !toolFilter.has(tool.name)) continue;
-			if (isToolExcluded(tool.name, serverName, effectivePrefix, definition.excludeTools)) continue;
+			if (!isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools)) continue;
 			const prefixedName = formatToolName(tool.name, serverName, effectivePrefix);
 			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
@@ -232,7 +236,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 			if (typeof resource?.name !== "string" || !resource.name || typeof resource.uri !== "string" || !resource.uri) continue;
 			const baseName = `read_${resourceNameToToolName(resource.name)}`;
 			if (toolFilter !== true && !toolFilter.has(baseName)) continue;
-			if (isToolExcluded(baseName, serverName, effectivePrefix, definition.excludeTools)) continue;
+			if (!isToolAllowed(baseName, serverName, effectivePrefix, definition.includeTools, definition.excludeTools)) continue;
 			const prefixedName = formatToolName(baseName, serverName, effectivePrefix);
 			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
@@ -310,7 +314,7 @@ function isImportKind(value: unknown): value is ImportKind {
 }
 
 function sanitizeServerPrefix(serverName: string): string {
-	return Array.from(serverName, (char) => /^[A-Za-z0-9_-]$/.test(char) ? char : `_${char.codePointAt(0)!.toString(16)}_`).join("").replace(/-/g, "_");
+	return Array.from(serverName, (char) => /^[A-Za-z0-9_-]$/.test(char) ? char : `_${char.codePointAt(0)!.toString(16)}_`).join("");
 }
 
 function getServerPrefix(serverName: string, mode: ToolPrefix): string {
@@ -322,23 +326,24 @@ function getServerPrefix(serverName: string, mode: ToolPrefix): string {
 
 function formatToolName(toolName: string, serverName: string, prefix: ToolPrefix): string {
 	const serverPrefix = getServerPrefix(serverName, prefix);
-	const sanitized = toolName.replace(/[.-]/g, "_");
+	const sanitized = toolName.replace(/\./g, "_");
 	return serverPrefix ? `${serverPrefix}_${sanitized}` : sanitized;
 }
 
-function isToolExcluded(toolName: string, serverName: string, prefix: ToolPrefix, excludeTools: unknown): boolean {
-	if (!Array.isArray(excludeTools) || excludeTools.length === 0) return false;
-	const candidates = new Set([
-		normalizeToolName(toolName),
-		normalizeToolName(formatToolName(toolName, serverName, prefix)),
-		normalizeToolName(formatToolName(toolName, serverName, "server")),
-		normalizeToolName(formatToolName(toolName, serverName, "short")),
-	]);
-	return excludeTools.some((excluded) => typeof excluded === "string" && candidates.has(normalizeToolName(excluded)));
+function globMatches(value: string, pattern: string): boolean {
+	const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+	return new RegExp(`^${escaped}$`, "u").test(value);
 }
 
-function normalizeToolName(value: string): string {
-	return value.replace(/-/g, "_");
+function matchesToolSelector(toolName: string, serverName: string, prefix: ToolPrefix, patterns: unknown): boolean {
+	if (!Array.isArray(patterns) || patterns.length === 0) return false;
+	const candidates = [toolName, formatToolName(toolName, serverName, prefix), formatToolName(toolName, serverName, "server"), formatToolName(toolName, serverName, "short"), formatToolName(toolName, serverName, "mcp")];
+	return patterns.some((pattern) => typeof pattern === "string" && candidates.some((candidate) => globMatches(candidate, pattern)));
+}
+
+function isToolAllowed(toolName: string, serverName: string, prefix: ToolPrefix, includeTools: unknown, excludeTools: unknown): boolean {
+	const included = !Array.isArray(includeTools) || includeTools.length === 0 || matchesToolSelector(toolName, serverName, prefix, includeTools);
+	return included && !matchesToolSelector(toolName, serverName, prefix, excludeTools);
 }
 
 function resourceNameToToolName(name: string): string {

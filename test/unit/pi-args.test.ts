@@ -869,7 +869,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		assert.equal(
 			args[args.indexOf("--tools") + 1],
-			"read,bash,chrome_devtools_take_screenshot,chrome_devtools_click",
+			"read,bash,chrome-devtools_take_screenshot,chrome-devtools_click",
 		);
 		assert.equal(env.MCP_DIRECT_TOOLS, "chrome-devtools");
 		assert.equal(
@@ -877,15 +877,15 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			JSON.stringify([
 				"read",
 				"bash",
-				"chrome_devtools_take_screenshot",
-				"chrome_devtools_click",
+				"chrome-devtools_take_screenshot",
+				"chrome-devtools_click",
 			]),
 		);
 		assert.equal(
 			env[MCP_DIRECT_CHILD_TOOLS_ENV],
 			JSON.stringify([
-				"chrome_devtools_take_screenshot",
-				"chrome_devtools_click",
+				"chrome-devtools_take_screenshot",
+				"chrome-devtools_click",
 			]),
 		);
 	});
@@ -947,7 +947,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 			assert.equal(
 				args[args.indexOf("--tools") + 1],
-				"chrome_devtools_take_screenshot,chrome_devtools_click",
+				"chrome-devtools_take_screenshot,chrome-devtools_click",
 			);
 			assert.equal(env.MCP_DIRECT_TOOLS, "chrome-devtools");
 		}
@@ -1002,12 +1002,31 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		);
 	});
 
+	it("matches adapter filtering, visibility, and punctuation", () => {
+		const fixture = createMcpFixture();
+		writeMcpFixture(fixture, {
+			serverName: "git-hub",
+			definition: { includeTools: ["foo-*"] },
+			tools: [
+				{ name: "foo-bar" },
+				{ name: "foo.hidden", uiVisibility: ["app"] } as any,
+				{ name: "blocked" },
+			],
+		});
+		const { args } = buildPiArgs({
+			baseArgs: ["-p"], task: "hello", sessionEnabled: false,
+			inheritProjectContext: false, inheritSkills: false, tools: ["read"],
+			mcpDirectTools: ["git-hub"],
+		});
+		assert.equal(args[args.indexOf("--tools") + 1], "read,git-hub_foo-bar");
+	});
+
 	it("matches adapter prefix modes for direct MCP names", () => {
 		for (const [prefix, expected] of [
-			["server", "read,linear_mcp_list_issues"],
+			["server", "read,linear-mcp_list_issues"],
 			["short", "read,linear_list_issues"],
 			["none", "read,list_issues"],
-			["mcp", "read,mcp__linear_mcp_list_issues"],
+			["mcp", "read,mcp__linear-mcp_list_issues"],
 		] as const) {
 			const fixture = createMcpFixture();
 			writeMcpFixture(fixture, {
@@ -1051,7 +1070,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		assert.equal(
 			args[args.indexOf("--tools") + 1],
-			"read,browser_mcp_navigate,browser_mcp_read_console_logs",
+			"read,browser-mcp_navigate,browser-mcp_read_console_logs",
 		);
 	});
 
@@ -1116,7 +1135,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			cwd: fixture.projectDir,
 		});
 
-		assert.equal(args[args.indexOf("--tools") + 1], "read,project_mcp_inspect");
+		assert.equal(args[args.indexOf("--tools") + 1], "read,project-mcp_inspect");
 	});
 
 	it("keeps tool extension paths when explicit extensions are allowlisted", () => {
@@ -1139,7 +1158,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		);
 		assert.equal(
 			args[args.indexOf("--tools") + 1],
-			"read,chrome_devtools_take_screenshot",
+			"read,chrome-devtools_take_screenshot",
 		);
 		assert.ok(
 			extensionArgs.some((arg) =>

@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { attestBoundRuntimeExtensions } from "../../src/runs/shared/bound-runtime-evidence.ts";
-import { packageEvidenceRoot, packageTreeDigest } from "../../src/runs/shared/package-tree-evidence.ts";
+import { packageEvidenceRoot, packageTreeDigest, packageTreeEvidence } from "../../src/runs/shared/package-tree-evidence.ts";
 import {
 	BOUND_TOOL_REGISTRY_ACTIVE_ENV,
 	BOUND_TOOL_REGISTRY_FD_ENV,
@@ -179,6 +179,23 @@ describe("bound tool registry child runtime", () => {
 		assert.deepEqual(events, []); // адаптерный input-hook не получает доступ к prompt payload
 		fs.closeSync(fd);
 		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it("does not attest ambient peers above the owner package root", () => {
+		const parent = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-ambient-peer-"));
+		const owner = path.join(parent, "owner");
+		const dependency = path.join(owner, "node_modules", "dep");
+		const ambientPeer = path.join(parent, "node_modules", "ambient-peer");
+		fs.mkdirSync(dependency, { recursive: true });
+		fs.mkdirSync(ambientPeer, { recursive: true });
+		fs.writeFileSync(path.join(owner, "package.json"), JSON.stringify({ name: "owner", dependencies: { dep: "1.0.0" } }));
+		fs.writeFileSync(path.join(dependency, "package.json"), JSON.stringify({ name: "dep", peerDependencies: { "ambient-peer": "*" } }));
+		fs.writeFileSync(path.join(dependency, "index.ts"), "export default function () {}\n");
+		fs.writeFileSync(path.join(ambientPeer, "package.json"), JSON.stringify({ name: "ambient-peer" }));
+		fs.writeFileSync(path.join(ambientPeer, "index.js"), "globalThis.ambientPeerExecuted = true;\n");
+		const evidence = packageTreeEvidence(path.join(dependency, "index.ts"), owner);
+		assert.equal(evidence.roots.includes(ambientPeer), false);
+		fs.rmSync(parent, { recursive: true, force: true });
 	});
 
 	it("rejects package imports which escape the attested resolution root", async () => {
