@@ -5,7 +5,7 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import type { Readable } from "node:stream";
-import { existsSync, realpathSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, realpathSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
@@ -1318,7 +1318,7 @@ async function runSingleAttempt(
 			if (code !== 0 && rawStdout.trim() && !closeError && !forcedDrainAfterFinalSuccess) {
 				closeError = rawStdout.trim();
 			}
-			{ try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD-EXIT status=" + result.status + " sig=" + signal + " diag=" + String(toolDiagnosticError).slice(0,200) + " err=" + String(result.error).slice(0,300) + "\nSTDERR[" + stderr.slice(-1200) + "]\nSTDOUT[" + rawStdout.slice(-400) + "]\n"); } catch {} }
+			{ try { appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD-EXIT status=" + result.status + " sig=" + signal + " diag=" + String(toolDiagnosticError).slice(0,200) + " err=" + String(result.error).slice(0,300) + "\nSTDERR[" + stderr.slice(-1200) + "]\nSTDOUT[" + rawStdout.slice(-400) + "]\n"); } catch {} }
 			if (code !== 0 && stderr.trim() && !closeError && !forcedDrainAfterFinalSuccess) {
 				closeError = stderr.trim();
 			}
