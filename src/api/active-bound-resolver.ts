@@ -246,7 +246,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 			candidate.activeBoundResolvedExtensions = extensions.paths;
 			candidate.activeBoundExtensionProjection = extensions.projection;
 		}
-	} catch { return failure("unsupported_mode"); }
+	} catch (error) { console.error("ABDISCOVER", error); return failure("unsupported_mode"); }
 	const resolved = resolveAgentName(input.request.agent, discovered.agents);
 	if (resolved.error) return failure("ambiguous_agent");
 	if (!resolved.agent) return failure("missing_agent");
