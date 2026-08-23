@@ -104,7 +104,6 @@ export type ResolveActiveBoundLaunchContractResult =
 	| { ok: false; code: ActiveBoundResolutionErrorCode };
 
 function failure(code: ActiveBoundResolutionErrorCode): ResolveActiveBoundLaunchContractResult {
-	console.error("ABFAIL", code, new Error().stack?.split("\n").slice(1, 4).join(" | "));
 	return { ok: false, code } as ResolveActiveBoundLaunchContractResult;
 }
 function fileDigest(filePath: string): string {
@@ -246,7 +245,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 			candidate.activeBoundResolvedExtensions = extensions.paths;
 			candidate.activeBoundExtensionProjection = extensions.projection;
 		}
-	} catch (error) { console.error("ABDISCOVER", error); return failure("unsupported_mode"); }
+	} catch { return failure("unsupported_mode"); }
 	const resolved = resolveAgentName(input.request.agent, discovered.agents);
 	if (resolved.error) return failure("ambiguous_agent");
 	if (!resolved.agent) return failure("missing_agent");

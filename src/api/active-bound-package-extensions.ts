@@ -139,7 +139,7 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 		const entries = (pi as { extensions?: unknown }).extensions;
 		if (!Array.isArray(entries) || entries.length !== 1 || typeof entries[0] !== "string" || !safeManifestEntry(entries[0], dependency.identity.rootPath)) throw new Error("Ambiguous active-bound dependency extension entry.");
 		const entry = regularCanonicalFile(path.resolve(dependency.identity.rootPath, entries[0]), dependency.identity.rootPath);
-		const evidenceRoot = packageEvidenceRoot(dependency.identity.rootPath);
+		const evidenceRoot = packageEvidenceRoot(owner.rootPath);
 		paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "package", ref, owner: publicIdentity(owner), package: publicIdentity(dependency.identity), entryDigest: digest(entries[0]), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 	}
 	if (new Set(paths).size !== paths.length) throw new Error("Duplicate active-bound extension entry.");

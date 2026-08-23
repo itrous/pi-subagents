@@ -235,6 +235,21 @@ function verifyRuntimeEvidence(): ReturnType<typeof attestBoundRuntimeExtensions
 	return runtimeEvidence;
 }
 
+function packageNameForEntry(entry: string, evidenceRoot: string): string | undefined {
+	let current = path.dirname(entry);
+	while (within(evidenceRoot, current)) {
+		try {
+			const manifest = JSON.parse(fs.readFileSync(path.join(current, "package.json"), "utf8")) as { name?: unknown };
+			return typeof manifest.name === "string" ? manifest.name : undefined;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+		}
+		if (current === evidenceRoot) break;
+		current = path.dirname(current);
+	}
+	return undefined;
+}
+
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
 	const runtimeOwned = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...runtimeHolder.state.policy.internalTools]);
@@ -273,8 +288,7 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		if (typeof factory !== "function") protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		try {
-			const manifest = JSON.parse(fs.readFileSync(path.join(attestation.evidenceRoot, "package.json"), "utf8")) as { name?: unknown };
-			runtimeHolder.state!.allowInputRegistrationNoop = manifest.name === "pi-mcp-adapter";
+			runtimeHolder.state!.allowInputRegistrationNoop = packageNameForEntry(attestation.path, attestation.evidenceRoot) === "pi-mcp-adapter";
 			await factory(mediated);
 		}
 		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
