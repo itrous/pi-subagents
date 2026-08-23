@@ -3,12 +3,18 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 const MAX_TREE_ENTRIES = 32768;
-const MAX_TREE_BYTES = 128 * 1024 * 1024;
+const MAX_TREE_BYTES = 256 * 1024 * 1024;
 const MAX_PACKAGE_ROOTS = 512;
+const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/[a-z0-9][a-z0-9._~-]*|[a-z0-9][a-z0-9._~-]*)$/u;
 
 export interface PackageTreeEvidence {
 	digest: string;
 	roots: string[];
+}
+
+function withinBoundary(root: string, target: string): boolean {
+	const relative = path.relative(root, target);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
 /** Package root supplied by owner/dependency attestation, not a whole npm ecosystem. */
@@ -23,7 +29,8 @@ function manifestAt(root: string): { bytes: Buffer; value: Record<string, unknow
 	return { bytes, value: value as Record<string, unknown> };
 }
 
-function resolvedPackageRoot(fromRoot: string, packageName: string): string | undefined {
+function resolvedPackageRoot(fromRoot: string, packageName: string, resolutionBoundary: string): string | undefined {
+	if (!PACKAGE_NAME.test(packageName)) throw new Error("Invalid package dependency name.");
 	const parts = packageName.split("/"); let current = fromRoot;
 	while (true) {
 		const candidate = path.join(current, "node_modules", ...parts);
@@ -32,13 +39,15 @@ function resolvedPackageRoot(fromRoot: string, packageName: string): string | un
 			if (canonical !== candidate || manifestAt(canonical).value.name !== packageName) throw new Error("Unsafe package evidence dependency root.");
 			return canonical;
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-		const parent = path.dirname(current); if (parent === current) return undefined; current = parent;
+		const parent = path.dirname(current); if (current === resolutionBoundary || parent === current) return undefined; current = parent;
 	}
 }
 
 /** Hash exactly the package and declared runtime dependency closure Node may execute. */
-export function packageTreeEvidence(entryPath: string, packageRoot: string): PackageTreeEvidence {
+export function packageTreeEvidence(entryPath: string, packageRoot: string, boundedResolutionRoot?: string): PackageTreeEvidence {
 	const root = path.resolve(packageRoot); const entry = path.resolve(entryPath);
+	const resolutionBoundary = boundedResolutionRoot === undefined ? path.parse(root).root : path.resolve(boundedResolutionRoot);
+	if (!withinBoundary(resolutionBoundary, root)) throw new Error("Package evidence root escapes its resolution boundary.");
 	const relativeEntry = path.relative(root, entry);
 	if (relativeEntry === ".." || relativeEntry.startsWith(`..${path.sep}`) || path.isAbsolute(relativeEntry)) throw new Error("Package entry escapes its package root.");
 	const roots = new Set<string>(); const pendingRoots = [root];
@@ -54,7 +63,7 @@ export function packageTreeEvidence(entryPath: string, packageRoot: string): Pac
 			const dependencies = manifest[field]; if (dependencies === undefined) continue;
 			if (!dependencies || typeof dependencies !== "object" || Array.isArray(dependencies)) throw new Error("Invalid package dependency evidence.");
 			for (const packageName of Object.keys(dependencies as Record<string, unknown>).sort()) {
-				const dependencyRoot = resolvedPackageRoot(current, packageName);
+				const dependencyRoot = resolvedPackageRoot(current, packageName, resolutionBoundary);
 				if (dependencyRoot) pendingRoots.push(dependencyRoot);
 				else if (field === "dependencies") throw new Error(`Missing package evidence dependency: ${packageName}`);
 			}
@@ -87,6 +96,6 @@ export function packageTreeEvidence(entryPath: string, packageRoot: string): Pac
 	return { digest: hash.digest("hex"), roots: orderedRoots };
 }
 
-export function packageTreeDigest(entryPath: string, packageRoot: string): string {
-	return packageTreeEvidence(entryPath, packageRoot).digest;
+export function packageTreeDigest(entryPath: string, packageRoot: string, boundedResolutionRoot?: string): string {
+	return packageTreeEvidence(entryPath, packageRoot, boundedResolutionRoot).digest;
 }

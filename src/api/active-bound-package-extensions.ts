@@ -117,8 +117,10 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 	const owner = agent.activeBoundPackageOwner; const paths: string[] = []; const projection: ActiveBoundPackageExtensionProjectionV1[] = []; const evidenceRootByPath = new Map<string, string>();
 	const treeDigestByRoot = new Map<string, string>();
 	const treeDigest = (entry: string, evidenceRoot: string): string => {
+		const relative = path.relative(evidenceRoot, entry);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Package entry escapes its package root.");
 		const cached = treeDigestByRoot.get(evidenceRoot); if (cached) return cached;
-		const measured = packageTreeDigest(entry, evidenceRoot); treeDigestByRoot.set(evidenceRoot, measured); return measured;
+		const measured = packageTreeDigest(entry, evidenceRoot, owner.rootPath); treeDigestByRoot.set(evidenceRoot, measured); return measured;
 	};
 	for (const ref of refs) {
 		if (typeof ref !== "string") throw new Error("Invalid active-bound extension ref.");
@@ -139,7 +141,7 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 		const entries = (pi as { extensions?: unknown }).extensions;
 		if (!Array.isArray(entries) || entries.length !== 1 || typeof entries[0] !== "string" || !safeManifestEntry(entries[0], dependency.identity.rootPath)) throw new Error("Ambiguous active-bound dependency extension entry.");
 		const entry = regularCanonicalFile(path.resolve(dependency.identity.rootPath, entries[0]), dependency.identity.rootPath);
-		const evidenceRoot = packageEvidenceRoot(dependency.identity.rootPath);
+		const evidenceRoot = packageEvidenceRoot(owner.rootPath);
 		paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "package", ref, owner: publicIdentity(owner), package: publicIdentity(dependency.identity), entryDigest: digest(entries[0]), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 	}
 	if (new Set(paths).size !== paths.length) throw new Error("Duplicate active-bound extension entry.");

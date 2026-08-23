@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { attestBoundRuntimeExtensions } from "../../src/runs/shared/bound-runtime-evidence.ts";
-import { packageEvidenceRoot, packageTreeDigest } from "../../src/runs/shared/package-tree-evidence.ts";
+import { packageEvidenceRoot, packageTreeDigest, packageTreeEvidence } from "../../src/runs/shared/package-tree-evidence.ts";
 import {
 	BOUND_TOOL_REGISTRY_ACTIVE_ENV,
 	BOUND_TOOL_REGISTRY_FD_ENV,
@@ -22,7 +22,7 @@ function policy(packageExtensionPaths: string[] = [], modelApi = "openai-respons
 	process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
 	const packageExtensions = packageExtensionPaths.map((entry) => {
 		const evidenceRoot = packageEvidenceRoot(path.dirname(entry));
-		return { path: entry, contentDigest: createHash("sha256").update(fs.readFileSync(entry)).digest("hex"), evidenceRoot, evidenceRootDigest: createHash("sha256").update(evidenceRoot).digest("hex"), packageTreeDigest: packageTreeDigest(entry, evidenceRoot) };
+		return { path: entry, contentDigest: createHash("sha256").update(fs.readFileSync(entry)).digest("hex"), evidenceRoot, evidenceRootDigest: createHash("sha256").update(evidenceRoot).digest("hex"), packageTreeDigest: packageTreeDigest(entry, evidenceRoot, evidenceRoot) };
 	});
 	const sharedDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../src/runs/shared");
 	const runtimeExtensions = attestBoundRuntimeExtensions([
@@ -167,10 +167,42 @@ describe("bound tool registry child runtime", () => {
 		process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(policy([extension]));
 		process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
 		initializeBoundToolRegistryBootstrap();
-		const registered: string[] = [];
-		await loadBoundPackageFactories({ on() { throw new Error("input hook must not be delegated"); }, registerTool(tool: { name: string }) { registered.push(tool.name); } } as any);
-		assert.deepEqual(registered, ["a"]);
+		const registered = new Map<string, unknown>();
+		const registrations: string[] = [];
+		const events: string[] = [];
+		await loadBoundPackageFactories({
+			on(event: string) { events.push(event); },
+			registerTool(tool: { name: string }) { registrations.push(tool.name); registered.set(tool.name, tool); },
+		} as any);
+		assert.deepEqual(registrations, ["a", "a"]); // fail-closed placeholder, затем реальная фабрика
+		assert.deepEqual([...registered.keys()], ["a"]);
+		assert.deepEqual(events, []); // адаптерный input-hook не получает доступ к prompt payload
 		fs.closeSync(fd);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it("does not attest ambient peers above the owner package root", () => {
+		const parent = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-ambient-peer-"));
+		const owner = path.join(parent, "owner");
+		const dependency = path.join(owner, "node_modules", "dep");
+		const ambientPeer = path.join(parent, "node_modules", "ambient-peer");
+		fs.mkdirSync(dependency, { recursive: true });
+		fs.mkdirSync(ambientPeer, { recursive: true });
+		fs.writeFileSync(path.join(owner, "package.json"), JSON.stringify({ name: "owner", dependencies: { dep: "1.0.0" } }));
+		fs.writeFileSync(path.join(dependency, "package.json"), JSON.stringify({ name: "dep", peerDependencies: { "ambient-peer": "*" } }));
+		fs.writeFileSync(path.join(dependency, "index.ts"), "export default function () {}\n");
+		fs.writeFileSync(path.join(ambientPeer, "package.json"), JSON.stringify({ name: "ambient-peer" }));
+		fs.writeFileSync(path.join(ambientPeer, "index.js"), "globalThis.ambientPeerExecuted = true;\n");
+		const evidence = packageTreeEvidence(path.join(dependency, "index.ts"), owner, owner);
+		assert.equal(evidence.roots.includes(ambientPeer), false);
+		fs.rmSync(parent, { recursive: true, force: true });
+	});
+
+	it("rejects traversal segments in dependency names", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-dependency-traversal-"));
+		fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "owner", dependencies: { "../../ambient": "1" } }));
+		fs.writeFileSync(path.join(root, "index.ts"), "export default function () {}\n");
+		assert.throws(() => packageTreeEvidence(path.join(root, "index.ts"), root, root), /Invalid package dependency name/);
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
@@ -185,10 +217,32 @@ describe("bound tool registry child runtime", () => {
 		process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(policy([extension]));
 		process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
 		const originalExit = process.exit; (process as any).exit = (code: number) => { throw new Error(`exit:${code}`); };
-		try { initializeBoundToolRegistryBootstrap(); await assert.rejects(loadBoundPackageFactories({} as any), /exit:78/); }
+		try { initializeBoundToolRegistryBootstrap(); await assert.rejects(loadBoundPackageFactories({ registerTool() {} } as any), /exit:78/); }
 		finally { process.exit = originalExit; }
 		assert.equal(JSON.parse(fs.readFileSync(output, "utf8")).code, "package_load_error");
 		fs.rmSync(parent, { recursive: true, force: true });
+	});
+
+	it("allows a package to refresh its own tool before the barrier", () => {
+		const registrations: string[] = [];
+		const mediated = createBoundPackageApi({ registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any) as any;
+		mediated.registerTool({ name: "a", execute() {} });
+		mediated.registerTool({ name: "a", execute() {} });
+		assert.deepEqual(registrations, ["a", "a"]);
+	});
+
+	it("rejects one package factory replacing another package factory tool", () => {
+		const registrations: string[] = [];
+		const ownership = { occupiedToolNames: new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]), packageToolOwners: new Map<string, symbol>() };
+		const pi = { registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any;
+		const first = (createBoundPackageApi as any)(pi, ownership);
+		const second = (createBoundPackageApi as any)(pi, ownership);
+		const originalExit = process.exit; (process as any).exit = (code: number) => { throw new Error(`exit:${code}`); };
+		try {
+			first.registerTool({ name: "a", execute() {} });
+			assert.throws(() => second.registerTool({ name: "a", execute() {} }));
+		} finally { process.exit = originalExit; }
+		assert.deepEqual(registrations, ["a"]);
 	});
 
 	it("suppresses command surfaces and exposes detached immutable model views", () => {

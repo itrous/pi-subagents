@@ -83,12 +83,11 @@ describe("active-bound package extension refs", () => {
 		assert.notEqual(first.projection.find((entry) => entry.kind === "package")!.packageTreeDigest, second.projection.find((entry) => entry.kind === "package")!.packageTreeDigest);
 	});
 
-	it("supports a hoisted dependency and bare-relative manifest entry", () => {
+	it("rejects a dependency hoisted above its package owner", () => {
 		const f = fixture(); const local = path.join(f.owner, "node_modules", "fixture-adapter"); const hoisted = path.join(root, "node_modules", "fixture-adapter");
 		fs.mkdirSync(path.dirname(hoisted), { recursive: true }); fs.renameSync(local, hoisted);
 		const manifest = JSON.parse(fs.readFileSync(path.join(hoisted, "package.json"), "utf8")); manifest.pi.extensions = ["index.ts"]; writeJson(path.join(hoisted, "package.json"), manifest);
-		const resolved = resolveActiveBoundPackageExtensions(discoverProjectAgentsRestricted(f.project, true).agents[0]!);
-		assert.equal(resolved.projection.find((entry) => entry.kind === "package")?.contentDigest.length, 64);
+		assert.throws(() => resolveActiveBoundPackageExtensions(discoverProjectAgentsRestricted(f.project, true).agents[0]!), /Missing package evidence dependency|escapes its package root/);
 	});
 
 	it("rejects dependency symlink escape and duplicate cross-scope roots", () => {
