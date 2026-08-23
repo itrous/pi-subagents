@@ -389,7 +389,7 @@ export function registerBoundToolRegistryGate(pi: ExtensionAPI): void {
 	(pi.on as unknown as (event: string, handler: (event: { payload?: unknown }, ctx: ExtensionContext) => unknown) => void)("before_provider_request", (event, ctx) => {
 		try {
 		if (!runtimeHolder.state || runtimeHolder.state.barrierCommitted) return event.payload;
-		if (runtimeHolder.state.placeholderTools.size > 0) protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
+		if (runtimeHolder.state.placeholderTools.size > 0) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "PLACEHOLDERS " + JSON.stringify([...runtimeHolder.state.placeholderTools]) + "\n"); } catch {} protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		if (ctx.model?.api !== runtimeHolder.state.policy.modelApi) protocolExit({ version: 1, kind: "protocol", code: "model_api_drift" });
 		verifyRuntimeEvidence(); verifyPackageEvidence();
 		const cloned = cloneOutgoingPayload(runtimeHolder.state.policy.modelApi, event.payload);
