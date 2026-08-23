@@ -74,7 +74,7 @@ function protocolExit(frame: ToolRegistryChildFrameV1): never {
 	writeFrame(frame);
 	return runtimeHolder.state!.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT);
 }
-function packageMutationExit(): never { return runtimeHolder.state!.exit(BOUND_PACKAGE_MUTATION_EXIT); }
+function packageMutationExit(): never { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "MUTATION " + new Error().stack + "\n"); } catch {} return runtimeHolder.state!.exit(BOUND_PACKAGE_MUTATION_EXIT); }
 
 function immutableDetachedView(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
 	if (!value || typeof value !== "object") return value;
