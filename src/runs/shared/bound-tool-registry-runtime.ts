@@ -248,15 +248,24 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 	    try {
 	     const packageRoot = fs.realpathSync(path.join(hostNm, ...name.split("/")));
 	     if (!peerAlias[name]) {
-	      peerDirs.push(packageRoot);
-	      peerAlias[name] = fs.realpathSync(hostRequire.resolve(name));
 	      const peerManifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
-	      for (const exported of Object.keys(peerManifest.exports ?? {})) {
-	       if (exported.startsWith("./") && !exported.includes("*")) {
-	        const specifier = `${name}/${exported.slice(2)}`;
-	        try { peerAlias[specifier] = fs.realpathSync(hostRequire.resolve(specifier)); } catch {}
-	       }
+	      const exportTarget = (value: unknown): string | undefined => {
+	       if (typeof value === "string") return value;
+	       if (!value || typeof value !== "object") return undefined;
+	       const conditions = value as Record<string, unknown>;
+	       return exportTarget(conditions.import) ?? exportTarget(conditions.default) ?? exportTarget(conditions.node);
+	      };
+	      const exportsMap = peerManifest.exports && typeof peerManifest.exports === "object" ? peerManifest.exports as Record<string, unknown> : {};
+	      const entries = Object.keys(exportsMap).some((key) => key.startsWith(".")) ? exportsMap : { ".": peerManifest.exports };
+	      for (const [exported, value] of Object.entries(entries)) {
+	       if (!exported.startsWith(".") || exported.includes("*")) continue;
+	       const target = exportTarget(value);
+	       if (!target) continue;
+	       const specifier = exported === "." ? name : `${name}/${exported.slice(2)}`;
+	       try { peerAlias[specifier] = fs.realpathSync(path.resolve(packageRoot, target)); } catch {}
 	      }
+	      if (!peerAlias[name]) try { peerAlias[name] = fs.realpathSync(hostRequire.resolve(name)); } catch {}
+	      if (peerAlias[name]) peerDirs.push(packageRoot);
 	     }
 	    } catch {}
 	   }
