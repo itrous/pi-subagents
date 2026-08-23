@@ -40,6 +40,7 @@ interface RuntimeState {
 	denialWritten: boolean;
 	restoreResolver?: () => void;
 	allowInputRegistrationNoop?: boolean;
+	placeholderTools: Set<string>;
 	exit: (code: number) => never;
 }
 const runtimeHolder = createRequire(import.meta.url)("./bound-tool-registry-state.cjs") as { state?: RuntimeState };
@@ -57,7 +58,7 @@ export function initializeBoundToolRegistryBootstrap(): void {
 	try { parsed = JSON.parse(encoded!); } catch { process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT); }
 	const policy = validateBoundToolRegistryPolicy(parsed);
 	if (!policy) process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT);
-	runtimeHolder.state = { policy, fd: Number(fdText), frameWritten: false, barrierCommitted: false, denialCalls: [], denialOverflow: false, denialWritten: false, exit: process.exit.bind(process) };
+	runtimeHolder.state = { policy, fd: Number(fdText), frameWritten: false, barrierCommitted: false, denialCalls: [], denialOverflow: false, denialWritten: false, placeholderTools: new Set(), exit: process.exit.bind(process) };
 }
 
 function writeFrame(frame: ToolRegistryChildFrameV1): void {
@@ -159,6 +160,7 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 			const name = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
 			if (typeof name !== "string" || !name || occupiedToolNames.has(name)) packageMutationExit();
 			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(tool));
+			runtimeHolder.state?.placeholderTools.delete(name);
 			occupiedToolNames.add(name);
 			return result;
 		};
@@ -234,6 +236,16 @@ function verifyRuntimeEvidence(): ReturnType<typeof attestBoundRuntimeExtensions
 
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
+	const available = new Set((pi.getAllTools() as Array<{ name?: string }>).map((tool) => tool.name).filter((name): name is string => typeof name === "string"));
+	for (const name of runtimeHolder.state.policy.required) {
+		if (available.has(name)) continue;
+		(pi.registerTool as unknown as (tool: unknown) => unknown)({
+			name, label: name, description: "Attested package tool awaiting session initialization.",
+			parameters: { type: "object", additionalProperties: true },
+			execute: async () => ({ content: [{ type: "text", text: "Package tool initialization incomplete." }], isError: true }),
+		});
+		runtimeHolder.state.placeholderTools.add(name);
+	}
 	const mediated = createBoundPackageApi(pi);
 	const hostNm = process.env[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV];
 	delete process.env[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV];
@@ -377,6 +389,7 @@ export function registerBoundToolRegistryGate(pi: ExtensionAPI): void {
 	(pi.on as unknown as (event: string, handler: (event: { payload?: unknown }, ctx: ExtensionContext) => unknown) => void)("before_provider_request", (event, ctx) => {
 		try {
 		if (!runtimeHolder.state || runtimeHolder.state.barrierCommitted) return event.payload;
+		if (runtimeHolder.state.placeholderTools.size > 0) protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		if (ctx.model?.api !== runtimeHolder.state.policy.modelApi) protocolExit({ version: 1, kind: "protocol", code: "model_api_drift" });
 		verifyRuntimeEvidence(); verifyPackageEvidence();
 		const cloned = cloneOutgoingPayload(runtimeHolder.state.policy.modelApi, event.payload);
