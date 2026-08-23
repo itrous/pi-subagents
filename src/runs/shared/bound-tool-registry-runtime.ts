@@ -24,6 +24,7 @@ import {
 export const BOUND_TOOL_REGISTRY_ACTIVE_ENV = "PI_SUBAGENT_TOOL_REGISTRY_ACTIVE";
 export const BOUND_TOOL_REGISTRY_POLICY_ENV = "PI_SUBAGENT_TOOL_REGISTRY_POLICY";
 export const BOUND_TOOL_REGISTRY_FD_ENV = "PI_SUBAGENT_TOOL_REGISTRY_FD";
+export const BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV = "PI_SUBAGENT_TOOL_REGISTRY_HOST_NODE_MODULES";
 export const BOUND_TOOL_REGISTRY_MISMATCH_EXIT = 78;
 export const BOUND_PACKAGE_MUTATION_EXIT = 76;
 const writeProofBytes = fs.writeSync.bind(fs);
@@ -179,7 +180,7 @@ function within(root: string, target: string): boolean {
 
 function installPackageResolutionGuard(roots: readonly string[], deniedPaths: ReadonlySet<string>): void {
 	if (!runtimeHolder.state || roots.length === 0) return;
-	const measured = (target: string): boolean => [...roots, ...peerDirs].some((root) => {
+	const measured = (target: string): boolean => roots.some((root) => {
 		if (!within(root, target)) return false;
 		return !path.relative(root, target).split(path.sep).includes("node_modules");
 	});
@@ -234,13 +235,14 @@ function verifyRuntimeEvidence(): ReturnType<typeof attestBoundRuntimeExtensions
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
 	const mediated = createBoundPackageApi(pi);
-	const hostNm = process.env.A1_HOST_NODE_MODULES;
+	const hostNm = process.env[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV];
+	delete process.env[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV];
 	const peerAlias: Record<string, string> = {};
 	const peerDirs: string[] = [];
 	if (hostNm) {
 	 for (const attestation of runtimeHolder.state.policy.packageExtensions) {
 	  try {
-	   const mf = JSON.parse(fs.readFileSync(path.join(path.dirname(attestation.path), "package.json"), "utf8"));
+	   const mf = JSON.parse(fs.readFileSync(path.join(attestation.evidenceRoot, "package.json"), "utf8"));
 	   for (const name of Object.keys(mf.peerDependencies ?? {})) {
 	    try {
 	     const resolved = fs.realpathSync(path.join(hostNm, ...name.split("/")));
@@ -255,13 +257,14 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 	const evidenceRoots = verifyPackageEvidence();
 			try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD roots=" + JSON.stringify(evidenceRoots) + " policyCount=" + runtimeHolder.state.policy.packageExtensions.length + "\n"); } catch {}
 const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
-	installPackageResolutionGuard([...evidenceRoots, ...peerDirs], deniedRuntimePaths);
+	const allowedRoots = [...evidenceRoots, ...peerDirs];
+	installPackageResolutionGuard(allowedRoots, deniedRuntimePaths);
 	const transformer = createJiti(import.meta.url, { moduleCache: false, tsconfigPaths: true, alias: peerAlias });
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false, tsconfigPaths: true, tryNative: false, alias: peerAlias,
 		transform(options) {
 			const __deny = typeof options.filename === "string" && path.isAbsolute(options.filename)
-				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !evidenceRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")));
+				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !allowedRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")));
 			if (__deny) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "ESC " + String(options.filename) + " roots=" + JSON.stringify(evidenceRoots) + "\n"); } catch {} throw new Error("Package factory transform escaped its attested resolution roots."); }
 			return { code: transformer.transform(options) };
 		},
