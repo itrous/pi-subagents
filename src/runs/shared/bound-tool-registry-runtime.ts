@@ -74,7 +74,7 @@ function protocolExit(frame: ToolRegistryChildFrameV1): never {
 	writeFrame(frame);
 	return runtimeHolder.state!.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT);
 }
-function packageMutationExit(): never { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "MUTATION " + new Error().stack + "\n"); } catch {} return runtimeHolder.state!.exit(BOUND_PACKAGE_MUTATION_EXIT); }
+function packageMutationExit(): never { return runtimeHolder.state!.exit(BOUND_PACKAGE_MUTATION_EXIT); }
 
 function immutableDetachedView(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
 	if (!value || typeof value !== "object") return value;
@@ -152,11 +152,17 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 		if (property === "on") return (event: string, handler: (...args: unknown[]) => unknown) => {
 			const adapterInput = event === "input" && runtimeHolder.state?.allowInputRegistrationNoop;
 			if ((!ALLOWED_PACKAGE_EVENTS.has(event) && !adapterInput) || runtimeHolder.state?.barrierCommitted) packageMutationExit();
-			const wrapped = (async (value: unknown, ctx: ExtensionContext) => { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "EVENT " + event + " start direct=" + process.env.MCP_DIRECT_TOOLS + " agentDir=" + process.env.PI_CODING_AGENT_DIR + " cwd=" + process.cwd() + "\n"); } catch {} const result = await handler(value, restrictedContext(ctx)); if (event === "session_start" && runtimeHolder.state?.placeholderTools.size) { const deadline = Date.now() + 30_000; while (runtimeHolder.state?.placeholderTools.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10)); } try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "EVENT " + event + " done placeholders=" + runtimeHolder.state?.placeholderTools.size + "\n"); } catch {} return result; }) as unknown as (...args: unknown[]) => unknown;
+			const wrapped = (async (value: unknown, ctx: ExtensionContext) => {
+				const result = await handler(value, restrictedContext(ctx));
+				if (event === "session_start" && runtimeHolder.state?.placeholderTools.size) {
+					const deadline = Date.now() + 30_000;
+					while (runtimeHolder.state?.placeholderTools.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				return result;
+			}) as unknown as (...args: unknown[]) => unknown;
 			return (pi.on as unknown as (name: string, callback: (...args: unknown[]) => unknown) => unknown)(event, wrapped);
 		};
 		if (property === "registerTool") return (tool: unknown) => {
-			try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "REGISTER " + String(tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined) + "\n"); } catch {}
 			if (runtimeHolder.state?.barrierCommitted) packageMutationExit();
 			const packageName = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
 			if (typeof packageName !== "string" || !packageName) packageMutationExit();
@@ -289,11 +295,9 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 	  } catch {}
 	 }
 	}
- try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "ALIAS host=" + String(hostNm) + " map=" + JSON.stringify(peerAlias) + "\n"); } catch {}
  const sharedDir = path.dirname(fileURLToPath(import.meta.url));
 	const runtimeEvidence = verifyRuntimeEvidence();
 	const evidenceRoots = verifyPackageEvidence();
-			try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "CHILD roots=" + JSON.stringify(evidenceRoots) + " policyCount=" + runtimeHolder.state.policy.packageExtensions.length + "\n"); } catch {}
 const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
 	const allowedRoots = [...evidenceRoots, ...peerDirs];
 	installPackageResolutionGuard(allowedRoots, deniedRuntimePaths);
@@ -301,9 +305,8 @@ const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !en
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false, tsconfigPaths: true, tryNative: false, alias: peerAlias,
 		transform(options) {
-			const __deny = typeof options.filename === "string" && path.isAbsolute(options.filename)
-				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !allowedRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")));
-			if (__deny) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "ESC " + String(options.filename) + " roots=" + JSON.stringify(evidenceRoots) + "\n"); } catch {} throw new Error("Package factory transform escaped its attested resolution roots."); }
+			if (typeof options.filename === "string" && path.isAbsolute(options.filename)
+				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !allowedRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")))) throw new Error("Package factory transform escaped its attested resolution roots.");
 			return { code: transformer.transform(options) };
 		},
 	});
@@ -315,14 +318,14 @@ const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !en
 				|| createHash("sha256").update(fs.readFileSync(attestation.path)).digest("hex") !== attestation.contentDigest) throw new Error("attestation drift");
 			factory = await jiti.import(attestation.path, { default: true });
 		}
-		catch (e) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "LOAD-FAIL " + String(e && (e.stack || e)) + "\n"); } catch {} protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
+		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		if (typeof factory !== "function") protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		try {
 			const manifest = JSON.parse(fs.readFileSync(path.join(attestation.evidenceRoot, "package.json"), "utf8")) as { name?: unknown };
 			runtimeHolder.state!.allowInputRegistrationNoop = manifest.name === "pi-mcp-adapter";
 			await factory(mediated);
 		}
-		catch (e) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "LOAD-FAIL " + String(e && (e.stack || e)) + "\n"); } catch {} protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
+		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		finally { if (runtimeHolder.state) runtimeHolder.state.allowInputRegistrationNoop = false; }
 	}
 }
@@ -394,7 +397,7 @@ export function registerBoundToolRegistryGate(pi: ExtensionAPI): void {
 	(pi.on as unknown as (event: string, handler: (event: { payload?: unknown }, ctx: ExtensionContext) => unknown) => void)("before_provider_request", (event, ctx) => {
 		try {
 		if (!runtimeHolder.state || runtimeHolder.state.barrierCommitted) return event.payload;
-		if (runtimeHolder.state.placeholderTools.size > 0) { try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "PLACEHOLDERS " + JSON.stringify([...runtimeHolder.state.placeholderTools]) + "\n"); } catch {} protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
+		if (runtimeHolder.state.placeholderTools.size > 0) protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		if (ctx.model?.api !== runtimeHolder.state.policy.modelApi) protocolExit({ version: 1, kind: "protocol", code: "model_api_drift" });
 		verifyRuntimeEvidence(); verifyPackageEvidence();
 		const cloned = cloneOutgoingPayload(runtimeHolder.state.policy.modelApi, event.payload);

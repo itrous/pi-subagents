@@ -167,9 +167,16 @@ describe("bound tool registry child runtime", () => {
 		process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(policy([extension]));
 		process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
 		initializeBoundToolRegistryBootstrap();
-		const registered: string[] = [];
-		await loadBoundPackageFactories({ on() { throw new Error("input hook must not be delegated"); }, registerTool(tool: { name: string }) { registered.push(tool.name); } } as any);
-		assert.deepEqual(registered, ["a"]);
+		const registered = new Map<string, unknown>();
+		const registrations: string[] = [];
+		const events: string[] = [];
+		await loadBoundPackageFactories({
+			on(event: string) { events.push(event); },
+			registerTool(tool: { name: string }) { registrations.push(tool.name); registered.set(tool.name, tool); },
+		} as any);
+		assert.deepEqual(registrations, ["a", "a"]); // fail-closed placeholder, затем реальная фабрика
+		assert.deepEqual([...registered.keys()], ["a"]);
+		assert.deepEqual(events, ["input"]);
 		fs.closeSync(fd);
 		fs.rmSync(root, { recursive: true, force: true });
 	});
@@ -185,7 +192,7 @@ describe("bound tool registry child runtime", () => {
 		process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(policy([extension]));
 		process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
 		const originalExit = process.exit; (process as any).exit = (code: number) => { throw new Error(`exit:${code}`); };
-		try { initializeBoundToolRegistryBootstrap(); await assert.rejects(loadBoundPackageFactories({} as any), /exit:78/); }
+		try { initializeBoundToolRegistryBootstrap(); await assert.rejects(loadBoundPackageFactories({ registerTool() {} } as any), /exit:78/); }
 		finally { process.exit = originalExit; }
 		assert.equal(JSON.parse(fs.readFileSync(output, "utf8")).code, "package_load_error");
 		fs.rmSync(parent, { recursive: true, force: true });
