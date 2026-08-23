@@ -202,6 +202,12 @@ try {
 const toolResult = [...created.session.messages].reverse().find((m) => m.role === "toolResult" && m.toolName === "pkg_projection_probe");
 assert.ok(toolResult, "probe tool result missing");
 assert.equal(toolResult.isError, false, String(toolResult.content?.map((c) => c.text).join("\n")));
+const resultText = toolResult.content?.map((c) => c.text).join("\n");
+assert.equal(resultText, "PKG_PROJECTION_OK", resultText);
+assert.deepEqual(toolResult.details?.statuses, { "rel-leaf": "completed", "dep-leaf": "completed" });
+assert.ok(parsedRequests >= 2, `expected at least two provider requests, got ${parsedRequests}`);
+assert.ok(bodies.get("REL_0")?.wireNames.includes("ref_tool"), "rel_tool missing from provider wire");
+assert.ok(bodies.get("DEP_0")?.wireNames.includes("dep_tool"), "dep_tool missing from provider wire");
 
 try {
 	await created.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });

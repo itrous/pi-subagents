@@ -1007,6 +1007,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 			["server", "read,linear_mcp_list_issues"],
 			["short", "read,linear_list_issues"],
 			["none", "read,list_issues"],
+			["mcp", "read,mcp__linear_mcp_list_issues"],
 		] as const) {
 			const fixture = createMcpFixture();
 			writeMcpFixture(fixture, {
@@ -1050,7 +1051,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		assert.equal(
 			args[args.indexOf("--tools") + 1],
-			"read,browser_mcp_navigate,browser_mcp_get_console_logs",
+			"read,browser_mcp_navigate,browser_mcp_read_console_logs",
 		);
 	});
 

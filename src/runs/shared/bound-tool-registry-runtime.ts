@@ -24,7 +24,6 @@ import {
 export const BOUND_TOOL_REGISTRY_ACTIVE_ENV = "PI_SUBAGENT_TOOL_REGISTRY_ACTIVE";
 export const BOUND_TOOL_REGISTRY_POLICY_ENV = "PI_SUBAGENT_TOOL_REGISTRY_POLICY";
 export const BOUND_TOOL_REGISTRY_FD_ENV = "PI_SUBAGENT_TOOL_REGISTRY_FD";
-export const BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV = "PI_SUBAGENT_TOOL_REGISTRY_HOST_NODE_MODULES";
 export const BOUND_TOOL_REGISTRY_MISMATCH_EXIT = 78;
 export const BOUND_PACKAGE_MUTATION_EXIT = 76;
 const writeProofBytes = fs.writeSync.bind(fs);
@@ -150,23 +149,16 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 		if (ALWAYS_DENIED_METHODS.has(property)) return packageMutationExit;
 		if (NOOP_METHODS.has(property)) return () => undefined;
 		if (property === "on") return (event: string, handler: (...args: unknown[]) => unknown) => {
-			const adapterInput = event === "input" && runtimeHolder.state?.allowInputRegistrationNoop;
-			if ((!ALLOWED_PACKAGE_EVENTS.has(event) && !adapterInput) || runtimeHolder.state?.barrierCommitted) packageMutationExit();
-			const wrapped = (async (value: unknown, ctx: ExtensionContext) => {
-				const result = await handler(value, restrictedContext(ctx));
-				if (event === "session_start" && runtimeHolder.state?.placeholderTools.size) {
-					const deadline = Date.now() + 30_000;
-					while (runtimeHolder.state?.placeholderTools.size && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-				}
-				return result;
-			}) as unknown as (...args: unknown[]) => unknown;
+			if (event === "input" && runtimeHolder.state?.allowInputRegistrationNoop && !runtimeHolder.state.barrierCommitted) return undefined;
+			if (!ALLOWED_PACKAGE_EVENTS.has(event) || runtimeHolder.state?.barrierCommitted) packageMutationExit();
+			const wrapped = ((value: unknown, ctx: ExtensionContext) => handler(value, restrictedContext(ctx))) as unknown as (...args: unknown[]) => unknown;
 			return (pi.on as unknown as (name: string, callback: (...args: unknown[]) => unknown) => unknown)(event, wrapped);
 		};
 		if (property === "registerTool") return (tool: unknown) => {
 			if (runtimeHolder.state?.barrierCommitted) packageMutationExit();
 			const packageName = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
 			if (typeof packageName !== "string" || !packageName) packageMutationExit();
-			const normalized = packageName.replace(/-/g, "_");
+			const normalized = packageName.replace(/[.-]/g, "_");
 			const name = runtimeHolder.state?.policy.required.includes(normalized) ? normalized : packageName;
 			if (occupiedToolNames.has(name)) packageMutationExit();
 			const projectedTool = name === packageName ? tool : { ...(tool as Record<string, unknown>), name };
@@ -258,55 +250,17 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 		runtimeHolder.state.placeholderTools.add(name);
 	}
 	const mediated = createBoundPackageApi(pi);
-	const hostNm = process.env[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV];
-	delete process.env[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV];
-	const peerAlias: Record<string, string> = {};
-	const peerDirs: string[] = [];
-	if (hostNm) {
-	 const hostRequire = createRequire(path.join(path.dirname(hostNm), "bound-peer-resolver.cjs"));
-	 for (const attestation of runtimeHolder.state.policy.packageExtensions) {
-	  try {
-	   const mf = JSON.parse(fs.readFileSync(path.join(path.dirname(attestation.path), "package.json"), "utf8"));
-	   for (const name of Object.keys(mf.peerDependencies ?? {})) {
-	    try {
-	     const packageRoot = fs.realpathSync(path.join(hostNm, ...name.split("/")));
-	     if (!peerAlias[name]) {
-	      const peerManifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
-	      const exportTarget = (value: unknown): string | undefined => {
-	       if (typeof value === "string") return value;
-	       if (!value || typeof value !== "object") return undefined;
-	       const conditions = value as Record<string, unknown>;
-	       return exportTarget(conditions.import) ?? exportTarget(conditions.default) ?? exportTarget(conditions.node);
-	      };
-	      const exportsMap = peerManifest.exports && typeof peerManifest.exports === "object" ? peerManifest.exports as Record<string, unknown> : {};
-	      const entries = Object.keys(exportsMap).some((key) => key.startsWith(".")) ? exportsMap : { ".": peerManifest.exports };
-	      for (const [exported, value] of Object.entries(entries)) {
-	       if (!exported.startsWith(".") || exported.includes("*")) continue;
-	       const target = exportTarget(value);
-	       if (!target) continue;
-	       const specifier = exported === "." ? name : `${name}/${exported.slice(2)}`;
-	       try { peerAlias[specifier] = fs.realpathSync(path.resolve(packageRoot, target)); } catch {}
-	      }
-	      if (!peerAlias[name]) try { peerAlias[name] = fs.realpathSync(hostRequire.resolve(name)); } catch {}
-	      if (peerAlias[name]) peerDirs.push(packageRoot);
-	     }
-	    } catch {}
-	   }
-	  } catch {}
-	 }
-	}
- const sharedDir = path.dirname(fileURLToPath(import.meta.url));
+	const sharedDir = path.dirname(fileURLToPath(import.meta.url));
 	const runtimeEvidence = verifyRuntimeEvidence();
 	const evidenceRoots = verifyPackageEvidence();
-const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
-	const allowedRoots = [...evidenceRoots, ...peerDirs];
-	installPackageResolutionGuard(allowedRoots, deniedRuntimePaths);
-	const transformer = createJiti(import.meta.url, { moduleCache: false, tsconfigPaths: true, alias: peerAlias });
+	const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
+	installPackageResolutionGuard(evidenceRoots, deniedRuntimePaths);
+	const transformer = createJiti(import.meta.url, { moduleCache: false, tsconfigPaths: true });
 	const jiti = createJiti(import.meta.url, {
-		moduleCache: false, tsconfigPaths: true, tryNative: false, alias: peerAlias,
+		moduleCache: false, tsconfigPaths: true, tryNative: false,
 		transform(options) {
 			if (typeof options.filename === "string" && path.isAbsolute(options.filename)
-				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !allowedRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")))) throw new Error("Package factory transform escaped its attested resolution roots.");
+				&& (deniedRuntimePaths.has(path.resolve(options.filename)) || !evidenceRoots.some((root) => within(root, options.filename!) && !path.relative(root, options.filename!).split(path.sep).includes("node_modules")))) throw new Error("Package factory transform escaped its attested resolution roots.");
 			return { code: transformer.transform(options) };
 		},
 	});

@@ -5,7 +5,7 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import type { Readable } from "node:stream";
-import { existsSync, realpathSync, unlinkSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
@@ -57,7 +57,7 @@ import {
 import { buildBoundSkillInjection, buildSkillInjection, resolveProjectSkillsUncached, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
-import { findPiPackageRootFromEntry, getPiSpawnCommand, PI_SUBAGENT_PI_BINARY_ENV, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../shared/pi-spawn.ts";
+import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { attestPiSpawnCommand } from "../shared/pi-command-evidence.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
@@ -70,7 +70,7 @@ import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../s
 import { formatProcessSignalError, isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
-import { BOUND_PACKAGE_MUTATION_EXIT, BOUND_TOOL_REGISTRY_ACTIVE_ENV, BOUND_TOOL_REGISTRY_FD_ENV, BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV, BOUND_TOOL_REGISTRY_POLICY_ENV } from "../shared/bound-tool-registry-runtime.ts";
+import { BOUND_PACKAGE_MUTATION_EXIT, BOUND_TOOL_REGISTRY_ACTIVE_ENV, BOUND_TOOL_REGISTRY_FD_ENV, BOUND_TOOL_REGISTRY_POLICY_ENV } from "../shared/bound-tool-registry-runtime.ts";
 import { createToolRegistryCollector, type ToolRegistryCollected, type ToolRegistryCollector } from "../shared/tool-registry-collector.ts";
 import { expectedToolRegistryProjection } from "../shared/tool-registry-proof.ts";
 import { createDeniedToolCollector, type DeniedToolCollected, type DeniedToolCollector } from "../shared/denied-tool-proof.ts";
@@ -586,7 +586,6 @@ async function runSingleAttempt(
 	delete spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV];
 	delete spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV];
 	delete spawnEnv[BOUND_TOOL_REGISTRY_FD_ENV];
-	delete spawnEnv[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV];
 	if (options.activeBoundToolRegistry) {
 		const deniedExact = new Set(["NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV", "ZDOTDIR"]);
 		for (const key of Object.keys(spawnEnv)) {
@@ -597,13 +596,6 @@ async function runSingleAttempt(
 	const toolRegistryProofNonce = options.activeBoundToolRegistry ? randomBytes(32).toString("hex") : undefined;
 	if (options.activeBoundToolRegistry) {
 		spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
-		let piPackageRoot: string | undefined;
-		try {
-			const configuredPiBinary = process.env[PI_SUBAGENT_PI_BINARY_ENV]?.trim();
-			piPackageRoot = configuredPiBinary ? findPiPackageRootFromEntry(realpathSync(configuredPiBinary)) : undefined;
-		} catch {}
-		piPackageRoot ??= resolvePiPackageRoot() ?? resolveInstalledPiPackageRoot();
-		if (piPackageRoot) spawnEnv[BOUND_TOOL_REGISTRY_HOST_NODE_MODULES_ENV] = path.join(piPackageRoot, "node_modules");
 		spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify({
 			...options.activeBoundToolRegistry,
 			proofNonce: toolRegistryProofNonce,

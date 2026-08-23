@@ -176,7 +176,7 @@ describe("bound tool registry child runtime", () => {
 		} as any);
 		assert.deepEqual(registrations, ["a", "a"]); // fail-closed placeholder, затем реальная фабрика
 		assert.deepEqual([...registered.keys()], ["a"]);
-		assert.deepEqual(events, ["input"]);
+		assert.deepEqual(events, []); // адаптерный input-hook не получает доступ к prompt payload
 		fs.closeSync(fd);
 		fs.rmSync(root, { recursive: true, force: true });
 	});

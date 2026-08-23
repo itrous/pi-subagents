@@ -21,7 +21,7 @@ const IMPORT_PATHS = {
 	vscode: [".vscode/mcp.json"],
 } as const;
 
-type ToolPrefix = "server" | "none" | "short";
+type ToolPrefix = "server" | "none" | "short" | "mcp";
 type ImportKind = keyof typeof IMPORT_PATHS;
 
 interface ServerEntry {
@@ -41,6 +41,7 @@ interface ServerEntry {
 	excludeTools?: string[];
 	protocolVersion?: string;
 	directTools?: boolean | string[];
+	toolPrefix?: ToolPrefix;
 }
 
 interface McpConfig {
@@ -207,6 +208,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 	const { servers: selectedServers, tools: selectedTools } = parseSelections(envOverride);
 
 	for (const [serverName, definition] of Object.entries(config.mcpServers)) {
+		const effectivePrefix = getToolPrefix(definition.toolPrefix ?? prefix);
 		const serverCache = cache.servers[serverName];
 		if (!isServerCacheValid(serverCache, definition)) continue;
 
@@ -218,8 +220,8 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 		for (const tool of Array.isArray(serverCache.tools) ? serverCache.tools : []) {
 			if (typeof tool?.name !== "string" || !tool.name) continue;
 			if (toolFilter !== true && !toolFilter.has(tool.name)) continue;
-			if (isToolExcluded(tool.name, serverName, prefix, definition.excludeTools)) continue;
-			const prefixedName = formatToolName(tool.name, serverName, prefix);
+			if (isToolExcluded(tool.name, serverName, effectivePrefix, definition.excludeTools)) continue;
+			const prefixedName = formatToolName(tool.name, serverName, effectivePrefix);
 			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
 			names.push({ name: prefixedName, selector: `${serverName}/${tool.name}` });
@@ -228,10 +230,10 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 		if (definition.exposeResources === false) continue;
 		for (const resource of Array.isArray(serverCache.resources) ? serverCache.resources : []) {
 			if (typeof resource?.name !== "string" || !resource.name || typeof resource.uri !== "string" || !resource.uri) continue;
-			const baseName = `get_${resourceNameToToolName(resource.name)}`;
+			const baseName = `read_${resourceNameToToolName(resource.name)}`;
 			if (toolFilter !== true && !toolFilter.has(baseName)) continue;
-			if (isToolExcluded(baseName, serverName, prefix, definition.excludeTools)) continue;
-			const prefixedName = formatToolName(baseName, serverName, prefix);
+			if (isToolExcluded(baseName, serverName, effectivePrefix, definition.excludeTools)) continue;
+			const prefixedName = formatToolName(baseName, serverName, effectivePrefix);
 			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
 			names.push({ name: prefixedName, selector: `${serverName}/${baseName}` });
@@ -300,25 +302,28 @@ export function computeMcpServerHash(definition: ServerEntry): string {
 }
 
 function getToolPrefix(value: unknown): ToolPrefix {
-	return value === "none" || value === "short" || value === "server" ? value : "server";
+	return value === "none" || value === "short" || value === "server" || value === "mcp" ? value : "server";
 }
 
 function isImportKind(value: unknown): value is ImportKind {
 	return typeof value === "string" && Object.hasOwn(IMPORT_PATHS, value);
 }
 
+function sanitizeServerPrefix(serverName: string): string {
+	return Array.from(serverName, (char) => /^[A-Za-z0-9_-]$/.test(char) ? char : `_${char.codePointAt(0)!.toString(16)}_`).join("").replace(/-/g, "_");
+}
+
 function getServerPrefix(serverName: string, mode: ToolPrefix): string {
 	if (mode === "none") return "";
-	if (mode === "short") {
-		const short = serverName.replace(/-?mcp$/i, "").replace(/-/g, "_");
-		return short || "mcp";
-	}
-	return serverName.replace(/-/g, "_");
+	if (mode === "short") return sanitizeServerPrefix(serverName.replace(/-?mcp$/i, "")) || "mcp";
+	if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName)}`;
+	return sanitizeServerPrefix(serverName);
 }
 
 function formatToolName(toolName: string, serverName: string, prefix: ToolPrefix): string {
 	const serverPrefix = getServerPrefix(serverName, prefix);
-	return serverPrefix ? `${serverPrefix}_${toolName}` : toolName;
+	const sanitized = toolName.replace(/[.-]/g, "_");
+	return serverPrefix ? `${serverPrefix}_${sanitized}` : sanitized;
 }
 
 function isToolExcluded(toolName: string, serverName: string, prefix: ToolPrefix, excludeTools: unknown): boolean {
