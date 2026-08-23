@@ -240,13 +240,24 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 	const peerAlias: Record<string, string> = {};
 	const peerDirs: string[] = [];
 	if (hostNm) {
+	 const hostRequire = createRequire(path.join(path.dirname(hostNm), "bound-peer-resolver.cjs"));
 	 for (const attestation of runtimeHolder.state.policy.packageExtensions) {
 	  try {
 	   const mf = JSON.parse(fs.readFileSync(path.join(path.dirname(attestation.path), "package.json"), "utf8"));
 	   for (const name of Object.keys(mf.peerDependencies ?? {})) {
 	    try {
-	     const resolved = fs.realpathSync(path.join(hostNm, ...name.split("/")));
-	     if (!peerAlias[name]) { peerAlias[name] = resolved; peerDirs.push(resolved); }
+	     const packageRoot = fs.realpathSync(path.join(hostNm, ...name.split("/")));
+	     if (!peerAlias[name]) {
+	      peerDirs.push(packageRoot);
+	      peerAlias[name] = fs.realpathSync(hostRequire.resolve(name));
+	      const peerManifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+	      for (const exported of Object.keys(peerManifest.exports ?? {})) {
+	       if (exported.startsWith("./") && !exported.includes("*")) {
+	        const specifier = `${name}/${exported.slice(2)}`;
+	        try { peerAlias[specifier] = fs.realpathSync(hostRequire.resolve(specifier)); } catch {}
+	       }
+	      }
+	     }
 	    } catch {}
 	   }
 	  } catch {}
