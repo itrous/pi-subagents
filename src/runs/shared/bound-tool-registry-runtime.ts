@@ -39,6 +39,7 @@ interface RuntimeState {
 	denialWritten: boolean;
 	restoreResolver?: () => void;
 	allowInputRegistrationNoop?: boolean;
+	placeholderTools: Set<string>;
 	exit: (code: number) => never;
 }
 const runtimeHolder = createRequire(import.meta.url)("./bound-tool-registry-state.cjs") as { state?: RuntimeState };
@@ -56,7 +57,7 @@ export function initializeBoundToolRegistryBootstrap(): void {
 	try { parsed = JSON.parse(encoded!); } catch { process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT); }
 	const policy = validateBoundToolRegistryPolicy(parsed);
 	if (!policy) process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT);
-	runtimeHolder.state = { policy, fd: Number(fdText), frameWritten: false, barrierCommitted: false, denialCalls: [], denialOverflow: false, denialWritten: false, exit: process.exit.bind(process) };
+	runtimeHolder.state = { policy, fd: Number(fdText), frameWritten: false, barrierCommitted: false, denialCalls: [], denialOverflow: false, denialWritten: false, placeholderTools: new Set(), exit: process.exit.bind(process) };
 }
 
 function writeFrame(frame: ToolRegistryChildFrameV1): void {
@@ -139,10 +140,23 @@ function wrapTool(tool: unknown): unknown {
 	};
 }
 
-export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
+interface BoundPackageToolOwnership {
+	occupiedToolNames: Set<string>;
+	packageToolOwners: Map<string, symbol>;
+}
+
+function newPackageToolOwnership(): BoundPackageToolOwnership {
+	return {
+		occupiedToolNames: new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...(runtimeHolder.state?.policy.internalTools ?? [])]),
+		packageToolOwners: new Map(),
+	};
+}
+
+export function createBoundPackageApi(pi: ExtensionAPI, ownership = newPackageToolOwnership()): ExtensionAPI {
 	// Supported Pi 0.84.1/0.84.2 expose this exact builtin registry. Protect it and
 	// runtime-owned internal tools without calling action APIs during extension load.
-	const occupiedToolNames = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...(runtimeHolder.state?.policy.internalTools ?? [])]);
+	const owner = Symbol("bound-package-factory");
+	const { occupiedToolNames, packageToolOwners } = ownership;
 	return opaqueFacade(pi, (property) => {
 		if (typeof property !== "string") return undefined;
 		if (ALWAYS_DENIED_METHODS.has(property)) return packageMutationExit;
@@ -155,10 +169,14 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 		};
 		if (property === "registerTool") return (tool: unknown) => {
 			if (runtimeHolder.state?.barrierCommitted) packageMutationExit();
-			const name = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
-			if (typeof name !== "string" || !name || occupiedToolNames.has(name)) packageMutationExit();
+			const packageName = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
+			if (typeof packageName !== "string" || !packageName) packageMutationExit();
+			const name = packageName;
+			if (occupiedToolNames.has(name) && packageToolOwners.get(name) !== owner) packageMutationExit();
 			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(tool));
+			runtimeHolder.state?.placeholderTools.delete(name);
 			occupiedToolNames.add(name);
+			packageToolOwners.set(name, owner);
 			return result;
 		};
 		if (POST_BARRIER_MUTATORS.has(property)) return (...args: unknown[]) => {
@@ -209,7 +227,7 @@ function verifyPackageEvidence(): string[] {
 		}
 		const resolutionRoots = new Set<string>();
 		for (const attestation of byRoot.values()) {
-			const evidence = packageTreeEvidence(attestation.path, attestation.evidenceRoot);
+			const evidence = packageTreeEvidence(attestation.path, attestation.evidenceRoot, attestation.evidenceRoot);
 			if (evidence.digest !== attestation.packageTreeDigest) throw new Error("package bytes drift");
 			for (const root of evidence.roots) resolutionRoots.add(root);
 		}
@@ -231,9 +249,35 @@ function verifyRuntimeEvidence(): ReturnType<typeof attestBoundRuntimeExtensions
 	return runtimeEvidence;
 }
 
+function packageNameForEntry(entry: string, evidenceRoot: string): string | undefined {
+	let current = path.dirname(entry);
+	while (within(evidenceRoot, current)) {
+		try {
+			const manifest = JSON.parse(fs.readFileSync(path.join(current, "package.json"), "utf8")) as { name?: unknown };
+			return typeof manifest.name === "string" ? manifest.name : undefined;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+		}
+		if (current === evidenceRoot) break;
+		current = path.dirname(current);
+	}
+	return undefined;
+}
+
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
-	const mediated = createBoundPackageApi(pi); const sharedDir = path.dirname(fileURLToPath(import.meta.url));
+	const runtimeOwned = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...runtimeHolder.state.policy.internalTools]);
+	for (const name of runtimeHolder.state.policy.required) {
+		if (runtimeOwned.has(name)) continue;
+		(pi.registerTool as unknown as (tool: unknown) => unknown)({
+			name, label: name, description: "Attested package tool awaiting session initialization.",
+			parameters: { type: "object", additionalProperties: true },
+			execute: async () => ({ content: [{ type: "text", text: "Package tool initialization incomplete." }], isError: true }),
+		});
+		runtimeHolder.state.placeholderTools.add(name);
+	}
+	const ownership = newPackageToolOwnership();
+	const sharedDir = path.dirname(fileURLToPath(import.meta.url));
 	const runtimeEvidence = verifyRuntimeEvidence();
 	const evidenceRoots = verifyPackageEvidence();
 	const deniedRuntimePaths = new Set(runtimeEvidence.entries.filter((entry) => !entry.name.startsWith("dependency:")).map((entry) => path.join(sharedDir, entry.name)));
@@ -258,9 +302,8 @@ export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void>
 		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		if (typeof factory !== "function") protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		try {
-			const manifest = JSON.parse(fs.readFileSync(path.join(attestation.evidenceRoot, "package.json"), "utf8")) as { name?: unknown };
-			runtimeHolder.state!.allowInputRegistrationNoop = manifest.name === "pi-mcp-adapter";
-			await factory(mediated);
+			runtimeHolder.state!.allowInputRegistrationNoop = packageNameForEntry(attestation.path, attestation.evidenceRoot) === "pi-mcp-adapter";
+			await factory(createBoundPackageApi(pi, ownership));
 		}
 		catch { protocolExit({ version: 1, kind: "protocol", code: "package_load_error" }); }
 		finally { if (runtimeHolder.state) runtimeHolder.state.allowInputRegistrationNoop = false; }
@@ -334,6 +377,7 @@ export function registerBoundToolRegistryGate(pi: ExtensionAPI): void {
 	(pi.on as unknown as (event: string, handler: (event: { payload?: unknown }, ctx: ExtensionContext) => unknown) => void)("before_provider_request", (event, ctx) => {
 		try {
 		if (!runtimeHolder.state || runtimeHolder.state.barrierCommitted) return event.payload;
+		if (runtimeHolder.state.placeholderTools.size > 0) protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		if (ctx.model?.api !== runtimeHolder.state.policy.modelApi) protocolExit({ version: 1, kind: "protocol", code: "model_api_drift" });
 		verifyRuntimeEvidence(); verifyPackageEvidence();
 		const cloned = cloneOutgoingPayload(runtimeHolder.state.policy.modelApi, event.payload);
