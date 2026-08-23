@@ -156,6 +156,7 @@ export function createBoundPackageApi(pi: ExtensionAPI): ExtensionAPI {
 			return (pi.on as unknown as (name: string, callback: (...args: unknown[]) => unknown) => unknown)(event, wrapped);
 		};
 		if (property === "registerTool") return (tool: unknown) => {
+			try { fs.appendFileSync(process.env.A1POLICY_LOG || "/tmp/a1policy.log", "REGISTER " + String(tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined) + "\n"); } catch {}
 			if (runtimeHolder.state?.barrierCommitted) packageMutationExit();
 			const name = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
 			if (typeof name !== "string" || !name || occupiedToolNames.has(name)) packageMutationExit();
