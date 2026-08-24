@@ -17,6 +17,7 @@ export const ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS: ReadonlySet<string> = new Set(
 	"contact_supervisor",
 	"intercom",
 	"structured_output",
+	"cursor",
 ]);
 
 export const ACTIVE_BOUND_PACKAGE_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;

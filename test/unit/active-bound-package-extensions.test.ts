@@ -131,7 +131,7 @@ describe("active-bound package extension refs", () => {
 		const baseAgent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
 		for (const tools of [
 			["read", "bad,name"], ["read", "bad name"], ["read", "工具"], ["read", `a${"x".repeat(64)}`],
-			["read", "read"], ["read", "structured_output"], ["read", "subagent"], ["read", "subagent_wait"], ["read", "contact_supervisor"], ["read", "intercom"], ["read", "mcp:server/tool"],
+			["read", "read"], ["read", "structured_output"], ["read", "subagent"], ["read", "subagent_wait"], ["read", "contact_supervisor"], ["read", "intercom"], ["read", "cursor"], ["read", "mcp:server/tool"],
 		]) {
 			const agent = { ...baseAgent, tools, subagentOnlyExtensions: ["./relative.ts"] };
 			const discover = (() => ({ agents: [agent], projectAgentsDir: null })) as typeof discoverAgents;

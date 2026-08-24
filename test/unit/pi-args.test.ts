@@ -1552,6 +1552,7 @@ describe("active-bound mediated extension order", () => {
 			["read", "subagent_wait"],
 			["read", "contact_supervisor"],
 			["read", "intercom"],
+			["read", "cursor"],
 		] as string[][]) {
 			assert.throws(() => resolvePiLaunchToolPlan({
 				tools, extensions: [], subagentOnlyExtensions: tools[1] === "git_read" ? [] : ["/trusted/package-extension.ts"],
