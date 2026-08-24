@@ -197,6 +197,21 @@ test("edit and write tool calls count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("write", { path: "a.ts" })]), true);
 });
 
+test("package-provided calls conservatively satisfy their mutation capability", () => {
+	const customCall = assistantToolCall("git_read", { subcommand: "status" });
+	assert.equal(hasMutationToolCall([customCall]), true);
+	assert.equal(hasMutationToolCall([assistantToolCall("read"), assistantToolCall("structured_output"), assistantToolCall("subagent_wait")]), false);
+	assert.deepEqual(evaluateCompletionMutationGuard({ agent: "worker", task: "Implement the approved fix", tools: ["git_read"], messages: [customCall] }), {
+		expectedMutation: true, attemptedMutation: true, triggered: false,
+	});
+	assert.deepEqual(evaluateCompletionMutationGuard({ agent: "worker", task: "Implement the approved fix", tools: ["git_read"], messages: [] }), {
+		expectedMutation: true, attemptedMutation: false, triggered: true,
+	});
+	assert.deepEqual(evaluateCompletionMutationGuard({ agent: "worker", task: "Implement the approved fix", tools: ["cursor"], messages: [] }), {
+		expectedMutation: true, attemptedMutation: false, triggered: true,
+	});
+});
+
 test("obvious mutating bash commands count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "mkdir -p src && cat > src/file.ts <<'EOF'\nhi\nEOF" })]), true);
 	assert.equal(hasMutationToolCall([assistantToolCall("bash", { command: "cat <<'EOF' > src/file.ts\nhi\nEOF" })]), true);

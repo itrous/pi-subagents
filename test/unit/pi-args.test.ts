@@ -1534,6 +1534,32 @@ describe("bound runtime extension evidence", () => {
 });
 
 describe("active-bound mediated extension order", () => {
+	it("accepts exact package-provided caller names only with a factory projection", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "git_read", "web_search"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],
+			activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+		});
+		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "git_read", "web_search"]);
+		assert.deepEqual(plan.requiredChildTools, ["read", "git_read", "web_search"]);
+		for (const tools of [
+			["read", "git_read"],
+			["read", "bad,name"],
+			["read", "bad name"],
+			["read", "工具"],
+			["read", `a${"x".repeat(64)}`],
+			["read", "read"],
+			["read", "subagent"],
+			["read", "subagent_wait"],
+			["read", "contact_supervisor"],
+			["read", "intercom"],
+		] as string[][]) {
+			assert.throws(() => resolvePiLaunchToolPlan({
+				tools, extensions: [], subagentOnlyExtensions: tools[1] === "git_read" ? [] : ["/trusted/package-extension.ts"],
+				activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+			}), /Active-bound/);
+		}
+	});
+
 	it("loads bootstrap, mediator and registry gate without direct package entries", () => {
 		const plan = resolvePiLaunchToolPlan({
 			tools: ["read"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],

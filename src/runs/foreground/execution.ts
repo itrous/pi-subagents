@@ -56,7 +56,7 @@ import {
 } from "../../shared/utils.ts";
 import { buildBoundSkillInjection, buildSkillInjection, resolveProjectSkillsUncached, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
-import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
+import { evaluateCompletionMutationGuard, isPotentialMutationToolCall } from "../shared/completion-guard.ts";
 import { arbitrateCompletionGuardRescue } from "../shared/llm-intent-arbiter.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { attestPiSpawnCommand } from "../shared/pi-command-evidence.ts";
@@ -1101,7 +1101,7 @@ async function runSingleAttempt(
 				progress.currentToolStartedAt = now;
 				progress.currentPath = resolveCurrentPath(evt.toolName, toolArgs);
 				const mutates = isMutatingTool(evt.toolName, toolArgs);
-				observedMutationAttempt = observedMutationAttempt || mutates;
+				observedMutationAttempt = observedMutationAttempt || isPotentialMutationToolCall(evt.toolName, toolArgs);
 				pendingToolResult = { tool: evt.toolName ?? "tool", path: progress.currentPath, mutates, startedAt: now };
 				fireUpdate();
 			}

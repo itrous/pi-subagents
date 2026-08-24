@@ -24,12 +24,9 @@ import { projectActiveBoundEnvironment, type ActiveBoundEnvironmentProjectionV1 
 import { resolveActiveBoundPackageExtensions, type ActiveBoundPackageExtensionProjectionV1 } from "./active-bound-package-extensions.ts";
 import { attestPiSpawnCommand } from "../runs/shared/pi-command-evidence.ts";
 import { expectedToolRegistryProjection, SUPPORTED_BOUND_MODEL_APIS, SUPPORTED_BOUND_PI_VERSIONS, type ToolRegistryProjectionV1 } from "../runs/shared/tool-registry-proof.ts";
+import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS, isActiveBoundPackageToolName } from "../runs/shared/core-runtime-tools.ts";
 
 export const ACTIVE_BOUND_LAUNCH_CONTRACT_VERSION = 1 as const;
-const FIXED_CHILD_TOOLS = new Set([
-	"read", "grep", "find", "ls", "bash", "edit", "write",
-	"web_search", "fetch_content", "get_search_content",
-]);
 
 interface SessionManager {
 	getSessionFile(): string | null | undefined;
@@ -292,7 +289,11 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	if ((agent.mcpDirectTools?.length ?? 0) > 0 && !packageExtensions.projection.some((entry) => entry.kind === "package" && entry.package?.name === "pi-mcp-adapter")) return failure("unsupported_mode");
 	const boundCeiling = input.capabilityCeiling;
 	const explicitAgentTools = agent.tools ?? [];
-	if (explicitAgentTools.some((tool) => !FIXED_CHILD_TOOLS.has(tool))) return failure("unsupported_mode");
+	if (new Set(explicitAgentTools).size !== explicitAgentTools.length) return failure("unsupported_mode");
+	const packageProvidedTools = explicitAgentTools.filter((tool) => !CORE_RUNTIME_OWNED_TOOLS.has(tool));
+	if (packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
+		|| (packageProvidedTools.length > 0 && (agent.source !== "package" || packageExtensions.paths.length === 0
+			|| packageExtensions.paths.length !== packageExtensions.projection.length))) return failure("unsupported_mode");
 	const boundTools = resolvedSkills.resolved.length > 0 && !explicitAgentTools.includes("read") ? ["read", ...explicitAgentTools] : explicitAgentTools;
 	let toolPlan;
 	try {
@@ -305,6 +306,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 			activeBoundPackageMediator: true,
 		});
 	} catch { return failure("restricted_agent"); }
+	if (packageProvidedTools.some((tool) => !toolPlan.effectiveToolAllowlist.includes(tool) || !toolPlan.requiredChildTools.includes(tool))) return failure("restricted_agent");
 	if (!toolPlan.explicitToolAllowlist || !toolPlan.disableAmbientExtensions || toolPlan.fanoutAuthorized
 		|| (resolvedSkills.resolved.length > 0 && !toolPlan.effectiveToolAllowlist.includes("read"))
 		|| toolPlan.extensionArgs.some((entry) => !toolPlan.runtimeExtensions.includes(entry) && !packageExtensions.paths.includes(entry))) return failure("unsupported_mode");

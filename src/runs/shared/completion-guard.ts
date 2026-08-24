@@ -14,6 +14,8 @@ const READ_ONLY_BUILTIN_TOOLS = new Set([
 	"get_search_content",
 	"intercom",
 	"contact_supervisor",
+	"structured_output",
+	"subagent_wait",
 ]);
 
 // Cursor native edit/write often land as thinking traces (inactive_trace /
@@ -66,6 +68,13 @@ function hasCheckpointMutationEvidence(message: Message): boolean {
 		&& data.beforeCommit !== data.afterCommit;
 }
 
+export function isPotentialMutationToolCall(name: string | undefined, args?: Record<string, unknown>): boolean {
+	if (typeof name !== "string") return false;
+	const proven = isMutatingTool(name, args ?? {});
+	if (proven || READ_ONLY_BUILTIN_TOOLS.has(name)) return proven;
+	return !["bash", "edit", "write", "cursor"].includes(name);
+}
+
 export function hasMutationToolCall(messages: Message[]): boolean {
 	for (const message of messages) {
 		if (hasCheckpointMutationEvidence(message)) return true;
@@ -76,7 +85,7 @@ export function hasMutationToolCall(messages: Message[]): boolean {
 			const args = typeof part.arguments === "object" && part.arguments !== null && !Array.isArray(part.arguments)
 				? part.arguments as Record<string, unknown>
 				: {};
-			if (isMutatingTool(part.name, args)) return true;
+			if (isPotentialMutationToolCall(part.name, args)) return true;
 		}
 	}
 	return false;

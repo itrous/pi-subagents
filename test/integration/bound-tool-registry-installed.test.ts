@@ -5,13 +5,13 @@ import * as fs from "node:fs";
 import { createServer } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { resolveActiveBoundLaunchContract } from "../../src/api/active-bound-resolver.ts";
 import { attestBoundRuntimeExtensions } from "../../src/runs/shared/bound-runtime-evidence.ts";
 import { packageEvidenceRoot, packageTreeDigest } from "../../src/runs/shared/package-tree-evidence.ts";
+import { resolvePiLaunchToolPlan } from "../../src/runs/shared/pi-args.ts";
 import { SUPPORTED_BOUND_PI_VERSIONS } from "../../src/runs/shared/tool-registry-proof.ts";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const piBinary = process.env.PI_SUBAGENT_PI_BINARY || "pi";
 
 function runPi(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; fd3: number; fd4: number }): Promise<{ status: number | null; stderr: string }> {
@@ -28,23 +28,28 @@ function runPi(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; f
 	});
 }
 
-test("installed Pi loads an exact mediated registry before one loopback provider request", async (t) => {
+test("installed Pi loads and executes a packed owner tool after exact mediated registry proof", async (t) => {
 	const versionProbe = spawnSync(piBinary, ["--version"], { encoding: "utf8", timeout: 10_000 });
 	const version = versionProbe.status === 0 ? versionProbe.stdout.trim() : "";
 	if (!SUPPORTED_BOUND_PI_VERSIONS.has(version)) return t.skip(`installed Pi ${version || "unavailable"} is outside the bound set`);
 
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "bound-registry-installed-"));
-	let providerRequests = 0; let wireNames: Array<string | undefined> | undefined; let wireBody = ""; const sockets = new Set<import("node:net").Socket>();
+	let providerRequests = 0; const wireNames: Array<Array<string | undefined>> = []; let wireBody = ""; const sockets = new Set<import("node:net").Socket>();
 	const server = createServer((request, response) => {
 		providerRequests++;
 		let body = "";
 		request.setEncoding("utf8"); request.on("data", (chunk) => { body += chunk; });
 		request.on("end", () => {
 			wireBody = body; const payload = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }> };
-			wireNames = payload.tools?.map((tool) => tool.function?.name);
+			wireNames.push(payload.tools?.map((tool) => tool.function?.name) ?? []);
 			response.writeHead(200, { "content-type": "text/event-stream" });
-			response.write(`data: ${JSON.stringify({ id: "probe", object: "chat.completion.chunk", created: 1, model: "probe", choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] })}\n\n`);
-			response.write(`data: ${JSON.stringify({ id: "probe", object: "chat.completion.chunk", created: 1, model: "probe", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+			if (providerRequests === 1) {
+				response.write(`data: ${JSON.stringify({ id: "probe", object: "chat.completion.chunk", created: 1, model: "probe", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "probe-call", type: "function", function: { name: "probe_tool", arguments: "{}" } }] }, finish_reason: null }] })}\n\n`);
+				response.write(`data: ${JSON.stringify({ id: "probe", object: "chat.completion.chunk", created: 1, model: "probe", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+			} else {
+				response.write(`data: ${JSON.stringify({ id: "probe", object: "chat.completion.chunk", created: 1, model: "probe", choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] })}\n\n`);
+				response.write(`data: ${JSON.stringify({ id: "probe", object: "chat.completion.chunk", created: 1, model: "probe", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+			}
 			response.end("data: [DONE]\n\n");
 		});
 	});
@@ -61,16 +66,42 @@ test("installed Pi loads an exact mediated registry before one loopback provider
 		} } }));
 
 		const marker = path.join(root, "marker");
-		const packageDir = path.join(root, "package"); fs.mkdirSync(packageDir);
-		fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({ name: "bound-registry-probe", version: "1.0.0" }));
-		const packageExtension = path.join(packageDir, "package.ts");
-		fs.writeFileSync(packageExtension, `import { appendFileSync } from "node:fs";\nexport default function (pi: any) { appendFileSync(process.env.BOUND_MARKER!, "factory:" + String(process.env.PI_SUBAGENT_TOOL_REGISTRY_POLICY) + "\\n"); pi.on("session_start", () => { appendFileSync(process.env.BOUND_MARKER!, "session_start\\n"); pi.registerTool({ name: "probe_tool", label: "Probe", description: "Probe", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "ok" }] }; } }); pi.setActiveTools(["probe_tool"]); }); }\n`);
-		const runtimeExtensionPaths = [
-			path.join(repoRoot, "src/runs/shared/bound-tool-registry-bootstrap.ts"),
-			path.join(repoRoot, "src/runs/shared/subagent-prompt-runtime.ts"),
-			path.join(repoRoot, "src/runs/shared/bound-package-mediator.ts"),
-			path.join(repoRoot, "src/runs/shared/bound-tool-registry-gate.ts"),
-		];
+		const packageSource = path.join(root, "package-source"); fs.mkdirSync(path.join(packageSource, "agents"), { recursive: true });
+		fs.writeFileSync(path.join(packageSource, "package.json"), JSON.stringify({ name: "bound-registry-probe", version: "1.0.0", pi: { subagents: { agents: ["./agents"] } } }));
+		fs.writeFileSync(path.join(packageSource, "agents", "package.ts"), `import { appendFileSync } from "node:fs";\nexport default function (pi: any) { appendFileSync(process.env.BOUND_MARKER!, "factory:" + String(process.env.PI_SUBAGENT_TOOL_REGISTRY_POLICY) + "\\n"); pi.on("session_start", () => { appendFileSync(process.env.BOUND_MARKER!, "session_start\\n"); pi.registerTool({ name: "probe_tool", label: "Probe", description: "Probe", parameters: { type: "object", properties: {} }, async execute() { appendFileSync(process.env.BOUND_MARKER!, "tool_execute\\n"); return { content: [{ type: "text", text: "ok" }] }; } }); pi.setActiveTools(["probe_tool"]); }); }\n`);
+		fs.writeFileSync(path.join(packageSource, "agents", "probe.md"), "---\nname: package-probe\ndescription: Package probe\ntools: probe_tool\nsubagentOnlyExtensions: ./package.ts\n---\nProbe.\n");
+		const packed = spawnSync("npm", ["pack", packageSource, "--ignore-scripts", "--pack-destination", root], { encoding: "utf8", timeout: 30_000 });
+		assert.equal(packed.status, 0, packed.stderr); const tarball = path.join(root, packed.stdout.trim().split("\n").at(-1)!);
+		const unpackRoot = path.join(root, "packed"); fs.mkdirSync(unpackRoot);
+		const unpacked = spawnSync("tar", ["-xzf", tarball, "-C", unpackRoot], { encoding: "utf8", timeout: 30_000 }); assert.equal(unpacked.status, 0, unpacked.stderr);
+		const packageDir = path.join(unpackRoot, "package"); const packageExtension = path.join(packageDir, "agents", "package.ts");
+		fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [{ source: `file:${packageDir}` }] }));
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		let preflight;
+		try {
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			preflight = resolveActiveBoundLaunchContract({
+				request: { version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: "probe-request", ownerRunId: "probe-owner", nodeId: "probe-node", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", agent: "package-probe", task: "Probe", cwd: project, context: "fresh", model: "probe/probe", thinking: "off", artifacts: false, result: { kind: "text" } },
+				activeCwd: project, projectTrusted: true, sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "parent-session" },
+				availableModels: [{ provider: "probe", id: "probe", fullId: "probe/probe", api: "openai-completions", reasoning: false }],
+				serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "sessions"),
+				runtimePolicy: { foregroundTimeoutMs: 30_000, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1 },
+			});
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		}
+		assert.equal(preflight.ok, true, JSON.stringify(preflight)); if (!preflight.ok) return;
+		assert.deepEqual(preflight.contract.tools.requiredChildTools, ["probe_tool"]);
+		assert.deepEqual(preflight.contract.toolRegistry.projection.effectiveCallerTools, ["probe_tool"]);
+		assert.equal(preflight.contract.packageExtensions.length, 1);
+		const toolPlan = resolvePiLaunchToolPlan({
+			tools: ["probe_tool"], extensions: [], subagentOnlyExtensions: [packageExtension],
+			activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+		});
+		assert.deepEqual(toolPlan.effectiveToolAllowlist, ["probe_tool"]);
+		assert.deepEqual(toolPlan.requiredChildTools, ["probe_tool"]);
+		assert.equal(toolPlan.extensionArgs.includes(packageExtension), false);
+		const runtimeExtensionPaths = toolPlan.runtimeExtensions;
 		const evidenceRoot = packageEvidenceRoot(packageDir);
 		const policy = {
 			version: 1, modelApi: "openai-completions", piRuntimeVersion: version, proofNonce: "e".repeat(64), denialFd: 4, required: ["probe_tool"], internalTools: [],
@@ -83,8 +114,8 @@ test("installed Pi loads an exact mediated registry before one loopback provider
 		try {
 			gated = await runPi([
 				"--no-extensions", "--no-context-files", "--no-skills", "--no-themes", "--no-session",
-				"--model", "probe/probe", "--tools", "probe_tool",
-				"--extension", runtimeExtensionPaths[0]!, "--extension", runtimeExtensionPaths[1]!, "--extension", runtimeExtensionPaths[2]!, "--extension", runtimeExtensionPaths[3]!,
+				"--model", "probe/probe", "--tools", toolPlan.effectiveToolAllowlist.join(","),
+				...runtimeExtensionPaths.flatMap((extension) => ["--extension", extension]),
 				"-p", "probe",
 			], {
 				cwd: project,
@@ -96,9 +127,9 @@ test("installed Pi loads an exact mediated registry before one loopback provider
 			});
 		} finally { fs.closeSync(proofFd); fs.closeSync(denialFd); }
 		assert.equal(gated.status, 0, gated.stderr);
-		assert.equal(providerRequests, 1);
-		assert.deepEqual(wireNames, ["probe_tool"], wireBody);
-		assert.deepEqual(fs.readFileSync(marker, "utf8").trim().split("\n"), ["factory:undefined", "session_start"]);
+		assert.equal(providerRequests, 2);
+		assert.deepEqual(wireNames, [["probe_tool"], ["probe_tool"]], wireBody);
+		assert.deepEqual(fs.readFileSync(marker, "utf8").trim().split("\n"), ["factory:undefined", "session_start", "tool_execute"]);
 		const frame = JSON.parse(fs.readFileSync(proofPath, "utf8"));
 		assert.equal(frame.kind, "registry");
 		assert.deepEqual(frame.projection.required, ["probe_tool"]);
