@@ -21,6 +21,8 @@ export interface ActiveBoundPackageExtensionProjectionV1 {
 	evidenceRootDigest: string;
 }
 
+export type ActiveBoundPackageEvidenceCache = Map<string, string>;
+
 export interface ActiveBoundResolvedPackageExtensions {
 	paths: string[];
 	projection: ActiveBoundPackageExtensionProjectionV1[];
@@ -107,7 +109,7 @@ function resolveDependencyManifest(agent: AgentConfig, moduleName: string): stri
 }
 
 /** Resolve package-owned refs without importing extension code. */
-export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveBoundResolvedPackageExtensions {
+export function resolveActiveBoundPackageExtensions(agent: AgentConfig, passCache?: ActiveBoundPackageEvidenceCache): ActiveBoundResolvedPackageExtensions {
 	const refs = agent.subagentOnlyExtensions ?? [];
 	if (agent.source !== "package" || !agent.activeBoundPackageOwner) {
 		if (refs.length) throw new Error("Only package agents may own active-bound extension refs.");
@@ -115,19 +117,25 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 	}
 	if (refs.length > MAX_REFS || new Set(refs).size !== refs.length) throw new Error("Invalid active-bound extension refs.");
 	const owner = agent.activeBoundPackageOwner; const paths: string[] = []; const projection: ActiveBoundPackageExtensionProjectionV1[] = []; const evidenceRootByPath = new Map<string, string>();
-	const treeDigestByRoot = new Map<string, string>();
+	const ownerManifestPath = path.join(owner.rootPath, "package.json");
+	const ownerManifestStat = fs.lstatSync(ownerManifestPath);
+	if (!ownerManifestStat.isFile() || ownerManifestStat.isSymbolicLink() || ownerManifestStat.size > MAX_FILE_BYTES || fs.realpathSync(ownerManifestPath) !== ownerManifestPath
+		|| digest(fs.readFileSync(ownerManifestPath)) !== owner.manifestDigest) throw new Error("Active-bound owner manifest drifted.");
+	const treeDigestByRoot = passCache ?? new Map<string, string>();
 	const treeDigest = (entry: string, evidenceRoot: string): string => {
 		const relative = path.relative(evidenceRoot, entry);
 		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Package entry escapes its package root.");
-		const cached = treeDigestByRoot.get(evidenceRoot); if (cached) return cached;
-		const measured = packageTreeDigest(entry, evidenceRoot, owner.rootPath); treeDigestByRoot.set(evidenceRoot, measured); return measured;
+		const cacheKey = `${evidenceRoot}\0${owner.rootPath}\0${owner.manifestDigest}`;
+		const cached = treeDigestByRoot.get(cacheKey); if (cached) return cached;
+		const measured = packageTreeDigest(entry, evidenceRoot, owner.rootPath); treeDigestByRoot.set(cacheKey, measured); return measured;
 	};
 	for (const ref of refs) {
 		if (typeof ref !== "string") throw new Error("Invalid active-bound extension ref.");
 		if (safeRelative(ref)) {
 			const entry = regularCanonicalFile(path.resolve(path.dirname(agent.filePath), ref), owner.rootPath);
 			const evidenceRoot = packageEvidenceRoot(owner.rootPath);
-			paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "relative", ref, owner: publicIdentity(owner), entryDigest: digest(ref), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
+			const contentDigest = digest(entry.bytes);
+			paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "relative", ref, owner: publicIdentity(owner), entryDigest: digest(ref), contentDigest, evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 			continue;
 		}
 		if (!ref.startsWith("package:")) throw new Error("Invalid active-bound extension ref.");
@@ -142,7 +150,8 @@ export function resolveActiveBoundPackageExtensions(agent: AgentConfig): ActiveB
 		if (!Array.isArray(entries) || entries.length !== 1 || typeof entries[0] !== "string" || !safeManifestEntry(entries[0], dependency.identity.rootPath)) throw new Error("Ambiguous active-bound dependency extension entry.");
 		const entry = regularCanonicalFile(path.resolve(dependency.identity.rootPath, entries[0]), dependency.identity.rootPath);
 		const evidenceRoot = packageEvidenceRoot(owner.rootPath);
-		paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "package", ref, owner: publicIdentity(owner), package: publicIdentity(dependency.identity), entryDigest: digest(entries[0]), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
+		const contentDigest = digest(entry.bytes);
+		paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); projection.push({ kind: "package", ref, owner: publicIdentity(owner), package: publicIdentity(dependency.identity), entryDigest: digest(entries[0]), contentDigest, evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 	}
 	if (new Set(paths).size !== paths.length) throw new Error("Duplicate active-bound extension entry.");
 	const evidenceByPath = new Map(paths.map((entry, index) => {

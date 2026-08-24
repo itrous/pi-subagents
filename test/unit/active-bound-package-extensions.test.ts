@@ -57,6 +57,32 @@ describe("active-bound package extension refs", () => {
 		assert.equal(plan.disableAmbientExtensions, true); for (const entry of resolved.paths) assert.ok(plan.extensionArgs.includes(entry));
 	});
 
+	it("shares tree evidence only inside an explicit pass cache", () => {
+		const f = fixture(["./relative.ts"]);
+		const agent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		const pass = new Map<string, string>();
+		const first = resolveActiveBoundPackageExtensions(agent, pass);
+		fs.writeFileSync(path.join(f.owner, "unrelated.txt"), "changed after discovery\n");
+		const samePass = resolveActiveBoundPackageExtensions(agent, pass);
+		assert.equal(samePass.projection[0]?.packageTreeDigest, first.projection[0]?.packageTreeDigest);
+		assert.equal(samePass.projection[0]?.contentDigest, first.projection[0]?.contentDigest);
+		fs.appendFileSync(path.join(f.owner, "agents", "relative.ts"), "// entry drift\n");
+		const entryDrift = resolveActiveBoundPackageExtensions(agent, pass);
+		assert.notEqual(entryDrift.projection[0]?.contentDigest, first.projection[0]?.contentDigest);
+		assert.equal(entryDrift.projection[0]?.packageTreeDigest, first.projection[0]?.packageTreeDigest, "same-pass cache is provisional");
+		const finalSelectedRehash = resolveActiveBoundPackageExtensions(agent);
+		assert.notEqual(finalSelectedRehash.projection[0]?.packageTreeDigest, entryDrift.projection[0]?.packageTreeDigest, "final selected barrier rehashes");
+	});
+
+	it("rejects owner manifest drift before a pass-cache hit", () => {
+		const f = fixture(["./relative.ts"]);
+		const agent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		const pass = new Map<string, string>(); resolveActiveBoundPackageExtensions(agent, pass);
+		const manifest = path.join(f.owner, "package.json");
+		fs.writeFileSync(manifest, `${fs.readFileSync(manifest, "utf8")} `);
+		assert.throws(() => resolveActiveBoundPackageExtensions(agent, pass), /manifest drifted/);
+	});
+
 	it("keeps execution-order paths paired with their own attestation after public ref sorting", () => {
 		const f = fixture(["./z.ts", "./a.ts"]);
 		fs.writeFileSync(path.join(f.owner, "agents", "z.ts"), "export default function () { /* z */ }\n");
