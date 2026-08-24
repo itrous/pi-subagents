@@ -243,10 +243,11 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		return discoverProjectAgentsRestricted(requestCwd, trusted);
 	};
 	let discovered: ReturnType<typeof discoverAgents>;
+	const initialPackageEvidence = new Map<string, string>();
 	try {
 		discovered = discoverRestricted();
 		for (const candidate of discovered.agents) if (candidate.source === "package") {
-			const extensions = resolveActiveBoundPackageExtensions(candidate);
+			const extensions = resolveActiveBoundPackageExtensions(candidate, initialPackageEvidence);
 			candidate.activeBoundResolvedExtensions = extensions.paths;
 			candidate.activeBoundExtensionProjection = extensions.projection;
 		}
@@ -279,7 +280,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const resolvedSkills = resolveProjectSkillsUncached(skillNames, requestCwd);
 	if (resolvedSkills.missing.length > 0) return failure("missing_skill");
 	let packageExtensions;
-	try { packageExtensions = resolveActiveBoundPackageExtensions(agent); }
+	try { packageExtensions = resolveActiveBoundPackageExtensions(agent, initialPackageEvidence); }
 	catch { return failure("unsupported_mode"); }
 	if (agent.source === "package") {
 		agent.activeBoundResolvedExtensions = packageExtensions.paths;
@@ -415,8 +416,9 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" || input.ownedSessionDirIdentity) return failure("host_required"); }
 		if (freshBaseRoot !== baseRoot || freshSessionRoot !== sessionRoot || freshSessionDir !== sessionDir || freshSessionFile !== sessionFile) return failure("host_required");
 		const freshDiscovery = discoverRestricted();
+		const freshDiscoveryPackageEvidence = new Map<string, string>();
 		for (const candidate of freshDiscovery.agents) if (candidate.source === "package") {
-			const extensions = resolveActiveBoundPackageExtensions(candidate);
+			const extensions = resolveActiveBoundPackageExtensions(candidate, freshDiscoveryPackageEvidence);
 			candidate.activeBoundResolvedExtensions = extensions.paths;
 			candidate.activeBoundExtensionProjection = extensions.projection;
 		}
