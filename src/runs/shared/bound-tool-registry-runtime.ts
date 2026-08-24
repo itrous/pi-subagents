@@ -9,6 +9,7 @@ import { VERSION as PI_RUNTIME_VERSION } from "@earendil-works/pi-coding-agent";
 import { createJiti } from "jiti/static";
 import { cloneJsonWithinByteLimit } from "../../slash/delegation-json.ts";
 import { attestBoundRuntimeExtensions } from "./bound-runtime-evidence.ts";
+import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS } from "./core-runtime-tools.ts";
 import { packageTreeEvidence } from "./package-tree-evidence.ts";
 import {
 	TOOL_REGISTRY_MAX_PAYLOAD_BYTES,
@@ -147,7 +148,7 @@ interface BoundPackageToolOwnership {
 
 function newPackageToolOwnership(): BoundPackageToolOwnership {
 	return {
-		occupiedToolNames: new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...(runtimeHolder.state?.policy.internalTools ?? [])]),
+		occupiedToolNames: new Set([...ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, ...(runtimeHolder.state?.policy.internalTools ?? [])]),
 		packageToolOwners: new Map(),
 	};
 }
@@ -266,7 +267,7 @@ function packageNameForEntry(entry: string, evidenceRoot: string): string | unde
 
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
-	const runtimeOwned = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", ...runtimeHolder.state.policy.internalTools]);
+	const runtimeOwned = new Set([...ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, ...runtimeHolder.state.policy.internalTools]);
 	for (const name of runtimeHolder.state.policy.required) {
 		if (runtimeOwned.has(name)) continue;
 		(pi.registerTool as unknown as (tool: unknown) => unknown)({

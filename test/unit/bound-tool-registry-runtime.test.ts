@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { attestBoundRuntimeExtensions } from "../../src/runs/shared/bound-runtime-evidence.ts";
+import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from "../../src/runs/shared/core-runtime-tools.ts";
 import { packageEvidenceRoot, packageTreeDigest, packageTreeEvidence } from "../../src/runs/shared/package-tree-evidence.ts";
 import {
 	BOUND_TOOL_REGISTRY_ACTIVE_ENV,
@@ -18,7 +19,7 @@ import {
 	resetBoundToolRegistryRuntimeForTests,
 } from "../../src/runs/shared/bound-tool-registry-runtime.ts";
 
-function policy(packageExtensionPaths: string[] = [], modelApi = "openai-responses") {
+function policy(packageExtensionPaths: string[] = [], modelApi = "openai-responses", required = ["a"]) {
 	process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
 	const packageExtensions = packageExtensionPaths.map((entry) => {
 		const evidenceRoot = packageEvidenceRoot(path.dirname(entry));
@@ -28,7 +29,7 @@ function policy(packageExtensionPaths: string[] = [], modelApi = "openai-respons
 	const runtimeExtensions = attestBoundRuntimeExtensions([
 		path.join(sharedDir, "bound-tool-registry-bootstrap.ts"), path.join(sharedDir, "subagent-prompt-runtime.ts"), path.join(sharedDir, "bound-package-mediator.ts"), path.join(sharedDir, "bound-tool-registry-gate.ts"),
 	]);
-	return { version: 1, modelApi, piRuntimeVersion: "0.84.2", proofNonce: "d".repeat(64), denialFd: 4, required: ["a"], internalTools: [], packageExtensions, runtimeExtensions };
+	return { version: 1, modelApi, piRuntimeVersion: "0.84.2", proofNonce: "d".repeat(64), denialFd: 4, required, internalTools: [], packageExtensions, runtimeExtensions };
 }
 
 function openAiPayload() {
@@ -51,6 +52,10 @@ describe("bound tool registry child runtime", () => {
 		delete process.env[BOUND_TOOL_REGISTRY_POLICY_ENV];
 		delete process.env[BOUND_TOOL_REGISTRY_FD_ENV];
 		resetBoundToolRegistryRuntimeForTests();
+	});
+
+	it("shares the exact seven runtime-owned builtin names", () => {
+		assert.deepEqual([...CORE_RUNTIME_OWNED_TOOLS], ["read", "grep", "find", "ls", "bash", "edit", "write"]);
 	});
 
 	it("probes script wrappers and standalone Pi with the correct argv shape", () => {
@@ -181,6 +186,49 @@ describe("bound tool registry child runtime", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
+	it("loads all historical web names through the same placeholder replacement path", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-web-tool-"));
+		const extension = path.join(root, "extension.ts"); fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "web-owner", version: "1.0.0" }));
+		const webTools = ["fetch_content", "get_search_content", "web_search"];
+		fs.writeFileSync(extension, `export default function (pi: any) { for (const name of ${JSON.stringify(webTools)}) pi.registerTool({ name, label: name, description: name, parameters: {}, async execute() { return { content: [] }; } }); }\n`);
+		const output = path.join(root, "proof"); const fd = fs.openSync(output, "w");
+		process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(policy([extension], "openai-responses", webTools));
+		process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd); initializeBoundToolRegistryBootstrap();
+		const registrations: string[] = [];
+		await loadBoundPackageFactories({ registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any);
+		assert.deepEqual(registrations, [...webTools, ...webTools]);
+		fs.closeSync(fd); fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it("blocks missing, wrong, and extra package registrations at the pre-provider registry gate", async () => {
+		const originalExit = process.exit; (process as any).exit = (code: number) => { throw new Error(`exit:${code}`); };
+		try {
+			for (const scenario of ["missing", "wrong", "extra"] as const) {
+				const root = fs.mkdtempSync(path.join(os.tmpdir(), `registry-runtime-${scenario}-`));
+				const extensions: string[] = [];
+				if (scenario !== "missing") {
+					fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: `${scenario}-owner`, version: "1.0.0" }));
+					const extension = path.join(root, "extension.ts"); extensions.push(extension);
+					const names = scenario === "wrong" ? ["wrong_name"] : ["a", "extra_name"];
+					fs.writeFileSync(extension, `export default function (pi: any) { for (const name of ${JSON.stringify(names)}) pi.registerTool({ name, label: name, description: name, parameters: {}, async execute() { return { content: [] }; } }); }\n`);
+				}
+				const proofPath = path.join(root, "proof"); const fd = fs.openSync(proofPath, "w");
+				process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(policy(extensions)); process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
+				initializeBoundToolRegistryBootstrap();
+				const active = new Set<string>(); let providerHandler: ((event: { payload: unknown }, ctx: any) => unknown) | undefined;
+				const pi = {
+					registerTool(tool: { name: string }) { active.add(tool.name); },
+					getActiveTools() { return [...active]; },
+					on(event: string, handler: typeof providerHandler) { if (event === "before_provider_request") providerHandler = handler; },
+				} as any;
+				await loadBoundPackageFactories(pi); registerBoundToolRegistryGate(pi);
+				assert.throws(() => providerHandler!({ payload: openAiPayload() }, { model: { api: "openai-responses" } }), /exit:78/);
+				assert.equal(JSON.parse(fs.readFileSync(proofPath, "utf8")).code, scenario === "extra" ? "active_registry_drift" : "package_load_error");
+				resetBoundToolRegistryRuntimeForTests(); fs.rmSync(root, { recursive: true, force: true });
+			}
+		} finally { process.exit = originalExit; }
+	});
+
 	it("does not attest ambient peers above the owner package root", () => {
 		const parent = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-ambient-peer-"));
 		const owner = path.join(parent, "owner");
@@ -229,6 +277,13 @@ describe("bound tool registry child runtime", () => {
 		mediated.registerTool({ name: "a", execute() {} });
 		mediated.registerTool({ name: "a", execute() {} });
 		assert.deepEqual(registrations, ["a", "a"]);
+	});
+
+	it("rejects package ownership collisions with every runtime-owned builtin", () => {
+		const registrations: string[] = [];
+		const mediated = createBoundPackageApi({ registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any) as any;
+		for (const name of ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS) assert.throws(() => mediated.registerTool({ name, execute() {} }));
+		assert.deepEqual(registrations, []);
 	});
 
 	it("rejects one package factory replacing another package factory tool", () => {

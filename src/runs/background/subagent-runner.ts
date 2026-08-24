@@ -86,7 +86,7 @@ import { markProcessTerminalCandidateLeaseRelease, writeProcessTerminalCandidate
 import { createSteeringStatus, recordSteeringRequest, steeringStatus, terminalSteeringNoticeState, updateSteeringTarget } from "./steering.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse, readStatus } from "../../shared/utils.ts";
-import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
+import { evaluateCompletionMutationGuard, isPotentialMutationToolCall } from "../shared/completion-guard.ts";
 import {
 	createMutatingFailureState,
 	didMutatingToolFail,
@@ -666,7 +666,7 @@ function runPiStreaming(
 					structuredOutputToolInvoked = true;
 					structuredOutputMessageStartIndex = messages.length;
 				}
-				observedMutationAttempt = observedMutationAttempt || isMutatingTool(event.toolName, event.args);
+				observedMutationAttempt = observedMutationAttempt || isPotentialMutationToolCall(event.toolName, event.args);
 				const toolArgs = extractToolArgsPreview(event.args ?? {});
 				writeOutputLine(toolArgs ? `${event.toolName}: ${toolArgs}` : event.toolName);
 				return;

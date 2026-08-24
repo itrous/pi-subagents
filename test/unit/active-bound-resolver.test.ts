@@ -153,8 +153,8 @@ describe("restricted active-bound resolver", () => {
 		}
 	});
 
-	it("rejects supervisor tools while fixed intercom policy is off", () => {
-		for (const tool of ["intercom", "contact_supervisor"]) {
+	it("rejects project-owned custom, historical web, and supervisor tools", () => {
+		for (const tool of ["git_read", "web_search", "fetch_content", "get_search_content", "intercom", "contact_supervisor"]) {
 			const cwd = path.join(root, `no-${tool}`); setup(cwd);
 			fs.writeFileSync(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: bound-worker\ndescription: Worker\ntools: ${tool}\n---\nPrompt.\n`);
 			assert.deepEqual(resolveActiveBoundLaunchContract(input(cwd, request(cwd, { skill: false }))), { ok: false, code: "unsupported_mode" });

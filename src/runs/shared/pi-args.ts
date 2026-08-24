@@ -52,6 +52,7 @@ import {
 	PERMISSION_POLICY_ENV,
 	type PermissionRules,
 } from "./permissions.ts";
+import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS, isActiveBoundPackageToolName } from "./core-runtime-tools.ts";
 import {
 	SUBAGENT_CAPABILITY_CEILING_ENV,
 	capabilityCeilingAgentRestrictionSources,
@@ -357,6 +358,14 @@ export function resolvePermissionSystemExtension(): string | undefined {
 export function resolvePiLaunchToolPlan(
 	input: ResolvePiLaunchToolPlanInput,
 ): PiLaunchToolPlan {
+	if (input.activeBoundPackageMediator && input.tools !== undefined) {
+		const packageProvidedTools = input.tools.filter((tool) => !CORE_RUNTIME_OWNED_TOOLS.has(tool));
+		if (new Set(input.tools).size !== input.tools.length
+			|| packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
+			|| (packageProvidedTools.length > 0 && (input.subagentOnlyExtensions?.length ?? 0) === 0)) {
+			throw new Error("Active-bound tool names must not overlap reserved names and package names require an attested factory plus wire-safe uniqueness.");
+		}
+	}
 	const capabilityCeiling = intersectSubagentCapabilityCeilings(
 		input.capabilityCeiling,
 		input.inheritedCapabilityCeiling,
