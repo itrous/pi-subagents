@@ -20,8 +20,9 @@ launch contract уже связывает canonical cwd, но admission изли
 
 - `source === "package"`;
 - уже проходит прежний `forbiddenAgentMode`: fresh, без project-context/skills,
-  memory/default reads, external runner, async/artifacts/acceptance и прочих
-  ambient возможностей;
+  memory/default reads, external runner, async/acceptance и прочих ambient
+  возможностей; A1P2 отдельно требует `artifacts:false` для external cwd
+  (exact-active прежний session-artifact contract сохраняется);
 - не имеет project refinement в active discovery cwd;
 - package extensions/factories проходят прежнюю owner attestation, resolver-pass
   evidence cache и final/runtime rehash без послаблений.
@@ -57,8 +58,12 @@ packages/settings/agents/skills/refinements или MCP config. Итоговый 
 быть package-owned; ambiguity/refinement проверяются в active discovery root.
 Для любого active-bound package carrier (external и exact-active cwd)
 `request.skill` обязан быть absent/false, а package `agent.skills` уже запрещён
-прежним режимом. MCP launch/tool plan для external carrier разрешается только от
-active discovery root; execution cwd не может добавить `.mcp.json`/`.pi/mcp.json`. Child запускается с прежним
+прежним режимом. External carrier с `mcpDirectTools` **или package extension
+`pi-mcp-adapter`** в A1P2 fail closed: безопасная передача merged active-root MCP
+config в Pi child требует отдельного adapter contract и не нужна E2 basic corpus.
+Проверка учитывает owner/package identity attested extension projection, а не
+только строку ref. Execution cwd не может включить eager/proxy MCP чтением
+`.mcp.json`/`.pi/mcp.json`. Exact-active carrier сохраняет прежний MCP contract. Child запускается с прежним
 `disableAmbientExtensions`/exact tool registry, `inheritProjectContext:false` и
 `inheritSkills:false`; package tool/extension ownership измеряется по package
 owner, а не execution cwd.
@@ -68,22 +73,28 @@ owner, а не execution cwd.
 1. Package-owned strict fresh carrier: external real cwd проходит preflight и
    launch contract/receipt связывают exact canonical cwd.
 2. Тот же mismatch для project agent остаётся `invalid_cwd`.
-3. Missing/file cwd fail closed. Новый mismatched external cwd, переданный через
-   symlink alias, fail closed; прежний exact-active alias сохраняет realpath-equality
-   и существующий позитивный контракт.
-4. External `.pi/settings`, packages, agents, skills и MCP config не меняют
-   active package discovery/model scope/tool plan; explicit `request.skill` у
+3. Missing/file cwd fail closed. Новый mismatched external cwd с symlink в
+   leaf-компоненте fail closed; symlink-префикс ОС канонизируется, а прежний
+   exact-active alias сохраняет realpath-equality и существующий позитивный контракт.
+4. External `.pi/settings`, packages, agents и skills не меняют active package
+   discovery/model scope; external carrier с `mcpDirectTools` или attested
+   `pi-mcp-adapter` extension fail closed, а external MCP config не читается.
+   Separate fixtures cover both `owner.name` and dependency `package.name`
+   adapter identities without selectors; positive exact-active fixture with the
+   same MCP contract remains green. Explicit `request.skill` у
    package carrier fail closed и при external, и при exact-active cwd.
    External refinement не применяется и не создаёт denial, тогда как refinement
    того же package agent в active discovery root сохраняет прежний fail-closed
    `unsupported_mode`. Контрольные fixtures обязаны отличать dual-root реализацию
    от ошибочного discovery/overlay по requestCwd.
-5. Относительный/подменённый Pi executable во внешнем cwd никогда не выбирается;
+5. External `artifacts:true, artifactDir:"session"` fail closed, while the
+   existing exact-active session-artifact positive remains green.
+6. Относительный/подменённый Pi executable во внешнем cwd никогда не выбирается;
    runtime attestation остаётся привязана к active root.
-6. Spawn/runtime proof подтверждают внешний cwd; package extension/tool registry
+7. Spawn/runtime proof подтверждают внешний cwd; package extension/tool registry
    initial/fresh/final/runtime evidence остаются exact, включая execution
    rediscovery от active discovery root.
-7. Все A1/A1P unit/integration/probe suites green; independent review закрывает
+8. Все A1/A1P unit/integration/probe suites green; independent review закрывает
    critical/high. После commit onecpi pin обновляется только через отдельный E2
    addendum и packed corpus gate.
 

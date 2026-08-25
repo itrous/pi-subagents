@@ -136,6 +136,8 @@ export interface BuildPiArgsInput {
 	systemPrompt?: string | null;
 	mcpDirectTools?: string[];
 	cwd?: string;
+	/** Active-bound discovery/config root; child still spawns in cwd. */
+	discoveryCwd?: string;
 	promptFileStem?: string;
 	intercomSessionName?: string;
 	orchestratorIntercomTarget?: string;
@@ -222,6 +224,7 @@ export interface ResolvePiLaunchToolPlanInput {
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
 	cwd?: string;
+	discoveryCwd?: string;
 	requireReadTool?: boolean;
 	structuredOutput?:
 		| boolean
@@ -406,7 +409,7 @@ export function resolvePiLaunchToolPlan(
 			);
 	const resolvedMcpSelections = capabilityCeiling?.denyExtensions
 		? []
-		: resolveMcpDirectToolSelections(input.mcpDirectTools, input.cwd);
+		: resolveMcpDirectToolSelections(input.mcpDirectTools, input.discoveryCwd ?? input.cwd);
 	const effectiveMcpSelections = resolvedMcpSelections.filter(
 		(selection) => !allowedToolSet || allowedToolSet.has(selection.name),
 	);
@@ -575,6 +578,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		mcpDirectTools: input.mcpDirectTools,
 		cwd: input.cwd,
+		discoveryCwd: input.discoveryCwd,
 		requireReadTool: input.requireReadTool,
 		structuredOutput: input.structuredOutput,
 		capabilityCeiling: input.capabilityCeiling,

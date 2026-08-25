@@ -1720,6 +1720,8 @@ export interface RunSyncOptions {
 	beforeSpawn?: (materializedLaunchDigest: string) => void;
 	/** Private active-bound path: resolve only uncached nearest-project skills. */
 	activeBoundProjectSkills?: boolean;
+	/** Private active-bound discovery/runtime root, distinct from child execution cwd. */
+	activeBoundDiscoveryCwd?: string;
 	/** Private active-bound per-spawn values; empty object still selects isolated mode. */
 	activeBoundEnvironment?: import("../api/active-bound-environment.ts").ActiveBoundEnvironmentV1;
 	/** Private active-bound mode: artifact writers activate only after child spawn. */
