@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ResolvedSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
@@ -45,6 +46,8 @@ export interface ActiveBoundRuntimeService {
 	readonly version: 1;
 	readonly serverInstanceId: string;
 	readonly sourceIdentityDigest: string;
+	/** Canonical active-session root used for bound discovery/runtime evidence. */
+	discoveryCwd(): string | undefined;
 	preflight(input: unknown): ActiveBoundPreflightResponseV1;
 	admit(request: ActiveBoundPreflightRequestV1, binding: ActiveBoundBindingV1): ActiveBoundAdmissionResult;
 	verifyPendingCancellation(tuple: { requestId: string; ownerRunId: string; nodeId: string }, binding: ActiveBoundBindingV1): boolean;
@@ -195,6 +198,7 @@ export function createActiveBoundRuntimeService(options: CreateActiveBoundRuntim
 		version: 1,
 		serverInstanceId: options.serverInstanceId,
 		sourceIdentityDigest: options.sourceIdentityDigest,
+		discoveryCwd() { try { const cwd = options.getContext()?.cwd; return cwd ? fs.realpathSync(cwd) : undefined; } catch { return undefined; } },
 		preflight(input) {
 			const parsed = parseActiveBoundPreflightRequest(input);
 			if (!parsed.ok) return { version: 1, code: "invalid_request" };

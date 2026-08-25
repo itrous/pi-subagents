@@ -9,6 +9,7 @@ import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from ".
 import { packageEvidenceRoot, packageTreeDigest, packageTreeEvidence } from "../../src/runs/shared/package-tree-evidence.ts";
 import {
 	BOUND_TOOL_REGISTRY_ACTIVE_ENV,
+	BOUND_TOOL_REGISTRY_CWD_ENV,
 	BOUND_TOOL_REGISTRY_FD_ENV,
 	BOUND_TOOL_REGISTRY_POLICY_ENV,
 	boundPiVersionProbeArgs,
@@ -21,6 +22,7 @@ import {
 
 function policy(packageExtensionPaths: string[] = [], modelApi = "openai-responses", required = ["a"]) {
 	process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
+	process.env[BOUND_TOOL_REGISTRY_CWD_ENV] = fs.realpathSync(process.cwd());
 	const packageExtensions = packageExtensionPaths.map((entry) => {
 		const evidenceRoot = packageEvidenceRoot(path.dirname(entry));
 		return { path: entry, contentDigest: createHash("sha256").update(fs.readFileSync(entry)).digest("hex"), evidenceRoot, evidenceRootDigest: createHash("sha256").update(evidenceRoot).digest("hex"), packageTreeDigest: packageTreeDigest(entry, evidenceRoot, evidenceRoot) };
@@ -51,6 +53,7 @@ describe("bound tool registry child runtime", () => {
 		delete process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV];
 		delete process.env[BOUND_TOOL_REGISTRY_POLICY_ENV];
 		delete process.env[BOUND_TOOL_REGISTRY_FD_ENV];
+		delete process.env[BOUND_TOOL_REGISTRY_CWD_ENV];
 		resetBoundToolRegistryRuntimeForTests();
 	});
 
@@ -70,6 +73,13 @@ describe("bound tool registry child runtime", () => {
 		await loadBoundPackageFactories({} as any);
 		assert.equal(process.env[BOUND_TOOL_REGISTRY_POLICY_ENV], undefined);
 		assert.equal(process.env[BOUND_TOOL_REGISTRY_FD_ENV], undefined);
+	});
+
+	it("fails closed when child runtime cwd differs from the bound spawn cwd", () => {
+		process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(policy()); process.env[BOUND_TOOL_REGISTRY_FD_ENV] = "3"; process.env[BOUND_TOOL_REGISTRY_CWD_ENV] = path.join(process.cwd(), "wrong-cwd");
+		const originalExit = process.exit; (process as any).exit = (code: number) => { throw new Error(`exit:${code}`); };
+		try { assert.throws(() => initializeBoundToolRegistryBootstrap(), /exit:78/); }
+		finally { process.exit = originalExit; }
 	});
 
 	it("returns a detached exact outgoing payload and writes one projection", () => {

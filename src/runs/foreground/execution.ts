@@ -5,7 +5,7 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import type { Readable } from "node:stream";
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, realpathSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
@@ -59,7 +59,7 @@ import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard, isPotentialMutationToolCall } from "../shared/completion-guard.ts";
 import { arbitrateCompletionGuardRescue } from "../shared/llm-intent-arbiter.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
-import { attestPiSpawnCommand } from "../shared/pi-command-evidence.ts";
+import { attestPiSpawnCommand, resolveAttestedPiSpawnCommand } from "../shared/pi-command-evidence.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { resolvePermissionRules } from "../shared/permissions.ts";
@@ -71,7 +71,7 @@ import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../s
 import { formatProcessSignalError, isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
-import { BOUND_PACKAGE_MUTATION_EXIT, BOUND_TOOL_REGISTRY_ACTIVE_ENV, BOUND_TOOL_REGISTRY_FD_ENV, BOUND_TOOL_REGISTRY_POLICY_ENV } from "../shared/bound-tool-registry-runtime.ts";
+import { BOUND_PACKAGE_MUTATION_EXIT, BOUND_TOOL_REGISTRY_ACTIVE_ENV, BOUND_TOOL_REGISTRY_CWD_ENV, BOUND_TOOL_REGISTRY_FD_ENV, BOUND_TOOL_REGISTRY_POLICY_ENV } from "../shared/bound-tool-registry-runtime.ts";
 import { createToolRegistryCollector, type ToolRegistryCollected, type ToolRegistryCollector } from "../shared/tool-registry-collector.ts";
 import { expectedToolRegistryProjection } from "../shared/tool-registry-proof.ts";
 import { createDeniedToolCollector, type DeniedToolCollected, type DeniedToolCollector } from "../shared/denied-tool-proof.ts";
@@ -409,6 +409,7 @@ async function runSingleAttempt(
 		systemPrompt: appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget),
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
+		discoveryCwd: options.activeBoundDiscoveryCwd,
 		promptFileStem: agent.name,
 		intercomSessionName: options.intercomSessionName,
 		orchestratorIntercomTarget: options.orchestratorIntercomTarget,
@@ -442,6 +443,7 @@ async function runSingleAttempt(
 		subagentOnlyExtensions: launchSubagentOnlyExtensions,
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
+		discoveryCwd: options.activeBoundDiscoveryCwd,
 		requireReadTool: Boolean(shared.resolvedSkillNames?.length),
 		structuredOutput: Boolean(options.structuredOutput),
 		capabilityCeiling: options.capabilityCeiling,
@@ -462,7 +464,7 @@ async function runSingleAttempt(
 		? canonicalSha256({ modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions })
 		: undefined;
 	let piCommandEvidence;
-	try { piCommandEvidence = options.activeBoundToolRegistry ? attestPiSpawnCommand(options.cwd ?? runtimeCwd) : undefined; }
+	try { piCommandEvidence = options.activeBoundToolRegistry ? attestPiSpawnCommand(options.activeBoundDiscoveryCwd ?? options.cwd ?? runtimeCwd) : undefined; }
 	catch (error) {
 		cleanupTempDir(tempDir);
 		const message = `Failed to attest Pi command before spawn: ${error instanceof Error ? error.message : String(error)}`;
@@ -475,6 +477,7 @@ async function runSingleAttempt(
 	}
 	const launchContractDigest = launchBindingDigest({
 		definitionDigest: agentDefinitionDigest(agent),
+		canonicalCwd: options.activeBoundToolRegistry ? realpathSync(options.cwd ?? runtimeCwd) : undefined,
 		task: shared.originalTask ?? task,
 		...(modelArg ? { model: modelArg } : {}),
 		modelCandidates: shared.modelCandidates,
@@ -590,6 +593,7 @@ async function runSingleAttempt(
 	delete spawnEnv[BOUND_TOOL_REGISTRY_ACTIVE_ENV];
 	delete spawnEnv[BOUND_TOOL_REGISTRY_POLICY_ENV];
 	delete spawnEnv[BOUND_TOOL_REGISTRY_FD_ENV];
+	delete spawnEnv[BOUND_TOOL_REGISTRY_CWD_ENV];
 	if (options.activeBoundToolRegistry) {
 		const deniedExact = new Set(["NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV", "ZDOTDIR"]);
 		for (const key of Object.keys(spawnEnv)) {
@@ -608,6 +612,7 @@ async function runSingleAttempt(
 			packageExtensions: (boundPackageExtensions?.attestations ?? []).map((entry) => ({ ...entry })),
 		});
 		spawnEnv[BOUND_TOOL_REGISTRY_FD_ENV] = "3";
+		spawnEnv[BOUND_TOOL_REGISTRY_CWD_ENV] = realpathSync(options.cwd ?? runtimeCwd);
 	}
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
@@ -620,7 +625,9 @@ async function runSingleAttempt(
 	let deniedToolProofReceived = false;
 	let childSpawned = false;
 	const exitCode = await new Promise<number>((resolve, reject) => {
-		const spawnSpec = getPiSpawnCommand(args);
+		const spawnSpec = options.activeBoundToolRegistry
+			? resolveAttestedPiSpawnCommand(args, options.activeBoundDiscoveryCwd ?? options.cwd ?? runtimeCwd)
+			: getPiSpawnCommand(args);
 		try { options.beforeSpawn?.(launchContractDigest); } catch (error) { cleanupTempDir(tempDir); reject(error); return; }
 		attemptTimeout = resolveAttemptTimeout(options);
 		if (attemptTimeout?.remainingMs === 0) {
@@ -1704,7 +1711,7 @@ async function runSyncCompletion(
 		alignForkedSessionCwd(options.sessionFile, options.cwd ?? runtimeCwd);
 	}
 	const skillNames = options.skills ?? agent.skills ?? [];
-	const skillCwd = options.cwd ?? runtimeCwd;
+	const skillCwd = options.activeBoundDiscoveryCwd ?? options.cwd ?? runtimeCwd;
 	const { resolved: resolvedSkills, missing: missingSkills } = options.activeBoundProjectSkills
 		? resolveProjectSkillsUncached(skillNames, skillCwd)
 		: resolveSkillsWithFallback(

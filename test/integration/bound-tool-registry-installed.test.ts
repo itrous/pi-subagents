@@ -121,7 +121,7 @@ test("installed Pi loads and executes a packed owner tool after exact mediated r
 				cwd: project,
 				env: {
 					...process.env, PI_CODING_AGENT_DIR: agentDir, BOUND_MARKER: marker,
-					PI_SUBAGENT_TOOL_REGISTRY_ACTIVE: "1", PI_SUBAGENT_TOOL_REGISTRY_POLICY: JSON.stringify(policy), PI_SUBAGENT_TOOL_REGISTRY_FD: "3",
+					PI_SUBAGENT_TOOL_REGISTRY_ACTIVE: "1", PI_SUBAGENT_TOOL_REGISTRY_POLICY: JSON.stringify(policy), PI_SUBAGENT_TOOL_REGISTRY_FD: "3", PI_SUBAGENT_TOOL_REGISTRY_CWD: fs.realpathSync(project),
 				},
 				fd3: proofFd, fd4: denialFd,
 			});

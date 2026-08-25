@@ -163,10 +163,16 @@ function forbiddenAgentMode(agent: AgentConfig): boolean {
 export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunchContractInput): ResolveActiveBoundLaunchContractResult {
 	if (input.request.targetServerInstanceId !== input.serverInstanceId
 		|| !input.serverInstanceId.trim() || !/^[0-9a-f]{64}$/u.test(input.sourceIdentityDigest)) return failure("unverified_source");
-	const requestCwd = canonicalDirectory(input.request.cwd);
 	const activeCwd = canonicalDirectory(input.activeCwd);
-	if (!requestCwd || !activeCwd || requestCwd !== activeCwd) return failure("invalid_cwd");
-	if (input.request.context !== "fresh"
+	if (!activeCwd) return failure("invalid_cwd");
+	const requestedPath = path.isAbsolute(input.request.cwd) ? input.request.cwd : path.resolve(activeCwd, input.request.cwd);
+	const requestCwd = canonicalDirectory(requestedPath);
+	if (!requestCwd) return failure("invalid_cwd");
+	const externalCwd = requestCwd !== activeCwd;
+	// Existing exact-active aliases retain canonical realpath equality. A new
+	// external execution root must itself be canonical, never a symlink alias.
+	if (externalCwd) { try { if (fs.lstatSync(path.resolve(requestedPath)).isSymbolicLink()) return failure("invalid_cwd"); } catch { return failure("invalid_cwd"); } }
+	if (input.request.context !== "fresh" || (externalCwd && input.request.artifacts !== false)
 		|| ((input.request.artifacts !== false || input.request.artifactDir !== undefined)
 			&& (input.request.artifacts !== true || input.request.artifactDir !== "session"))) return failure("unsupported_mode");
 	let parentSessionFile: string | null | undefined;
@@ -237,10 +243,10 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return failure("host_required"); }
 	}
 	const discoverRestricted = () => {
-		if (input.discover) return input.discover(requestCwd, "project");
+		if (input.discover) return input.discover(activeCwd, "project");
 		let trusted = input.projectTrusted === true;
 		if (input.isProjectTrusted) { try { trusted = input.isProjectTrusted() === true; } catch { trusted = false; } }
-		return discoverProjectAgentsRestricted(requestCwd, trusted);
+		return discoverProjectAgentsRestricted(activeCwd, trusted);
 	};
 	let discovered: ReturnType<typeof discoverAgents>;
 	const initialPackageEvidence = new Map<string, string>();
@@ -253,13 +259,13 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		}
 	} catch { return failure("unsupported_mode"); }
 	const resolved = resolveAgentName(input.request.agent, discovered.agents);
-	if (resolved.error) return failure("ambiguous_agent");
-	if (!resolved.agent) return failure("missing_agent");
+	if (resolved.error) return failure(externalCwd ? "invalid_cwd" : "ambiguous_agent");
+	if (!resolved.agent) return failure(externalCwd ? "invalid_cwd" : "missing_agent");
 	const agent = resolved.agent;
 	let hasRefinement: boolean;
-	try { hasRefinement = fs.existsSync(getAgentRefinementPath(requestCwd, agent.name)); }
+	try { hasRefinement = fs.existsSync(getAgentRefinementPath(activeCwd, agent.name)); }
 	catch { return failure("unsupported_mode"); }
-	if (forbiddenAgentMode(agent) || hasRefinement) return failure("unsupported_mode");
+	if ((externalCwd && agent.source !== "package") || forbiddenAgentMode(agent) || hasRefinement || (externalCwd && Boolean(agent.mcpDirectTools?.length))) return failure(externalCwd && agent.source !== "package" ? "invalid_cwd" : "unsupported_mode");
 	if (capabilityCeilingAgentRestrictionMessage(agent.name, input.capabilityCeiling)) return failure("restricted_agent");
 	const exactModel = input.availableModels.find((entry) => `${entry.provider}/${entry.id}` === input.request.model && (entry.fullId === undefined || entry.fullId === input.request.model));
 	if (!exactModel || checkModelScope(input.request.model, discovered.modelScope, "explicit")
@@ -276,8 +282,9 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const explicitSkills = Array.isArray(input.request.skill)
 		? input.request.skill.map((name) => name.trim()).filter(Boolean)
 		: normalizeSkillInput(input.request.skill);
+	if (agent.source === "package" && explicitSkills !== undefined && explicitSkills !== false && explicitSkills.length > 0) return failure("unsupported_mode");
 	const skillNames = explicitSkills === false ? [] : explicitSkills ?? agent.skills ?? [];
-	const resolvedSkills = resolveProjectSkillsUncached(skillNames, requestCwd);
+	const resolvedSkills = resolveProjectSkillsUncached(skillNames, activeCwd);
 	if (resolvedSkills.missing.length > 0) return failure("missing_skill");
 	let packageExtensions;
 	try { packageExtensions = resolveActiveBoundPackageExtensions(agent, initialPackageEvidence); }
@@ -287,6 +294,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		agent.activeBoundExtensionProjection = packageExtensions.projection;
 	}
 	if (packageExtensions.paths.length > 0 && input.capabilityCeiling?.denyExtensions) return failure("restricted_agent");
+	if (externalCwd && packageExtensions.projection.some((entry) => entry.owner.name === "pi-mcp-adapter" || entry.package?.name === "pi-mcp-adapter")) return failure("unsupported_mode");
 	if ((agent.mcpDirectTools?.length ?? 0) > 0 && !packageExtensions.projection.some((entry) => entry.kind === "package" && entry.package?.name === "pi-mcp-adapter")) return failure("unsupported_mode");
 	const boundCeiling = input.capabilityCeiling;
 	const explicitAgentTools = agent.tools ?? [];
@@ -301,7 +309,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: boundTools, extensions: [], subagentOnlyExtensions: packageExtensions.paths,
 			mcpDirectTools: agent.mcpDirectTools,
-			cwd: requestCwd, requireReadTool: resolvedSkills.resolved.length > 0,
+			cwd: activeCwd, requireReadTool: resolvedSkills.resolved.length > 0,
 			structuredOutput: input.request.result.kind === "structured", capabilityCeiling: boundCeiling, agentName: agent.name,
 			disablePermissionSystemExtension: true,
 			activeBoundPackageMediator: true,
@@ -351,9 +359,9 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	try { runtimeExtensions = attestBoundRuntimeExtensions(toolPlan.runtimeExtensions); }
 	catch { return failure("unsupported_mode"); }
 	const toolRegistryDigest = canonicalSha256({ modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions });
-	let piCommandEvidence; try { piCommandEvidence = attestPiSpawnCommand(requestCwd); } catch { return failure("unsupported_mode"); }
+	let piCommandEvidence; try { piCommandEvidence = attestPiSpawnCommand(activeCwd); } catch { return failure("unsupported_mode"); }
 	const launchBindingInput = {
-		definitionDigest, task: input.request.task,
+		definitionDigest, canonicalCwd: requestCwd, task: input.request.task,
 		model: materializedModel, modelCandidates: [materializedModel], thinking: input.request.thinking, systemPrompt,
 		systemPromptMode: agent.systemPromptMode, inheritProjectContext: agent.inheritProjectContext, inheritSkills: agent.inheritSkills,
 		skills: skillNames, environment, packageExtensions: packageExtensions.projection, piCommandEvidence, toolRegistry: { modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions, digest: toolRegistryDigest }, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: packageExtensions.paths, mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
@@ -437,8 +445,8 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 			|| agentDefinitionDigest(freshResolved.agent) !== definitionDigest
 			|| fileDigest(freshResolved.agent.filePath) !== agentBytesDigest
 			|| optionalDigest(freshDiscovery.modelScope) !== optionalDigest(discovered.modelScope)
-			|| fs.existsSync(getAgentRefinementPath(requestCwd, freshResolved.agent.name))) return failure("unsupported_mode");
-		const freshSkills = resolveProjectSkillsUncached(skillNames, requestCwd);
+			|| fs.existsSync(getAgentRefinementPath(activeCwd, freshResolved.agent.name))) return failure("unsupported_mode");
+		const freshSkills = resolveProjectSkillsUncached(skillNames, activeCwd);
 		if (freshSkills.missing.length > 0) return failure("missing_skill");
 		const freshSkillEvidence = freshSkills.resolved.map((skill) => ({ name: skill.name, source: skill.source, contentDigest: fileDigest(skill.path) }));
 		if (canonicalSha256(freshSkillEvidence) !== canonicalSha256(skillEvidence)) return failure("unsupported_mode");

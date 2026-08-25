@@ -81,6 +81,7 @@ export function agentDefinitionDigest(agent: AgentConfig): string {
 
 export interface LaunchBindingInput {
 	definitionDigest: string;
+	canonicalCwd?: string;
 	/** Caller task; runtime acceptance/output task annotations are explicitly outside the preflight-known subset. */
 	task?: string;
 	model?: string;
@@ -111,6 +112,7 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 	return {
 		version: LAUNCH_BINDING_PROJECTION_VERSION,
 		definitionDigest: input.definitionDigest,
+		canonicalCwd: input.canonicalCwd,
 		taskDigest: input.task === undefined ? undefined : sha256(input.task),
 		model: input.model,
 		modelCandidates: input.modelCandidates,

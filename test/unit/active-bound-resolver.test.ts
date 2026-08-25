@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -90,6 +91,40 @@ describe("restricted active-bound resolver", () => {
 		assert.equal(withArtifacts.ok, true); if (!withArtifacts.ok) return;
 		assert.equal(withArtifacts.contract.policy.artifacts, true); assert.equal(withArtifacts.contract.policy.artifactDir, "session"); assert.match(withArtifacts.contract.roots.artifactRootDigest ?? "", /^[0-9a-f]{64}$/);
 		assert.notEqual(withArtifacts.contract.launchInputsDigest, first.contract.launchInputsDigest); assert.equal(fs.existsSync(path.join(root, "child-sessions")), false);
+	});
+
+	it("allows only package-owned carriers to use a canonical external execution cwd while discovery stays active-root", () => {
+		const active = path.join(root, "active"); const external = path.join(root, "external"); const files = setup(active); fs.mkdirSync(external, { recursive: true });
+		const discovered = discoverAgents(active, "both"); const projectAgent = discovered.agents.find((item) => item.name === "bound-worker")!;
+		const packageRoot = path.join(active, "package"); fs.mkdirSync(path.join(packageRoot, "agents"), { recursive: true }); const ownerManifest = JSON.stringify({ name: "bound-fixture", version: "1.0.0", dependencies: { "pi-mcp-adapter": "1.0.0" } }); fs.writeFileSync(path.join(packageRoot, "package.json"), ownerManifest);
+		const packageFile = path.join(packageRoot, "agents", "bound-worker.md"); fs.copyFileSync(files.agent, packageFile);
+		const packageAgent = { ...projectAgent, source: "package" as const, filePath: packageFile, skills: [], inheritProjectContext: false, inheritSkills: false, defaultContext: "fresh" as const, activeBoundPackageOwner: { name: "bound-fixture", version: "1.0.0", manifestDigest: createHash("sha256").update(ownerManifest).digest("hex"), rootPath: packageRoot } };
+		fs.mkdirSync(path.join(external, ".pi", "agents"), { recursive: true }); fs.writeFileSync(path.join(external, ".pi", "agents", "bound-worker.md"), "---\nname: bound-worker\ndescription: attacker\ntools: write\n---\nattack\n"); fs.writeFileSync(path.join(external, ".pi", "settings.json"), "{}"); fs.writeFileSync(path.join(external, ".mcp.json"), JSON.stringify({ mcpServers: { attacker: { command: "false" } } }));
+		const calls: string[] = []; const discover = ((cwd: string) => { calls.push(cwd); return { ...discovered, agents: [packageAgent] }; }) as typeof discoverAgents;
+		const result = resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: false })), discover });
+		assert.equal(result.ok, true); if (!result.ok) return;
+		assert.equal(result.contract.canonicalCwd, fs.realpathSync(external)); assert.deepEqual(calls, [fs.realpathSync(active), fs.realpathSync(active)]);
+		const relative = resolveActiveBoundLaunchContract({ ...input(active, request(path.relative(active, external), { skill: false })), discover }); assert.equal(relative.ok, true); if (relative.ok) assert.equal(relative.contract.canonicalCwd, fs.realpathSync(external)); assert.deepEqual(result.contract.mcpDirectTools, []);
+		const externalRefinement = getAgentRefinementPath(external, "bound-worker"); fs.mkdirSync(path.dirname(externalRefinement), { recursive: true }); fs.writeFileSync(externalRefinement, "external must be ignored");
+		assert.equal(resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: false })), discover }).ok, true);
+		const activeRefinement = getAgentRefinementPath(active, "bound-worker"); fs.mkdirSync(path.dirname(activeRefinement), { recursive: true }); fs.writeFileSync(activeRefinement, "active remains fail closed");
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: false })), discover }), { ok: false, code: "unsupported_mode" }); fs.rmSync(activeRefinement);
+		const projectOnly = resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: false })), discover: (() => ({ ...discovered, agents: [projectAgent] })) as typeof discoverAgents });
+		assert.deepEqual(projectOnly, { ok: false, code: "invalid_cwd" });
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: ["bound-skill"] })), discover }), { ok: false, code: "unsupported_mode" });
+		const discoverMcp = (() => ({ ...discovered, agents: [{ ...packageAgent, mcpDirectTools: ["trusted-server"] }] })) as typeof discoverAgents;
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: false })), discover: discoverMcp }), { ok: false, code: "unsupported_mode" });
+		const adapterRoot = path.join(packageRoot, "node_modules", "pi-mcp-adapter"); fs.mkdirSync(adapterRoot, { recursive: true }); fs.writeFileSync(path.join(adapterRoot, "package.json"), JSON.stringify({ name: "pi-mcp-adapter", version: "1.0.0", pi: { extensions: ["./index.ts"] } })); fs.writeFileSync(path.join(adapterRoot, "index.ts"), "export default function adapter() {}\n");
+		const adapterAgent = { ...packageAgent, subagentOnlyExtensions: ["package:pi-mcp-adapter"] }; const discoverAdapter = (() => ({ ...discovered, agents: [adapterAgent] })) as typeof discoverAgents;
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: false })), discover: discoverAdapter }), { ok: false, code: "unsupported_mode" });
+		const adapterOwnerRoot = path.join(active, "adapter-owner"); fs.mkdirSync(path.join(adapterOwnerRoot, "agents"), { recursive: true }); const adapterOwnerManifest = JSON.stringify({ name: "pi-mcp-adapter", version: "1.0.0" }); fs.writeFileSync(path.join(adapterOwnerRoot, "package.json"), adapterOwnerManifest); fs.writeFileSync(path.join(adapterOwnerRoot, "ext.ts"), "export default function adapter() {}\n"); const adapterOwnerAgentFile = path.join(adapterOwnerRoot, "agents", "bound-worker.md"); fs.copyFileSync(files.agent, adapterOwnerAgentFile);
+		const adapterOwnerAgent = { ...packageAgent, filePath: adapterOwnerAgentFile, subagentOnlyExtensions: ["./ext.ts"], activeBoundPackageOwner: { name: "pi-mcp-adapter", version: "1.0.0", manifestDigest: createHash("sha256").update(adapterOwnerManifest).digest("hex"), rootPath: adapterOwnerRoot } }; const discoverAdapterOwner = (() => ({ ...discovered, agents: [adapterOwnerAgent] })) as typeof discoverAgents;
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(external, { skill: false })), discover: discoverAdapterOwner }), { ok: false, code: "unsupported_mode" });
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(active, { skill: ["bound-skill"] })), discover }), { ok: false, code: "unsupported_mode" });
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, { ...request(external, { skill: false }), artifacts: true, artifactDir: "session" }), discover }), { ok: false, code: "unsupported_mode" });
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(path.join(root, "missing-external"), { skill: false })), discover }), { ok: false, code: "invalid_cwd" }); const externalFile = path.join(root, "external-file"); fs.writeFileSync(externalFile, "not a directory"); assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(externalFile, { skill: false })), discover }), { ok: false, code: "invalid_cwd" });
+		const alias = path.join(root, "external-alias"); fs.symlinkSync(external, alias);
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...input(active, request(alias, { skill: false })), discover }), { ok: false, code: "invalid_cwd" });
 	});
 
 	it("fails exact model, cwd, session and deterministic-root restrictions closed", () => {

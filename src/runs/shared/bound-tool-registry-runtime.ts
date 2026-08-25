@@ -25,6 +25,7 @@ import {
 export const BOUND_TOOL_REGISTRY_ACTIVE_ENV = "PI_SUBAGENT_TOOL_REGISTRY_ACTIVE";
 export const BOUND_TOOL_REGISTRY_POLICY_ENV = "PI_SUBAGENT_TOOL_REGISTRY_POLICY";
 export const BOUND_TOOL_REGISTRY_FD_ENV = "PI_SUBAGENT_TOOL_REGISTRY_FD";
+export const BOUND_TOOL_REGISTRY_CWD_ENV = "PI_SUBAGENT_TOOL_REGISTRY_CWD";
 export const BOUND_TOOL_REGISTRY_MISMATCH_EXIT = 78;
 export const BOUND_PACKAGE_MUTATION_EXIT = 76;
 const writeProofBytes = fs.writeSync.bind(fs);
@@ -49,11 +50,14 @@ export function initializeBoundToolRegistryBootstrap(): void {
 	const active = process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV];
 	const encoded = process.env[BOUND_TOOL_REGISTRY_POLICY_ENV];
 	const fdText = process.env[BOUND_TOOL_REGISTRY_FD_ENV];
+	const expectedCwd = process.env[BOUND_TOOL_REGISTRY_CWD_ENV];
 	delete process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV];
 	delete process.env[BOUND_TOOL_REGISTRY_POLICY_ENV];
 	delete process.env[BOUND_TOOL_REGISTRY_FD_ENV];
+	delete process.env[BOUND_TOOL_REGISTRY_CWD_ENV];
 	if (active !== "1") return;
-	if (!encoded || !fdText || !/^[1-9][0-9]*$/u.test(fdText) || Number(fdText) < 3) process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT);
+	if (!encoded || !fdText || !expectedCwd || !/^[1-9][0-9]*$/u.test(fdText) || Number(fdText) < 3) process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT);
+	try { if (fs.realpathSync(process.cwd()) !== expectedCwd) process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT); } catch { process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT); }
 	let parsed: unknown;
 	try { parsed = JSON.parse(encoded!); } catch { process.exit(BOUND_TOOL_REGISTRY_MISMATCH_EXIT); }
 	const policy = validateBoundToolRegistryPolicy(parsed);

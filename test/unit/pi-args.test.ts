@@ -1183,6 +1183,15 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.equal(args[args.indexOf("--tools") + 1], "read,project-mcp_inspect");
 	});
 
+	it("uses active-bound discovery cwd for MCP config while preserving child cwd", () => {
+		const fixture = createMcpFixture(); const external = path.join(fixture.root, "external"); fs.mkdirSync(external);
+		process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
+		writeMcpFixture(fixture, { serverName: "active-mcp", configPath: path.join(fixture.projectDir, ".mcp.json"), tools: [{ name: "inspect" }] });
+		writeJson(path.join(external, ".mcp.json"), { mcpServers: { attacker: { command: "false" } } });
+		const { args } = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["active-mcp"], cwd: external, discoveryCwd: fixture.projectDir });
+		assert.equal(args[args.indexOf("--tools") + 1], "read,active-mcp_inspect");
+	});
+
 	it("keeps selected tools when an unselected server has invalid cache identity", () => {
 		const fixture = createMcpFixture();
 		const good = { command: "good" };

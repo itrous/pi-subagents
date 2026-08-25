@@ -1545,6 +1545,16 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 	});
 
 
+	it("spawns active-bound child in external cwd while runtime evidence stays on active discovery root", async () => {
+		const active = path.join(tempDir, "active-root"); const external = path.join(tempDir, "external-root"); fs.mkdirSync(active); fs.mkdirSync(external);
+		mockPi.onCall({ output: "external-ok", boundToolRegistryNames: ["read"] });
+		const result = await runSync(external, [makeAgent("echo", { tools: ["read"] })], "echo", "external bound", {
+			runId: "bound-external-cwd", acceptance: false, disableWatchdog: true, activeBoundProjectSkills: true, activeBoundDiscoveryCwd: active,
+			activeBoundEnvironment: {}, launchToolsOverride: ["read"], activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+		});
+		assert.equal(result.exitCode, 0, result.error); assert.equal(readCall().cwd, external);
+	});
+
 	it("projects measured bound registry mismatch before accepting child output", async () => {
 		mockPi.onCall({ output: "must not succeed", boundToolRegistryNames: ["extra", "read"] });
 		const previousNodeOptions = process.env.NODE_OPTIONS; process.env.NODE_OPTIONS = "--require=/ambient-preload-must-not-run.cjs";
