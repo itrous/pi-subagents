@@ -52,6 +52,7 @@ import {
 	PERMISSION_POLICY_ENV,
 	type PermissionRules,
 } from "./permissions.ts";
+import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS, isActiveBoundPackageToolName } from "./core-runtime-tools.ts";
 import {
 	SUBAGENT_CAPABILITY_CEILING_ENV,
 	capabilityCeilingAgentRestrictionSources,
@@ -135,6 +136,8 @@ export interface BuildPiArgsInput {
 	systemPrompt?: string | null;
 	mcpDirectTools?: string[];
 	cwd?: string;
+	/** Active-bound discovery/config root; child still spawns in cwd. */
+	discoveryCwd?: string;
 	promptFileStem?: string;
 	intercomSessionName?: string;
 	orchestratorIntercomTarget?: string;
@@ -221,6 +224,7 @@ export interface ResolvePiLaunchToolPlanInput {
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
 	cwd?: string;
+	discoveryCwd?: string;
 	requireReadTool?: boolean;
 	structuredOutput?:
 		| boolean
@@ -357,6 +361,14 @@ export function resolvePermissionSystemExtension(): string | undefined {
 export function resolvePiLaunchToolPlan(
 	input: ResolvePiLaunchToolPlanInput,
 ): PiLaunchToolPlan {
+	if (input.activeBoundPackageMediator && input.tools !== undefined) {
+		const packageProvidedTools = input.tools.filter((tool) => !CORE_RUNTIME_OWNED_TOOLS.has(tool));
+		if (new Set(input.tools).size !== input.tools.length
+			|| packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
+			|| (packageProvidedTools.length > 0 && (input.subagentOnlyExtensions?.length ?? 0) === 0)) {
+			throw new Error("Active-bound tool names must not overlap reserved names and package names require an attested factory plus wire-safe uniqueness.");
+		}
+	}
 	const capabilityCeiling = intersectSubagentCapabilityCeilings(
 		input.capabilityCeiling,
 		input.inheritedCapabilityCeiling,
@@ -397,7 +409,7 @@ export function resolvePiLaunchToolPlan(
 			);
 	const resolvedMcpSelections = capabilityCeiling?.denyExtensions
 		? []
-		: resolveMcpDirectToolSelections(input.mcpDirectTools, input.cwd);
+		: resolveMcpDirectToolSelections(input.mcpDirectTools, input.discoveryCwd ?? input.cwd);
 	const effectiveMcpSelections = resolvedMcpSelections.filter(
 		(selection) => !allowedToolSet || allowedToolSet.has(selection.name),
 	);
@@ -566,6 +578,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		mcpDirectTools: input.mcpDirectTools,
 		cwd: input.cwd,
+		discoveryCwd: input.discoveryCwd,
 		requireReadTool: input.requireReadTool,
 		structuredOutput: input.structuredOutput,
 		capabilityCeiling: input.capabilityCeiling,

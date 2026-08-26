@@ -1183,6 +1183,15 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		assert.equal(args[args.indexOf("--tools") + 1], "read,project-mcp_inspect");
 	});
 
+	it("uses active-bound discovery cwd for MCP config while preserving child cwd", () => {
+		const fixture = createMcpFixture(); const external = path.join(fixture.root, "external"); fs.mkdirSync(external);
+		process.env.PI_CODING_AGENT_DIR = fixture.agentDir;
+		writeMcpFixture(fixture, { serverName: "active-mcp", configPath: path.join(fixture.projectDir, ".mcp.json"), tools: [{ name: "inspect" }] });
+		writeJson(path.join(external, ".mcp.json"), { mcpServers: { attacker: { command: "false" } } });
+		const { args } = buildPiArgs({ baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false, tools: ["read"], mcpDirectTools: ["active-mcp"], cwd: external, discoveryCwd: fixture.projectDir });
+		assert.equal(args[args.indexOf("--tools") + 1], "read,active-mcp_inspect");
+	});
+
 	it("keeps selected tools when an unselected server has invalid cache identity", () => {
 		const fixture = createMcpFixture();
 		const good = { command: "good" };
@@ -1534,6 +1543,33 @@ describe("bound runtime extension evidence", () => {
 });
 
 describe("active-bound mediated extension order", () => {
+	it("accepts exact package-provided caller names only with a factory projection", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "git_read", "web_search"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],
+			activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+		});
+		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "git_read", "web_search"]);
+		assert.deepEqual(plan.requiredChildTools, ["read", "git_read", "web_search"]);
+		for (const tools of [
+			["read", "git_read"],
+			["read", "bad,name"],
+			["read", "bad name"],
+			["read", "工具"],
+			["read", `a${"x".repeat(64)}`],
+			["read", "read"],
+			["read", "subagent"],
+			["read", "subagent_wait"],
+			["read", "contact_supervisor"],
+			["read", "intercom"],
+			["read", "cursor"],
+		] as string[][]) {
+			assert.throws(() => resolvePiLaunchToolPlan({
+				tools, extensions: [], subagentOnlyExtensions: tools[1] === "git_read" ? [] : ["/trusted/package-extension.ts"],
+				activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+			}), /Active-bound/);
+		}
+	});
+
 	it("loads bootstrap, mediator and registry gate without direct package entries", () => {
 		const plan = resolvePiLaunchToolPlan({
 			tools: ["read"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],

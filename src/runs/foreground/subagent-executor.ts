@@ -410,6 +410,7 @@ interface ExecutionContextData {
 	parentPiSessionId?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	activeBoundProof?: ActiveBoundExecutionProofV1;
+	activeBoundDiscoveryCwd?: string;
 	boundSpawnBudget?: { commit(): void; rollback(): void };
 	boundBaseRootIdentity?: ActiveBoundRootIdentityV1;
 	boundRootIdentity?: ActiveBoundRootIdentityV1;
@@ -4071,6 +4072,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				singleModelAttempt: true,
 				disableWatchdog: true,
 				activeBoundProjectSkills: true,
+				activeBoundDiscoveryCwd: data.activeBoundDiscoveryCwd!,
 				activeBoundEnvironment: Object.assign(Object.create(null), data.activeBoundProof.request.environment ?? {}),
 				deferArtifactsUntilSpawn: data.activeBoundProof.request.artifacts,
 				parentDepthOverride: data.activeBoundProof.contract.policy.parentDepth,
@@ -5552,11 +5554,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (activeBoundProof?.contract.canonicalCwd) effectiveParams = { ...effectiveParams, cwd: activeBoundProof.contract.canonicalCwd };
 		const scope: AgentScope = activeBoundProof ? "project" : resolveExecutionAgentScope(effectiveParams.agentScope);
 		const effectiveCwd = effectiveParams.cwd ?? ctx.cwd;
+		const activeBoundDiscoveryCwd = activeBoundProof
+			? (typeof deps.activeBoundRuntime?.discoveryCwd === "function" ? deps.activeBoundRuntime.discoveryCwd() : (() => { try { return fs.realpathSync(ctx.cwd); } catch { return undefined; } })())
+			: undefined;
+		if (activeBoundProof && !activeBoundDiscoveryCwd) return buildRequestedModeError(effectiveParams, "Active-bound discovery root is unavailable.");
 		const parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
 		let projectTrusted = false;
 		try { projectTrusted = ctx.isProjectTrusted?.() === true; } catch { projectTrusted = false; }
 		let discovered: ReturnType<ExecutorDeps["discoverAgents"]>;
-		try { discovered = activeBoundProof ? discoverProjectAgentsRestricted(effectiveCwd, projectTrusted) : deps.discoverAgents(effectiveCwd, scope); }
+		try { discovered = activeBoundProof ? discoverProjectAgentsRestricted(activeBoundDiscoveryCwd!, projectTrusted) : deps.discoverAgents(effectiveCwd, scope); }
 		catch (error) {
 			if (activeBoundProof) return buildRequestedModeError(effectiveParams, "Active-bound launch contract changed before spawn.");
 			throw error;
@@ -5904,6 +5910,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			parentPiSessionId: requestPiSessionId,
 			capabilityCeiling: activeBoundProof?.contract.tools?.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(requestSessionId),
 			activeBoundProof,
+			activeBoundDiscoveryCwd,
 			boundSpawnBudget,
 			boundBaseRootIdentity,
 			boundRootIdentity,

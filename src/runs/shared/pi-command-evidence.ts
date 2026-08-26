@@ -67,7 +67,7 @@ function isNativeExecutable(bytes: Buffer): boolean {
 		|| bytes.subarray(0, 2).equals(Buffer.from("MZ"))
 		|| ["feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe"].includes(bytes.subarray(0, 4).toString("hex"));
 }
-function attestShebang(entries: PiCommandEvidenceV1["entries"], executable: { canonical: string; bytes: Buffer }, cwd: string, plainScript = false): void {
+function attestShebang(entries: PiCommandEvidenceV1["entries"], executable: { canonical: string; bytes: Buffer }, cwd: string, plainScript = false, visited = new Set<string>(), depth = 0): void {
 	const source = executable.bytes.toString("utf8");
 	if (!source.startsWith("#!")) {
 		// A native standalone executable is the host-selected, fully measured command TCB.
@@ -77,18 +77,53 @@ function attestShebang(entries: PiCommandEvidenceV1["entries"], executable: { ca
 	}
 	const newline = source.indexOf("\n"); if (newline < 0) throw new Error("Invalid Pi shebang.");
 	const interpreter = addInterpreterEvidence(entries, source.slice(2, newline), cwd);
-	if (!/^(?:da)?sh$/u.test(path.basename(interpreter))) { attestScriptPackage(entries, executable.canonical); return; }
+	if (!isShellCommand(interpreter)) { attestScriptPackage(entries, executable.canonical); return; }
+	if (depth >= 16) throw new Error("Pi shell wrapper depth exceeded.");
+	if (visited.has(executable.canonical)) throw new Error("Cyclic Pi shell wrapper."); visited.add(executable.canonical);
 	const body = source.slice(newline + 1).split(/\r?\n/u).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
 	if (body.length !== 1) throw new Error("Unsupported shell Pi wrapper.");
 	const match = /^exec\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s+"\$@"$/u.exec(body[0]!);
 	if (!match) throw new Error("Unsupported shell Pi wrapper.");
 	const targetCommand = token(match[1], match[2], match[3]); const targetScript = token(match[4], match[5], match[6]);
-	const target = measured("wrapper-target", resolvePathCommand(targetCommand, cwd)); entries.push(target.evidence); attestShebang(entries, target, cwd);
-	const script = measured("script", path.isAbsolute(targetScript) ? targetScript : path.resolve(cwd, targetScript)); entries.push(script.evidence); attestScriptPackage(entries, script.canonical);
+	const target = measured("wrapper-target", resolvePathCommand(targetCommand, cwd)); entries.push(target.evidence); attestShebang(entries, target, cwd, false, visited, depth + 1);
+	const script = measured("script", path.isAbsolute(targetScript) ? targetScript : path.resolve(cwd, targetScript)); entries.push(script.evidence); attestShebang(entries, script, cwd, true, visited, depth + 1); attestScriptPackage(entries, script.canonical);
+}
+
+function isShellCommand(command: string): boolean { return /^(?:ba|da)?sh$/u.test(path.basename(command)); }
+function shellWrapperInvocation(command: string, cwd: string): { command: string; script: string } | undefined {
+	const source = fs.readFileSync(command, "utf8"); if (!source.startsWith("#!")) return undefined;
+	const newline = source.indexOf("\n"); if (newline < 0) throw new Error("Invalid Pi shebang.");
+	const parts = source.slice(2, newline).trim().split(/\s+/u); let interpreter = resolvePathCommand(parts[0]!, cwd);
+	if (path.basename(interpreter) === "env") { if (parts.length !== 2) throw new Error("Unsupported env shebang."); interpreter = resolvePathCommand(parts[1]!, cwd); }
+	else if (parts.length !== 1) throw new Error("Unsupported interpreter arguments.");
+	if (!isShellCommand(interpreter)) return undefined;
+	const body = source.slice(newline + 1).split(/\r?\n/u).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+	if (body.length !== 1) throw new Error("Unsupported shell Pi wrapper.");
+	const match = /^exec\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s+"\$@"$/u.exec(body[0]!);
+	if (!match) throw new Error("Unsupported shell Pi wrapper.");
+	const targetCommand = token(match[1], match[2], match[3]); const targetScript = token(match[4], match[5], match[6]);
+	return { command: fs.realpathSync(resolvePathCommand(targetCommand, cwd)), script: fs.realpathSync(path.isAbsolute(targetScript) ? targetScript : path.resolve(cwd, targetScript)) };
+}
+
+export function resolveAttestedPiSpawnCommand(args: string[], cwd = process.cwd()): { command: string; args: string[] } {
+	const spawn = getPiSpawnCommand(args); const base = getPiSpawnCommand([]); let command = fs.realpathSync(resolvePathCommand(spawn.command, cwd));
+	let resolvedArgs = [...spawn.args];
+	if (base.args[0] && !base.args[0].startsWith("-") && !path.isAbsolute(base.args[0])) resolvedArgs[0] = fs.realpathSync(path.resolve(cwd, base.args[0]));
+	const visited = new Set<string>();
+	for (let depth = 0; depth < 16; depth++) {
+		const scriptCandidate = isShellCommand(command) && Boolean(resolvedArgs[0]);
+		const candidate = scriptCandidate ? fs.realpathSync(resolvedArgs[0]!) : command;
+		if (visited.has(candidate)) throw new Error("Cyclic Pi shell wrapper."); visited.add(candidate);
+		const wrapper = shellWrapperInvocation(candidate, cwd); if (!wrapper) return { command, args: resolvedArgs };
+		command = wrapper.command; resolvedArgs = [wrapper.script, ...(scriptCandidate ? resolvedArgs.slice(1) : resolvedArgs)];
+	}
+	throw new Error("Pi shell wrapper depth exceeded.");
 }
 
 export function attestPiSpawnCommand(cwd = process.cwd()): PiCommandEvidenceV1 {
-	const spawn = getPiSpawnCommand([]); const executable = measured("executable", resolvePathCommand(spawn.command, cwd));
+	const original = getPiSpawnCommand([]); const spawn = { command: resolvePathCommand(original.command, cwd), args: [...original.args] };
+	if (spawn.args[0] && !spawn.args[0].startsWith("-") && !path.isAbsolute(spawn.args[0])) spawn.args[0] = path.resolve(cwd, spawn.args[0]);
+	const executable = measured("executable", spawn.command);
 	const entries: PiCommandEvidenceV1["entries"] = [executable.evidence]; attestShebang(entries, executable, cwd);
 	if (spawn.args[0]) {
 		const script = measured("script", path.isAbsolute(spawn.args[0]) ? spawn.args[0] : path.resolve(cwd, spawn.args[0])); entries.push(script.evidence); attestShebang(entries, script, cwd, true); attestScriptPackage(entries, script.canonical);

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { discoverProjectAgentsRestricted } from "../../src/agents/agents.ts";
+import { discoverAgents, discoverProjectAgentsRestricted } from "../../src/agents/agents.ts";
 import { resolveActiveBoundPackageExtensions } from "../../src/api/active-bound-package-extensions.ts";
 import { resolveActiveBoundLaunchContract } from "../../src/api/active-bound-resolver.ts";
 import { resolvePiLaunchToolPlan } from "../../src/runs/shared/pi-args.ts";
@@ -54,6 +55,88 @@ describe("active-bound package extension refs", () => {
 		assert.doesNotMatch(JSON.stringify(resolved.projection), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		const plan = resolvePiLaunchToolPlan({ tools: ["read"], extensions: [], subagentOnlyExtensions: resolved.paths, disablePermissionSystemExtension: true });
 		assert.equal(plan.disableAmbientExtensions, true); for (const entry of resolved.paths) assert.ok(plan.extensionArgs.includes(entry));
+	});
+
+	it("shares tree evidence only inside an explicit pass cache", () => {
+		const f = fixture(["./relative.ts"]);
+		const agent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		const pass = new Map<string, string>();
+		const first = resolveActiveBoundPackageExtensions(agent, pass);
+		fs.writeFileSync(path.join(f.owner, "unrelated.txt"), "changed after discovery\n");
+		const samePass = resolveActiveBoundPackageExtensions(agent, pass);
+		assert.equal(samePass.projection[0]?.packageTreeDigest, first.projection[0]?.packageTreeDigest);
+		assert.equal(samePass.projection[0]?.contentDigest, first.projection[0]?.contentDigest);
+		fs.appendFileSync(path.join(f.owner, "agents", "relative.ts"), "// entry drift\n");
+		const entryDrift = resolveActiveBoundPackageExtensions(agent, pass);
+		assert.notEqual(entryDrift.projection[0]?.contentDigest, first.projection[0]?.contentDigest);
+		assert.equal(entryDrift.projection[0]?.packageTreeDigest, first.projection[0]?.packageTreeDigest, "same-pass cache is provisional");
+		const finalSelectedRehash = resolveActiveBoundPackageExtensions(agent);
+		assert.notEqual(finalSelectedRehash.projection[0]?.packageTreeDigest, entryDrift.projection[0]?.packageTreeDigest, "final selected barrier rehashes");
+	});
+
+	it("rejects owner manifest drift before a pass-cache hit", () => {
+		const f = fixture(["./relative.ts"]);
+		const agent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		const pass = new Map<string, string>(); resolveActiveBoundPackageExtensions(agent, pass);
+		const manifest = path.join(f.owner, "package.json");
+		fs.writeFileSync(manifest, `${fs.readFileSync(manifest, "utf8")} `);
+		assert.throws(() => resolveActiveBoundPackageExtensions(agent, pass), /manifest drifted/);
+	});
+
+	it("keeps execution-order paths paired with their own attestation after public ref sorting", () => {
+		const f = fixture(["./z.ts", "./a.ts"]);
+		fs.writeFileSync(path.join(f.owner, "agents", "z.ts"), "export default function () { /* z */ }\n");
+		fs.writeFileSync(path.join(f.owner, "agents", "a.ts"), "export default function () { /* a */ }\n");
+		const agent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		const resolved = resolveActiveBoundPackageExtensions(agent);
+		assert.deepEqual(resolved.projection.map((entry) => entry.ref), ["./a.ts", "./z.ts"]);
+		assert.deepEqual(resolved.paths.map((entry) => path.basename(entry)), ["z.ts", "a.ts"]);
+		for (const attestation of resolved.attestations) {
+			assert.equal(attestation.contentDigest, createHash("sha256").update(fs.readFileSync(attestation.path)).digest("hex"), attestation.path);
+		}
+	});
+
+	it("admits wire-safe package tools through the exact attested projection", () => {
+		const f = fixture(["./relative.ts"]); const sessions = path.join(root, "custom-sessions"); fs.mkdirSync(sessions);
+		fs.writeFileSync(path.join(f.owner, "agents", "worker.md"), "---\nname: package-worker\ndescription: Package worker\ntools: read, git_read, web_search\nsubagentOnlyExtensions: ./relative.ts\n---\nWorker\n");
+		fs.writeFileSync(path.join(f.owner, "agents", "relative.ts"), "export default function (pi: any) { for (const name of ['git_read', 'web_search']) pi.registerTool({ name, label: name, description: name, parameters: {}, async execute() { return { content: [] }; } }); }\n");
+		const discovered = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		assert.deepEqual(discovered.tools, ["read", "git_read", "web_search"]);
+		assert.equal(resolveActiveBoundPackageExtensions(discovered).projection.length, 1);
+		const request = { version: 1 as const, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: "request", ownerRunId: "owner", nodeId: "node", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", agent: "package-worker", task: "Inspect", cwd: f.project, context: "fresh" as const, model: "test/exact", thinking: "off" as const, artifacts: false, result: { kind: "text" as const } };
+		const baseInput = { request, activeCwd: f.project, projectTrusted: true, sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "session" }, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }], serverInstanceId: request.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), defaultSessionDir: sessions, runtimePolicy: { foregroundTimeoutMs: 1000, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1 } };
+		const accepted = resolveActiveBoundLaunchContract(baseInput); assert.equal(accepted.ok, true, JSON.stringify(accepted)); if (!accepted.ok) return;
+		assert.deepEqual(accepted.contract.tools.effectiveAllowlist, ["read", "git_read", "web_search"]);
+		assert.deepEqual(accepted.contract.tools.requiredChildTools, ["read", "git_read", "web_search"]);
+		assert.deepEqual(accepted.contract.toolRegistry.projection.required, ["git_read", "read", "web_search"]);
+		assert.deepEqual(accepted.contract.toolRegistry.projection.effectiveCallerTools, ["git_read", "read", "web_search"]);
+		assert.deepEqual(resolveActiveBoundLaunchContract({ ...baseInput, capabilityCeiling: { version: 1, allowedTools: ["read"], denyExtensions: false, sources: ["test"] } }), { ok: false, code: "restricted_agent" });
+		const firstDigest = accepted.contract.digest;
+		fs.appendFileSync(path.join(f.owner, "agents", "relative.ts"), "// factory bytes drift\n");
+		const factoryMutated = resolveActiveBoundLaunchContract(baseInput); assert.equal(factoryMutated.ok, true); if (!factoryMutated.ok) return;
+		assert.notEqual(factoryMutated.contract.digest, firstDigest);
+		fs.writeFileSync(path.join(f.owner, "agents", "worker.md"), "---\nname: package-worker\ndescription: Package worker\ntools: read, git_read_v2, web_search\nsubagentOnlyExtensions: ./relative.ts\n---\nWorker\n");
+		const toolListMutated = resolveActiveBoundLaunchContract(baseInput); assert.equal(toolListMutated.ok, true); if (toolListMutated.ok) assert.notEqual(toolListMutated.contract.digest, factoryMutated.contract.digest);
+	});
+
+	it("rejects package names without factories and malformed or colliding caller names before launch", () => {
+		const f = fixture([]); const sessions = path.join(root, "invalid-sessions"); fs.mkdirSync(sessions);
+		const request = { version: 1 as const, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: "request", ownerRunId: "owner", nodeId: "node", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", agent: "package-worker", task: "Inspect", cwd: f.project, context: "fresh" as const, model: "test/exact", thinking: "off" as const, artifacts: false, result: { kind: "text" as const } };
+		const baseInput = { request, activeCwd: f.project, projectTrusted: true, sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "session" }, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }], serverInstanceId: request.targetServerInstanceId, sourceIdentityDigest: "a".repeat(64), defaultSessionDir: sessions, runtimePolicy: { foregroundTimeoutMs: 1000, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1 } };
+		for (const tool of ["git_read", "web_search"]) {
+			fs.writeFileSync(path.join(f.owner, "agents", "worker.md"), `---\nname: package-worker\ndescription: Package worker\ntools: read, ${tool}\n---\nWorker\n`);
+			assert.deepEqual(resolveActiveBoundLaunchContract(baseInput), { ok: false, code: "unsupported_mode" });
+		}
+		fs.writeFileSync(path.join(f.owner, "agents", "relative.ts"), "export default function () {}\n");
+		const baseAgent = discoverProjectAgentsRestricted(f.project, true).agents[0]!;
+		for (const tools of [
+			["read", "bad,name"], ["read", "bad name"], ["read", "工具"], ["read", `a${"x".repeat(64)}`],
+			["read", "read"], ["read", "structured_output"], ["read", "subagent"], ["read", "subagent_wait"], ["read", "contact_supervisor"], ["read", "intercom"], ["read", "cursor"], ["read", "mcp:server/tool"],
+		]) {
+			const agent = { ...baseAgent, tools, subagentOnlyExtensions: ["./relative.ts"] };
+			const discover = (() => ({ agents: [agent], projectAgentsDir: null })) as typeof discoverAgents;
+			assert.deepEqual(resolveActiveBoundLaunchContract({ ...baseInput, discover }), { ok: false, code: "unsupported_mode" }, JSON.stringify(tools));
+		}
 	});
 
 	it("publishes only the bound projection and rejects an external extension ceiling", () => {
