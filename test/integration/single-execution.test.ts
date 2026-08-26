@@ -1731,15 +1731,16 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 	it("preserves cancellation before the bound gate emits a frame", async () => {
 		mockPi.onCall({ waitForPath: path.join(tempDir, "never-release-bound-registry-cancel"), ignoreSigterm: true });
-		const controller = new AbortController(); const startedAt = Date.now();
-		setTimeout(() => controller.abort(), 500);
-		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound cancel", {
+		const controller = new AbortController();
+		const run = runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound cancel", {
 			runId: "bound-registry-cancel", acceptance: false, disableWatchdog: true, signal: controller.signal,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
 			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
+		const readinessDeadline = Date.now() + 5_000; while (mockPi.callCount() < 1 && Date.now() < readinessDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(mockPi.callCount(), 1, "mock Pi must install its SIGTERM handler before cancellation"); const cancelledAt = Date.now(); controller.abort(); const result = await run;
 		assert.equal(controller.signal.aborted, true);
-		assert.ok(Date.now() - startedAt >= 2_800, "active-bound cancellation must wait for SIGKILL and observed close");
+		assert.ok(Date.now() - cancelledAt >= 2_800, "active-bound cancellation must wait for SIGKILL and observed close");
 		assert.equal(result.nativeStatus, undefined);
 		assert.equal(result.toolRegistryError, undefined);
 	});
