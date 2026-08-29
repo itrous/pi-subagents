@@ -14,11 +14,12 @@ probe also became inconsistent with its documented command.
    Pi 0.84.1/0.84.2 fail preflight with `unsupported_mode`; the onecpi installer
    follow-up likewise requires exactly 0.84.3.
 2. Active-bound remains current-runtime-only, while general-mode core ownership
-   must stay safe on older installed Pi. Export a pure version-to-core-set helper:
-   the seven legacy names exist on 0.84.1/0.84.2 and `powershell` is added only for
-   0.84.3; unknown versions conservatively get no unproved PowerShell ownership.
-   Reserved, child-available and direct-MCP collision sets derive from that runtime
-   set, while the active-bound preflight admits only 0.84.3.
+   must stay safe on older installed Pi. Keep the seven legacy names as the
+   general core set and define a separate exact active-bound 0.84.3 set adding
+   `powershell`. Child diagnostics require PowerShell to be measured in the actual
+   child registry. General direct-MCP collision behavior stays legacy; active-bound
+   rejects MCP names colliding with its exact 0.84.3 set. Package ownership and
+   mediator reserved names derive from the active-bound set.
 3. Treat `powershell` as write-capable for agent memory. Conservatively classify
    every non-empty PowerShell invocation as mutating for completion/long-running
    guards; no incomplete shell-language parser may claim a command is read-only.
