@@ -148,9 +148,10 @@ export function isMutatingTool(toolName: string | undefined, args: Record<string
 		const activityTitle = typeof args?.activityTitle === "string" ? args.activityTitle : "";
 		return /^Cursor (?:edit|write)\b/i.test(activityTitle);
 	}
-	if (toolName !== "bash") return false;
 	const command = typeof args?.command === "string" ? args.command : "";
 	if (!command.trim()) return false;
+	if (toolName === "powershell") return true;
+	if (toolName !== "bash") return false;
 	return isMutatingBashCommand(command);
 }
 

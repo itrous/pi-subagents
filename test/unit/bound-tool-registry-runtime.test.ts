@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { attestBoundRuntimeExtensions } from "../../src/runs/shared/bound-runtime-evidence.ts";
-import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from "../../src/runs/shared/core-runtime-tools.ts";
+import { ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS, ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from "../../src/runs/shared/core-runtime-tools.ts";
 import { packageEvidenceRoot, packageTreeDigest, packageTreeEvidence } from "../../src/runs/shared/package-tree-evidence.ts";
 import {
 	BOUND_TOOL_REGISTRY_ACTIVE_ENV,
@@ -31,7 +31,7 @@ function policy(packageExtensionPaths: string[] = [], modelApi = "openai-respons
 	const runtimeExtensions = attestBoundRuntimeExtensions([
 		path.join(sharedDir, "bound-tool-registry-bootstrap.ts"), path.join(sharedDir, "subagent-prompt-runtime.ts"), path.join(sharedDir, "bound-package-mediator.ts"), path.join(sharedDir, "bound-tool-registry-gate.ts"),
 	]);
-	return { version: 1, modelApi, piRuntimeVersion: "0.84.2", proofNonce: "d".repeat(64), denialFd: 4, required, internalTools: [], packageExtensions, runtimeExtensions };
+	return { version: 1, modelApi, piRuntimeVersion: "0.84.3", proofNonce: "d".repeat(64), denialFd: 4, required, internalTools: [], packageExtensions, runtimeExtensions };
 }
 
 function openAiPayload() {
@@ -43,7 +43,7 @@ describe("bound tool registry child runtime", () => {
 	const fakePiRoot = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-pi-package-"));
 	const fakePiCli = path.join(fakePiRoot, "dist", "cli.js");
 	fs.mkdirSync(path.dirname(fakePiCli), { recursive: true });
-	fs.writeFileSync(fakePiCli, "if (process.argv.includes('--version')) console.log('0.84.2');\n");
+	fs.writeFileSync(fakePiCli, "if (process.argv.includes('--version')) console.log('0.84.3');\n");
 	before(() => { process.argv[1] = fakePiCli; });
 	after(() => {
 		if (originalArgv1 === undefined) delete process.argv[1]; else process.argv[1] = originalArgv1;
@@ -57,8 +57,9 @@ describe("bound tool registry child runtime", () => {
 		resetBoundToolRegistryRuntimeForTests();
 	});
 
-	it("shares the exact seven runtime-owned builtin names", () => {
+	it("keeps legacy general builtins separate from exact Pi 0.84.3 active-bound ownership", () => {
 		assert.deepEqual([...CORE_RUNTIME_OWNED_TOOLS], ["read", "grep", "find", "ls", "bash", "edit", "write"]);
+		assert.deepEqual([...ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS], ["read", "grep", "find", "ls", "bash", "edit", "write", "powershell"]);
 	});
 
 	it("probes script wrappers and standalone Pi with the correct argv shape", () => {
@@ -298,7 +299,7 @@ describe("bound tool registry child runtime", () => {
 
 	it("rejects one package factory replacing another package factory tool", () => {
 		const registrations: string[] = [];
-		const ownership = { occupiedToolNames: new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]), packageToolOwners: new Map<string, symbol>() };
+		const ownership = { occupiedToolNames: new Set(ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS), packageToolOwners: new Map<string, symbol>() };
 		const pi = { registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any;
 		const first = (createBoundPackageApi as any)(pi, ownership);
 		const second = (createBoundPackageApi as any)(pi, ownership);

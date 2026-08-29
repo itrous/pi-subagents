@@ -52,7 +52,7 @@ import {
 	PERMISSION_POLICY_ENV,
 	type PermissionRules,
 } from "./permissions.ts";
-import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS, isActiveBoundPackageToolName } from "./core-runtime-tools.ts";
+import { ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS, ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, isActiveBoundPackageToolName } from "./core-runtime-tools.ts";
 import {
 	SUBAGENT_CAPABILITY_CEILING_ENV,
 	capabilityCeilingAgentRestrictionSources,
@@ -362,7 +362,7 @@ export function resolvePiLaunchToolPlan(
 	input: ResolvePiLaunchToolPlanInput,
 ): PiLaunchToolPlan {
 	if (input.activeBoundPackageMediator && input.tools !== undefined) {
-		const packageProvidedTools = input.tools.filter((tool) => !CORE_RUNTIME_OWNED_TOOLS.has(tool));
+		const packageProvidedTools = input.tools.filter((tool) => !ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS.has(tool));
 		if (new Set(input.tools).size !== input.tools.length
 			|| packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
 			|| (packageProvidedTools.length > 0 && (input.subagentOnlyExtensions?.length ?? 0) === 0)) {
@@ -424,7 +424,7 @@ export function resolvePiLaunchToolPlan(
 	if (input.activeBoundPackageMediator) {
 		const mcpNames = new Set(effectiveMcpTools);
 		if (mcpNames.size !== effectiveMcpTools.length
-			|| effectiveMcpTools.some((name) => declaredBuiltinTools.includes(name) || internalTools.includes(name))
+			|| effectiveMcpTools.some((name) => ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS.has(name) || declaredBuiltinTools.includes(name) || internalTools.includes(name))
 			|| internalTools.some((name) => declaredBuiltinTools.includes(name))) {
 			throw new Error("Active-bound tool names must not overlap across builtin, MCP, and internal origins.");
 		}

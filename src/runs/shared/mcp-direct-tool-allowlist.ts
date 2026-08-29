@@ -3,10 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getProjectConfigDir } from "../../shared/utils.ts";
+import { CORE_RUNTIME_OWNED_TOOLS } from "./core-runtime-tools.ts";
 
 const CACHE_VERSION = 1;
 const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const BUILTIN_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
+export const MCP_DIRECT_BUILTIN_TOOL_NAMES = new Set([...CORE_RUNTIME_OWNED_TOOLS, "mcp"]);
 const GENERIC_GLOBAL_CONFIG_PATH = path.join(os.homedir(), ".config", "mcp", "mcp.json");
 const IMPORT_PATHS = {
 	cursor: [path.join(os.homedir(), ".cursor", "mcp.json")],
@@ -265,7 +266,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 			if (toolFilter !== true && !toolFilter.has(tool.name)) continue;
 			if (!isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools, allCurrentCandidates)) continue;
 			const prefixedName = formatToolName(tool.name, serverName, effectivePrefix);
-			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
+			if (MCP_DIRECT_BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
 			names.push({ name: prefixedName, selector: `${serverName}/${tool.name}` });
 		}
@@ -277,7 +278,7 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 			if (toolFilter !== true && !toolFilter.has(baseName)) continue;
 			if (!isToolAllowed(baseName, serverName, effectivePrefix, definition.includeTools, definition.excludeTools, allCurrentCandidates)) continue;
 			const prefixedName = formatToolName(baseName, serverName, effectivePrefix);
-			if (BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
+			if (MCP_DIRECT_BUILTIN_TOOL_NAMES.has(prefixedName) || seenNames.has(prefixedName)) continue;
 			seenNames.add(prefixedName);
 			names.push({ name: prefixedName, selector: `${serverName}/${baseName}` });
 		}

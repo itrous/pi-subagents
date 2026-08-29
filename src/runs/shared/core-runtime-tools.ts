@@ -1,4 +1,4 @@
-/** Pi builtins whose implementation and ownership belong to the bound runtime. */
+/** Pi builtins shared by legacy and current runtimes. */
 export const CORE_RUNTIME_OWNED_TOOLS: ReadonlySet<string> = new Set([
 	"read",
 	"grep",
@@ -9,10 +9,16 @@ export const CORE_RUNTIME_OWNED_TOOLS: ReadonlySet<string> = new Set([
 	"write",
 ]);
 
+/** Exact active-bound builtin registry for the only admitted runtime, Pi 0.84.3. */
+export const ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS: ReadonlySet<string> = new Set([
+	...CORE_RUNTIME_OWNED_TOOLS,
+	"powershell",
+]);
+
 /** Package-provided caller names must survive the comma-delimited Pi --tools wire. */
 /** Runtime/internal names that package factories must never replace. */
 export const ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS: ReadonlySet<string> = new Set([
-	...CORE_RUNTIME_OWNED_TOOLS,
+	...ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS,
 	"subagent_wait",
 	"contact_supervisor",
 	"intercom",

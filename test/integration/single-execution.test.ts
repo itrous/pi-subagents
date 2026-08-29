@@ -1550,7 +1550,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		mockPi.onCall({ output: "external-ok", boundToolRegistryNames: ["read"] });
 		const result = await runSync(external, [makeAgent("echo", { tools: ["read"] })], "echo", "external bound", {
 			runId: "bound-external-cwd", acceptance: false, disableWatchdog: true, activeBoundProjectSkills: true, activeBoundDiscoveryCwd: active,
-			activeBoundEnvironment: {}, launchToolsOverride: ["read"], activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundEnvironment: {}, launchToolsOverride: ["read"], activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0, result.error); assert.equal(readCall().cwd, external);
 	});
@@ -1563,7 +1563,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch", {
 				runId: "bound-registry-mismatch", acceptance: false, disableWatchdog: true,
 				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 			});
 		} finally { if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previousNodeOptions; }
 		assert.equal(result.exitCode, 1);
@@ -1580,7 +1580,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denied tool", {
 			runId: "bound-denied-tool", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0); assert.equal(result.finalOutput, "bounded");
 		assert.deepEqual(result.deniedToolCalls, [{ tool: "read", reason: "permission_rule" }]);
@@ -1596,7 +1596,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound settle", {
 			runId: "bound-denial-settle", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0); assert.ok(Date.now() - startedAt >= 1200); assert.deepEqual(result.deniedToolCalls, []);
 	});
@@ -1607,7 +1607,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fallback", {
 			runId: "bound-denial-fallback", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0); assert.deepEqual(result.deniedToolCalls, []);
 		assert.ok(Date.now() - startedAt < 4_000, "valid fallback proof must release final drain before process keep-alive");
@@ -1618,7 +1618,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound missing denial proof", {
 			runId: "bound-missing-denial", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.deniedToolCalls, undefined);
 	});
@@ -1628,7 +1628,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fail-stop", {
 			runId: "bound-denial-fail-stop", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.toolRegistryError, undefined);
 	});
@@ -1638,7 +1638,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound forged registry", {
 			runId: "bound-registry-forged", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1650,7 +1650,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound oversized registry", {
 			runId: "bound-registry-actual-bound", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1661,7 +1661,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound unproved mutation exit", {
 			runId: "bound-registry-unproved-mutation", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "missing_frame");
@@ -1672,7 +1672,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch mutation exit", {
 			runId: "bound-registry-mismatch-mutation", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_mismatch");
 		assert.deepEqual(result.toolsExtra, ["extra"]);
@@ -1684,7 +1684,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound exact exit", {
 			runId: "bound-registry-exact-exit", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1696,7 +1696,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound invalid projection", {
 			runId: "bound-registry-invalid-projection", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1709,7 +1709,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound inherited fd", {
 			runId: "bound-registry-inherited-fd", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 1);
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
@@ -1722,7 +1722,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound timeout", {
 			runId: "bound-registry-timeout", acceptance: false, disableWatchdog: true, timeoutMs: 20,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		assert.equal(result.timedOut, true);
 		assert.equal(result.nativeStatus, undefined);
@@ -1735,7 +1735,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const run = runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound cancel", {
 			runId: "bound-registry-cancel", acceptance: false, disableWatchdog: true, signal: controller.signal,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 		});
 		const readinessDeadline = Date.now() + 5_000; while (mockPi.callCount() < 1 && Date.now() < readinessDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
 		assert.equal(mockPi.callCount(), 1, "mock Pi must install its SIGTERM handler before cancellation"); const cancelledAt = Date.now(); controller.abort(); const result = await run;
@@ -1753,7 +1753,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound spawn error", {
 				runId: "bound-registry-spawn-error", acceptance: false, disableWatchdog: true,
 				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.2", required: ["read"], internalTools: [], packageExtensions: [] },
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
 			});
 		} finally {
 			if (previousBinary === undefined) delete process.env.PI_SUBAGENT_PI_BINARY;

@@ -158,7 +158,7 @@ function newPackageToolOwnership(): BoundPackageToolOwnership {
 }
 
 export function createBoundPackageApi(pi: ExtensionAPI, ownership = newPackageToolOwnership()): ExtensionAPI {
-	// Supported Pi 0.84.1/0.84.2 expose this exact builtin registry. Protect it and
+	// Active-bound supports Pi 0.84.3 and protects its exact builtin registry plus
 	// runtime-owned internal tools without calling action APIs during extension load.
 	const owner = Symbol("bound-package-factory");
 	const { occupiedToolNames, packageToolOwners } = ownership;

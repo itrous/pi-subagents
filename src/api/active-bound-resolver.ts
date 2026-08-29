@@ -24,7 +24,7 @@ import { projectActiveBoundEnvironment, type ActiveBoundEnvironmentProjectionV1 
 import { resolveActiveBoundPackageExtensions, type ActiveBoundPackageExtensionProjectionV1 } from "./active-bound-package-extensions.ts";
 import { attestPiSpawnCommand } from "../runs/shared/pi-command-evidence.ts";
 import { expectedToolRegistryProjection, SUPPORTED_BOUND_MODEL_APIS, SUPPORTED_BOUND_PI_VERSIONS, type ToolRegistryProjectionV1 } from "../runs/shared/tool-registry-proof.ts";
-import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS, isActiveBoundPackageToolName } from "../runs/shared/core-runtime-tools.ts";
+import { ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS, ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, isActiveBoundPackageToolName } from "../runs/shared/core-runtime-tools.ts";
 
 export const ACTIVE_BOUND_LAUNCH_CONTRACT_VERSION = 1 as const;
 
@@ -299,7 +299,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const boundCeiling = input.capabilityCeiling;
 	const explicitAgentTools = agent.tools ?? [];
 	if (new Set(explicitAgentTools).size !== explicitAgentTools.length) return failure("unsupported_mode");
-	const packageProvidedTools = explicitAgentTools.filter((tool) => !CORE_RUNTIME_OWNED_TOOLS.has(tool));
+	const packageProvidedTools = explicitAgentTools.filter((tool) => !ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS.has(tool));
 	if (packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
 		|| (packageProvidedTools.length > 0 && (agent.source !== "package" || packageExtensions.paths.length === 0
 			|| packageExtensions.paths.length !== packageExtensions.projection.length))) return failure("unsupported_mode");

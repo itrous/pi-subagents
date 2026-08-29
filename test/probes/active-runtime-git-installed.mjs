@@ -12,10 +12,10 @@ import { installExactCommit } from "../../install-lib.mjs";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const piBinary = process.env.PI_SUBAGENT_PI_BINARY || "pi";
 function findExecutable(command) { if (path.isAbsolute(command) || command.includes(path.sep)) return command; for (const directory of (process.env.PATH || "").split(path.delimiter)) { const candidate = path.join(directory, command); try { fs.accessSync(candidate, fs.constants.X_OK); return candidate; } catch {} } return ""; }
-const resolvedPiBinary = fs.realpathSync.native(findExecutable(piBinary)); let inferredRuntimeRoot = "";
-try { const candidate = path.dirname(path.dirname(resolvedPiBinary)); if (fs.existsSync(path.join(candidate, "package.json"))) inferredRuntimeRoot = candidate; } catch {}
+const resolvedPiBinary = fs.realpathSync.native(findExecutable(piBinary)); let inferredRuntimeRoot = path.dirname(resolvedPiBinary);
+while (path.dirname(inferredRuntimeRoot) !== inferredRuntimeRoot) { const manifest = path.join(inferredRuntimeRoot, "package.json"); try { if (fs.existsSync(path.join(inferredRuntimeRoot, "dist", "index.js")) && JSON.parse(fs.readFileSync(manifest, "utf8")).name === "@earendil-works/pi-coding-agent") break; } catch {} inferredRuntimeRoot = path.dirname(inferredRuntimeRoot); }
 const runtimeRoot = process.env.A1_PROBE_PI_RUNTIME_ROOT || inferredRuntimeRoot;
-assert.ok(runtimeRoot && inferredRuntimeRoot, "Pi binary must resolve inside its runtime package"); assert.equal(fs.realpathSync.native(runtimeRoot), fs.realpathSync.native(inferredRuntimeRoot), "SDK runtime root differs from launched Pi runtime");
+assert.ok(fs.existsSync(path.join(inferredRuntimeRoot, "dist", "index.js")), "Pi binary must resolve inside its runtime package"); assert.equal(fs.realpathSync.native(runtimeRoot), fs.realpathSync.native(inferredRuntimeRoot), "SDK runtime root differs from launched Pi runtime");
 const coding = await import(pathToFileURL(path.join(runtimeRoot, "dist", "index.js")).href);
 const piAiRoot = path.join(runtimeRoot, "node_modules", "@earendil-works", "pi-ai");
 const faux = await import(pathToFileURL(path.join(piAiRoot, "dist", "providers", "faux.js")).href);
@@ -47,7 +47,7 @@ const npmCache = path.resolve(process.env.A1_PROBE_NPM_CACHE || path.join(os.hom
 process.env.HOME = root; process.env.PI_CODING_AGENT_DIR = agentDir; process.env.PI_SUBAGENT_PI_BINARY = resolvedPiBinary; process.env.A1_PROBE_EXPECTED_COMMIT = commit;
 
 const versionProbe = spawnSync(resolvedPiBinary, ["--version"], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 }); assert.equal(versionProbe.status, 0, versionProbe.stderr); const piVersion = versionProbe.stdout.trim();
-assert.ok(piVersion === "0.84.1" || piVersion === "0.84.2", `unsupported Pi ${piVersion}`); assert.equal(JSON.parse(fs.readFileSync(path.join(runtimeRoot, "package.json"), "utf8")).version, piVersion, "Pi binary and SDK package versions differ");
+assert.equal(piVersion, "0.84.3", `active-runtime publication probe requires Pi 0.84.3, got ${piVersion}`); assert.equal(JSON.parse(fs.readFileSync(path.join(runtimeRoot, "package.json"), "utf8")).version, piVersion, "Pi binary and SDK package versions differ");
 installExactCommit({ extensionDir, stateDir: installerState, repositoryUrl, commit, expectedRepository: mode === "github" ? undefined : (value) => path.resolve(value) === repoRoot, npmCommand: ["npm", "--cache", npmCache], quiet: true });
 if (mode === "local") git(["remote", "set-url", "origin", canonicalRepository], extensionDir);
 assert.equal(git(["rev-parse", "HEAD"], extensionDir), commit); assert.equal(git(["status", "--porcelain=v1", "--untracked-files=all"], extensionDir), "");

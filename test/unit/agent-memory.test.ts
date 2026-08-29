@@ -127,6 +127,7 @@ describe("agentHasWriteTools", () => {
 		assert.equal(agentHasWriteTools({ tools: ["read", "edit"] }), true);
 		assert.equal(agentHasWriteTools({ tools: ["write"] }), true);
 		assert.equal(agentHasWriteTools({ tools: ["bash"] }), true);
+		assert.equal(agentHasWriteTools({ tools: ["powershell"] }), true);
 	});
 
 	it("treats read-only and mcp-only tool sets as non-write", () => {
