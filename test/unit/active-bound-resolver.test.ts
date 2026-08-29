@@ -70,7 +70,7 @@ describe("restricted active-bound resolver", () => {
 		assert.equal(first.contract.policy.artifacts, false);
 		assert.equal(first.contract.tools.disableAmbientExtensions, true);
 		assert.equal(first.contract.toolRegistry.modelApi, "openai-responses");
-		assert.equal(first.contract.toolRegistry.piRuntimeVersion, "0.84.2");
+		assert.equal(first.contract.toolRegistry.piRuntimeVersion, "0.84.3");
 		assert.deepEqual(first.contract.toolRegistry.projection.effectiveCallerTools, ["read"]);
 		assert.deepEqual(first.contract.toolRegistry.projection.missing, []);
 		assert.match(first.contract.toolRegistry.digest, /^[0-9a-f]{64}$/);

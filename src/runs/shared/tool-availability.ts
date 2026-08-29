@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { CORE_RUNTIME_OWNED_TOOLS } from "./core-runtime-tools.ts";
 
 export const REQUIRED_CHILD_TOOLS_ENV = "PI_SUBAGENT_REQUIRED_TOOLS";
 export const MCP_DIRECT_CHILD_TOOLS_ENV = "PI_SUBAGENT_MCP_DIRECT_TOOLS";
@@ -13,7 +14,7 @@ export interface ChildToolDiagnostic {
 	missingMcpDirectTools?: string[];
 }
 
-const PI_CORE_CHILD_TOOLS = new Set(["bash", "edit", "find", "grep", "ls", "read", "write"]);
+const PI_CORE_CHILD_TOOLS = CORE_RUNTIME_OWNED_TOOLS;
 
 export function writeChildToolDiagnostic(
 	filePath: string,

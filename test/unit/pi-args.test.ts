@@ -1570,6 +1570,11 @@ describe("active-bound mediated extension order", () => {
 		}
 	});
 
+	it("rejects direct MCP shadowing of the Pi 0.84.3 powershell builtin only in active-bound mode", () => {
+		const fixture = createMcpFixture(); writeMcpFixture(fixture, { serverName: "sys", definition: { command: "probe", toolPrefix: "none" }, tools: [{ name: "powershell" }] });
+		assert.throws(() => resolvePiLaunchToolPlan({ tools: ["read"], extensions: [], mcpDirectTools: ["sys"], cwd: fixture.projectDir, activeBoundPackageMediator: true, disablePermissionSystemExtension: true }), /must not overlap/);
+	});
+
 	it("loads bootstrap, mediator and registry gate without direct package entries", () => {
 		const plan = resolvePiLaunchToolPlan({
 			tools: ["read"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],

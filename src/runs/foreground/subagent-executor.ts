@@ -5015,7 +5015,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						async: false,
 						artifacts: false,
 						outputSchema,
-						toolBudget: { hard: 1, block: ["write", "edit", "bash"] },
+						toolBudget: { hard: 1, block: ["write", "edit", "bash", "powershell"] },
 					}, proposalSignal, undefined, ctx, true),
 				});
 			}

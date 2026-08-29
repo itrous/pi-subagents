@@ -72,7 +72,7 @@ export function isPotentialMutationToolCall(name: string | undefined, args?: Rec
 	if (typeof name !== "string") return false;
 	const proven = isMutatingTool(name, args ?? {});
 	if (proven || READ_ONLY_BUILTIN_TOOLS.has(name)) return proven;
-	return !["bash", "edit", "write", "cursor"].includes(name);
+	return !["bash", "powershell", "edit", "write", "cursor"].includes(name);
 }
 
 export function hasMutationToolCall(messages: Message[]): boolean {

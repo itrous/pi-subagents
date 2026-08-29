@@ -300,6 +300,8 @@ test("Cursor replay tool calls count only edit/write activity as mutation", () =
 	assert.equal(hasMutationToolCall([assistantToolCall("cursor", { activityTitle: "Cursor read" })]), false);
 	assert.equal(isMutatingTool("cursor", cursorEdit), true);
 	assert.equal(isMutatingTool("cursor", { activityTitle: "Cursor read" }), false);
+	assert.equal(isMutatingTool("powershell", { command: "Get-Content file.txt" }), true);
+	assert.equal(isMutatingTool("powershell", { command: "" }), false);
 });
 
 test("claimed changedFiles without mutation evidence does not bypass the guard", () => {

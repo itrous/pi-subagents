@@ -8,7 +8,7 @@ export const TOOL_REGISTRY_MAX_NAME_BYTES = 128;
 export const TOOL_REGISTRY_MAX_FRAME_BYTES = 64 * 1024;
 export const TOOL_REGISTRY_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 
-export const SUPPORTED_BOUND_PI_VERSIONS = new Set(["0.84.1", "0.84.2"]);
+export const SUPPORTED_BOUND_PI_VERSIONS = new Set(["0.84.3"]);
 export const SUPPORTED_BOUND_MODEL_APIS = new Set([
 	"openai-completions", "mistral-conversations", "openai-responses",
 	"azure-openai-responses", "openai-codex-responses", "anthropic-messages",
