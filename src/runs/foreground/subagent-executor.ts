@@ -4085,6 +4085,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 					piRuntimeVersion: data.activeBoundProof.contract.toolRegistry.piRuntimeVersion,
 					required: [...data.activeBoundProof.contract.toolRegistry.projection.required],
 					internalTools: [...data.activeBoundProof.contract.toolRegistry.projection.internalTools],
+					runtimeBuiltins: data.activeBoundProof.contract.toolRegistry.runtimeBuiltins,
 					packageExtensions: [],
 				} } : {}),
 			} : {}),

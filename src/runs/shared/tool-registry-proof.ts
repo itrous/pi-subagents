@@ -1,19 +1,26 @@
 import * as path from "node:path";
+import { types as utilTypes } from "node:util";
 import { canonicalSha256 } from "../../shared/canonical-json.ts";
 import type { BoundRuntimeExtensionEvidenceV1 } from "./bound-runtime-evidence.ts";
 
 export const TOOL_REGISTRY_PROJECTION_VERSION = 1 as const;
 export const TOOL_REGISTRY_MAX_NAMES = 128;
+export const TOOL_REGISTRY_MAX_VISIBLE_TOOLS = 4096;
 export const TOOL_REGISTRY_MAX_NAME_BYTES = 128;
 export const TOOL_REGISTRY_MAX_FRAME_BYTES = 64 * 1024;
 export const TOOL_REGISTRY_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 
-export const SUPPORTED_BOUND_PI_VERSIONS = new Set(["0.84.3"]);
 export const SUPPORTED_BOUND_MODEL_APIS = new Set([
 	"openai-completions", "mistral-conversations", "openai-responses",
 	"azure-openai-responses", "openai-codex-responses", "anthropic-messages",
 	"bedrock-converse-stream", "google-generative-ai", "google-vertex", "pi-messages",
 ]);
+
+export interface RuntimeBuiltinProjectionV1 {
+	version: 1;
+	names: string[];
+	digest: string;
+}
 
 export interface ToolRegistryProjectionV1 {
 	version: 1;
@@ -35,6 +42,7 @@ export interface BoundToolRegistryPolicyV1 {
 	internalTools: string[];
 	packageExtensions: Array<{ path: string; contentDigest: string; evidenceRoot: string; evidenceRootDigest: string; packageTreeDigest: string }>;
 	runtimeExtensions?: BoundRuntimeExtensionEvidenceV1;
+	runtimeBuiltins: RuntimeBuiltinProjectionV1;
 }
 
 export type ToolRegistryChildFrameV1 =
@@ -76,6 +84,43 @@ function normalizeNames(names: readonly string[]): string[] | undefined {
 	return sortToolRegistryNames(new Set(names));
 }
 
+export function runtimeBuiltinProjection(tools: readonly unknown[], options: { allowEmpty?: boolean } = {}): RuntimeBuiltinProjectionV1 | undefined {
+	if (!Array.isArray(tools) || tools.length > TOOL_REGISTRY_MAX_VISIBLE_TOOLS) return undefined;
+	const names: string[] = [];
+	const allNames = new Set<string>();
+	for (const entry of tools) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry) || utilTypes.isProxy(entry)) return undefined;
+		const nameDescriptor = Object.getOwnPropertyDescriptor(entry, "name");
+		const sourceDescriptor = Object.getOwnPropertyDescriptor(entry, "sourceInfo");
+		if (!nameDescriptor || !("value" in nameDescriptor) || !sourceDescriptor || !("value" in sourceDescriptor) || !validToolRegistryName(nameDescriptor.value)) return undefined;
+		if (allNames.has(nameDescriptor.value)) return undefined;
+		allNames.add(nameDescriptor.value);
+		const sourceInfo = sourceDescriptor.value;
+		if (!sourceInfo || typeof sourceInfo !== "object" || Array.isArray(sourceInfo) || utilTypes.isProxy(sourceInfo)) return undefined;
+		const source = Object.getOwnPropertyDescriptor(sourceInfo, "source");
+		if (!source || !("value" in source) || typeof source.value !== "string" || !source.value || Buffer.byteLength(source.value, "utf8") > 256) return undefined;
+		if (source.value === "builtin") names.push(nameDescriptor.value);
+	}
+	const normalized = normalizeNames(names);
+	if (!normalized || (normalized.length === 0 && options.allowEmpty !== true)) return undefined;
+	const base = { version: 1 as const, names: normalized };
+	return { ...base, digest: canonicalSha256(base) };
+}
+
+export function validateRuntimeBuiltinProjection(value: unknown): RuntimeBuiltinProjectionV1 | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (Object.keys(record).sort().join(",") !== "digest,names,version" || record.version !== 1 || typeof record.digest !== "string" || !/^[0-9a-f]{64}$/u.test(record.digest) || !Array.isArray(record.names)) return undefined;
+	const names = normalizeNames(record.names as string[]);
+	if (!names || names.length === 0 || names.length !== record.names.length || names.some((name, index) => name !== (record.names as string[])[index])) return undefined;
+	const projection = { version: 1 as const, names, digest: record.digest };
+	return projection.digest === canonicalSha256({ version: 1, names }) ? projection : undefined;
+}
+
+export function validRuntimeVersionIdentity(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 128 && !/[\0\r\n]/u.test(value);
+}
+
 export function toolRegistryProjection(input: {
 	required: readonly string[];
 	actual: readonly string[];
@@ -106,9 +151,9 @@ export function expectedToolRegistryProjection(required: readonly string[], inte
 export function validateBoundToolRegistryPolicy(value: unknown): BoundToolRegistryPolicyV1 | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const record = value as Record<string, unknown>;
-	if (Object.keys(record).sort().join(",") !== "denialFd,internalTools,modelApi,packageExtensions,piRuntimeVersion,proofNonce,required,runtimeExtensions,version"
-		|| record.version !== 1 || record.denialFd !== 4 || typeof record.modelApi !== "string" || typeof record.piRuntimeVersion !== "string" || typeof record.proofNonce !== "string" || !/^[0-9a-f]{64}$/u.test(record.proofNonce)
-		|| !SUPPORTED_BOUND_MODEL_APIS.has(record.modelApi) || !SUPPORTED_BOUND_PI_VERSIONS.has(record.piRuntimeVersion)
+	if (Object.keys(record).sort().join(",") !== "denialFd,internalTools,modelApi,packageExtensions,piRuntimeVersion,proofNonce,required,runtimeBuiltins,runtimeExtensions,version"
+		|| record.version !== 1 || record.denialFd !== 4 || typeof record.modelApi !== "string" || !validRuntimeVersionIdentity(record.piRuntimeVersion) || typeof record.proofNonce !== "string" || !/^[0-9a-f]{64}$/u.test(record.proofNonce)
+		|| !SUPPORTED_BOUND_MODEL_APIS.has(record.modelApi)
 		|| !Array.isArray(record.required) || !Array.isArray(record.internalTools) || !Array.isArray(record.packageExtensions)
 		|| !record.runtimeExtensions || typeof record.runtimeExtensions !== "object" || Array.isArray(record.runtimeExtensions)
 		|| record.packageExtensions.length > 16 || record.packageExtensions.some((entry) => {
@@ -121,6 +166,8 @@ export function validateBoundToolRegistryPolicy(value: unknown): BoundToolRegist
 				|| typeof value.evidenceRootDigest !== "string" || !/^[0-9a-f]{64}$/u.test(value.evidenceRootDigest)
 				|| typeof value.packageTreeDigest !== "string" || !/^[0-9a-f]{64}$/u.test(value.packageTreeDigest);
 		})) return undefined;
+	const runtimeBuiltins = validateRuntimeBuiltinProjection(record.runtimeBuiltins);
+	if (!runtimeBuiltins) return undefined;
 	const runtimeExtensions = record.runtimeExtensions as Record<string, unknown>;
 	if (Object.keys(runtimeExtensions).sort().join(",") !== "entries,version" || runtimeExtensions.version !== 1 || !Array.isArray(runtimeExtensions.entries)
 		|| runtimeExtensions.entries.length > 32 || runtimeExtensions.entries.some((entry) => {
@@ -137,6 +184,7 @@ export function validateBoundToolRegistryPolicy(value: unknown): BoundToolRegist
 		version: 1, modelApi: record.modelApi, piRuntimeVersion: record.piRuntimeVersion, proofNonce: record.proofNonce, denialFd: 4,
 		required, internalTools,
 		packageExtensions: (record.packageExtensions as Array<{ path: string; contentDigest: string; evidenceRoot: string; evidenceRootDigest: string; packageTreeDigest: string }>).map((entry) => ({ ...entry })),
+		runtimeBuiltins,
 		runtimeExtensions: { version: 1, entries: (runtimeExtensions.entries as Array<{ name: string; contentDigest: string }>).map((entry) => ({ ...entry })) },
 	};
 }

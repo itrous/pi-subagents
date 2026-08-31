@@ -9,22 +9,20 @@ export const CORE_RUNTIME_OWNED_TOOLS: ReadonlySet<string> = new Set([
 	"write",
 ]);
 
-/** Exact active-bound builtin registry for the only admitted runtime, Pi 0.84.3. */
-export const ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS: ReadonlySet<string> = new Set([
-	...CORE_RUNTIME_OWNED_TOOLS,
-	"powershell",
-]);
-
-/** Package-provided caller names must survive the comma-delimited Pi --tools wire. */
-/** Runtime/internal names that package factories must never replace. */
-export const ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS: ReadonlySet<string> = new Set([
-	...ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS,
+/** Runtime/internal names that are plugin-owned regardless of the host builtin set. */
+export const ACTIVE_BOUND_INTERNAL_RESERVED_TOOLS: ReadonlySet<string> = new Set([
 	"subagent_wait",
 	"contact_supervisor",
 	"intercom",
 	"structured_output",
 	"cursor",
 ]);
+
+export function activeBoundRuntimeReservedTools(runtimeBuiltins: Iterable<string>): ReadonlySet<string> {
+	return new Set([...runtimeBuiltins, ...ACTIVE_BOUND_INTERNAL_RESERVED_TOOLS]);
+}
+
+/** Package-provided caller names must survive the comma-delimited Pi --tools wire. */
 
 export const ACTIVE_BOUND_PACKAGE_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 

@@ -6,7 +6,7 @@ import { launchBindingDigest } from "../../src/shared/launch-contract.ts";
 import {
 	expectedToolRegistryProjection,
 	extractProviderPayloadToolNames,
-	SUPPORTED_BOUND_PI_VERSIONS,
+	runtimeBuiltinProjection,
 	toolRegistryProjection,
 	validateBoundToolRegistryPolicy,
 } from "../../src/runs/shared/tool-registry-proof.ts";
@@ -36,9 +36,11 @@ describe("bound tool registry projection", () => {
 		assert.equal(validateBoundToolRegistryPolicy({ version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["x", "x"], internalTools: [], packageExtensions: [] }), undefined);
 		assert.equal(expectedToolRegistryProjection(["\ud800"], []), undefined);
 		assert.equal(expectedToolRegistryProjection(["\udc00"], []), undefined);
-		const policy = (piRuntimeVersion: string) => ({ version: 1, modelApi: "openai-responses", piRuntimeVersion, proofNonce: "d".repeat(64), denialFd: 4, required: ["x"], internalTools: [], packageExtensions: [{ path: "/owner/ext.ts", contentDigest: "a".repeat(64), evidenceRoot: "/owner", evidenceRootDigest: "b".repeat(64), packageTreeDigest: "c".repeat(64) }], runtimeExtensions: { version: 1, entries: [] } });
-		assert.deepEqual([...SUPPORTED_BOUND_PI_VERSIONS], ["0.84.3"]);
-		assert.ok(validateBoundToolRegistryPolicy(policy("0.84.3"))); assert.equal(validateBoundToolRegistryPolicy(policy("0.84.2")), undefined); assert.equal(validateBoundToolRegistryPolicy(policy("0.84.4")), undefined);
+		const runtimeBuiltins = runtimeBuiltinProjection([{ name: "read", sourceInfo: { source: "builtin" } }, { name: "custom", sourceInfo: { source: "package" } }])!;
+		assert.deepEqual(runtimeBuiltins.names, ["read"]);
+		const policy = (piRuntimeVersion: string) => ({ version: 1, modelApi: "openai-responses", piRuntimeVersion, proofNonce: "d".repeat(64), denialFd: 4, required: ["x"], internalTools: [], packageExtensions: [{ path: "/owner/ext.ts", contentDigest: "a".repeat(64), evidenceRoot: "/owner", evidenceRootDigest: "b".repeat(64), packageTreeDigest: "c".repeat(64) }], runtimeExtensions: { version: 1, entries: [] }, runtimeBuiltins });
+		assert.ok(validateBoundToolRegistryPolicy(policy("0.84.3"))); assert.ok(validateBoundToolRegistryPolicy(policy("0.84.4"))); assert.ok(validateBoundToolRegistryPolicy(policy("future-compatible-runtime"))); assert.equal(validateBoundToolRegistryPolicy(policy("bad\nversion")), undefined);
+		assert.equal(runtimeBuiltinProjection([{ name: "read", sourceInfo: { source: "builtin" } }, { name: "read", sourceInfo: { source: "package" } }]), undefined);
 		const escaped = Array.from({ length: 128 }, (_, index) => `${index.toString().padStart(3, "0")}${"\u0001".repeat(125)}`);
 		assert.equal(expectedToolRegistryProjection(escaped, []), undefined);
 	});

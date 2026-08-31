@@ -13,6 +13,7 @@ import {
 	SUBAGENT_DELEGATION_UPDATE_EVENT,
 } from "../../src/api/delegation.ts";
 import { SUBAGENT_RPC_REQUEST_EVENT, subagentRpcReplyEvent } from "../../src/extension/rpc.ts";
+import { runtimeBuiltinProjection } from "../../src/runs/shared/tool-registry-proof.ts";
 
 function makeTrustedCtx(cwd: string): ReturnType<typeof makeMinimalCtx> {
 	const ctx = makeMinimalCtx(cwd);
@@ -34,9 +35,9 @@ describe("active-bound registered-extension lifecycle", () => {
 		const extensionEvents = createEventBus(); const sourceIdentity = { version: 1 as const, kind: "git" as const, repository: "https://github.com/itrous/pi-subagents.git", commit: "0123456789abcdef0123456789abcdef01234567", digest: "a".repeat(64) };
 		const makeRuntime = (sessionId: string, serverInstanceId: string) => {
 			const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>(); let uiCalls = 0;
-			const pi = new Proxy({ events: extensionEvents, on(event: string, handler: (event: any, ctx: any) => unknown) { const list = handlers.get(event) ?? []; list.push(handler); handlers.set(event, list); return () => handlers.set(event, (handlers.get(event) ?? []).filter((entry) => entry !== handler)); }, registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; } }, { get(target, prop) { if (prop in target) return target[prop as keyof typeof target]; return () => undefined; } });
+			const pi = new Proxy({ events: extensionEvents, on(event: string, handler: (event: any, ctx: any) => unknown) { const list = handlers.get(event) ?? []; list.push(handler); handlers.set(event, list); return () => handlers.set(event, (handlers.get(event) ?? []).filter((entry) => entry !== handler)); }, registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; }, getAllTools() { return ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name, sourceInfo: { source: "builtin" } })); } }, { get(target, prop) { if (prop in target) return target[prop as keyof typeof target]; return () => undefined; } });
 			const ctx = { ...makeTrustedCtx(tempDir), hasUI: false, modelRegistry: { getAvailable: () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }] }, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => path.join(tempDir, `${sessionId}.jsonl`), getEntries: () => [] }, ui: new Proxy({}, { get() { return () => { uiCalls++; throw new Error("headless lifecycle invoked UI"); }; } }) };
-			registerSubagentExtension(pi as never, { resolveSourceIdentity: () => ({ available: true as const, sourceIdentity }), createServerInstanceId: () => serverInstanceId });
+			registerSubagentExtension(pi as never, { resolveSourceIdentity: () => ({ available: true as const, sourceIdentity }), resolveRuntimeCapabilities: () => ({ version: 1, piRuntimeVersion: "0.84.4", runtimeBuiltins: runtimeBuiltinProjection(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name, sourceInfo: { source: "builtin" } })))! }), createServerInstanceId: () => serverInstanceId });
 			const startHandlers = [...handlers.get("session_start") ?? []]; const shutdownHandlers = [...handlers.get("session_shutdown") ?? []];
 			return { handlers, ctx, uiCalls: () => uiCalls, start: async (reason: string) => { for (const handler of startHandlers) await handler({ reason }, ctx); }, shutdown: async (reason: string) => { for (const handler of shutdownHandlers) await handler({ reason }, ctx); } };
 		};

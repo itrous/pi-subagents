@@ -30,6 +30,7 @@ import {
 import registerSubagentExtension from "../../src/extension/index.ts";
 import { parseActiveBoundPreflightRequest } from "../../src/api/active-bound-preflight.ts";
 import { createActiveBoundRuntimeService } from "../../src/api/active-bound-runtime.ts";
+import { runtimeBuiltinProjection } from "../../src/runs/shared/tool-registry-proof.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import {
 	SUBAGENT_DELEGATION_REQUEST_EVENT,
@@ -1444,7 +1445,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		executionCtx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
 		executionCtx.sessionManager.getSessionId = () => "pi-session";
 		executionCtx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }];
-		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => executionCtx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
+		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => executionCtx, getRuntimeCapabilities: () => ({ version: 1, piRuntimeVersion: "0.84.4", runtimeBuiltins: runtimeBuiltinProjection(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name, sourceInfo: { source: "builtin" } })))! }), config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
 		const runtimeRecheck = runtime.recheck.bind(runtime); let artifactAbsenceChecks = 0;
 		runtime.recheck = (activeProof, options) => { if (activeProof.request.artifacts) { artifactAbsenceChecks++; assert.equal(fs.existsSync(path.join(base, activeProof.request.prospectiveRunId, "artifacts")), false); } return runtimeRecheck(activeProof, options); };
 		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base, maxSubagentSpawnsPerSession: 1 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
@@ -1521,7 +1522,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const agentDir = path.join(tempDir, ".pi", "agents"); fs.mkdirSync(agentDir, { recursive: true }); fs.writeFileSync(path.join(agentDir, "echo.md"), "---\nname: echo\ndescription: Echo\ntools: read\n---\nEcho.\n");
 		const base = path.join(tempDir, "lifecycle-sessions"); fs.mkdirSync(base);
 		const ctx = makeTrustedCtx(tempDir) as any; ctx.hasUI = false; ctx.sessionManager.getSessionFile = () => path.join(tempDir, "lifecycle-parent.jsonl"); ctx.sessionManager.getSessionId = () => "lifecycle-session"; ctx.modelRegistry.getAvailable = () => [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: false }];
-		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => ctx, config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
+		const runtime = createActiveBoundRuntimeService({ serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => ctx, getRuntimeCapabilities: () => ({ version: 1, piRuntimeVersion: "0.84.4", runtimeBuiltins: runtimeBuiltinProjection(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name, sourceInfo: { source: "builtin" } })))! }), config: { defaultSessionDir: base, maxSubagentDepth: 1 }, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1, resolveCapabilityCeiling: () => undefined });
 		const executor = makeExecutor([makeAgent("echo", { tools: ["read"] })], { defaultSessionDir: base }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), runtime);
 		const releases = Array.from({ length: 4 }, (_, index) => path.join(tempDir, `release-bound-${index}`));
 		for (let index = 0; index < 4; index++) mockPi.onCall({ waitForPath: releases[index], output: `leaf-${index}`, ...(index === 1 ? { ignoreSigterm: true } : {}) });
@@ -1550,7 +1551,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		mockPi.onCall({ output: "external-ok", boundToolRegistryNames: ["read"] });
 		const result = await runSync(external, [makeAgent("echo", { tools: ["read"] })], "echo", "external bound", {
 			runId: "bound-external-cwd", acceptance: false, disableWatchdog: true, activeBoundProjectSkills: true, activeBoundDiscoveryCwd: active,
-			activeBoundEnvironment: {}, launchToolsOverride: ["read"], activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundEnvironment: {}, launchToolsOverride: ["read"], activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0, result.error); assert.equal(readCall().cwd, external);
 	});
@@ -1563,7 +1564,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch", {
 				runId: "bound-registry-mismatch", acceptance: false, disableWatchdog: true,
 				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 			});
 		} finally { if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previousNodeOptions; }
 		assert.equal(result.exitCode, 1);
@@ -1580,7 +1581,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denied tool", {
 			runId: "bound-denied-tool", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0); assert.equal(result.finalOutput, "bounded");
 		assert.deepEqual(result.deniedToolCalls, [{ tool: "read", reason: "permission_rule" }]);
@@ -1596,7 +1597,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound settle", {
 			runId: "bound-denial-settle", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0); assert.ok(Date.now() - startedAt >= 1200); assert.deepEqual(result.deniedToolCalls, []);
 	});
@@ -1607,7 +1608,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fallback", {
 			runId: "bound-denial-fallback", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 0); assert.deepEqual(result.deniedToolCalls, []);
 		assert.ok(Date.now() - startedAt < 4_000, "valid fallback proof must release final drain before process keep-alive");
@@ -1618,7 +1619,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound missing denial proof", {
 			runId: "bound-missing-denial", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.deniedToolCalls, undefined);
 	});
@@ -1628,7 +1629,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound denial fail-stop", {
 			runId: "bound-denial-fail-stop", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_denied_tools_protocol_error"); assert.equal(result.deniedToolCallsError, "missing_frame"); assert.equal(result.toolRegistryError, undefined);
 	});
@@ -1638,7 +1639,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound forged registry", {
 			runId: "bound-registry-forged", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1650,7 +1651,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound oversized registry", {
 			runId: "bound-registry-actual-bound", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1661,7 +1662,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound unproved mutation exit", {
 			runId: "bound-registry-unproved-mutation", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "missing_frame");
@@ -1672,7 +1673,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound mismatch mutation exit", {
 			runId: "bound-registry-mismatch-mutation", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_mismatch");
 		assert.deepEqual(result.toolsExtra, ["extra"]);
@@ -1684,7 +1685,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound exact exit", {
 			runId: "bound-registry-exact-exit", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1696,7 +1697,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound invalid projection", {
 			runId: "bound-registry-invalid-projection", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
 		assert.equal(result.toolRegistryError, "invalid_frame");
@@ -1709,7 +1710,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound inherited fd", {
 			runId: "bound-registry-inherited-fd", acceptance: false, disableWatchdog: true,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.exitCode, 1);
 		assert.equal(result.nativeStatus, "native_tool_registry_protocol_error");
@@ -1722,7 +1723,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound timeout", {
 			runId: "bound-registry-timeout", acceptance: false, disableWatchdog: true, timeoutMs: 20,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		assert.equal(result.timedOut, true);
 		assert.equal(result.nativeStatus, undefined);
@@ -1735,7 +1736,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const run = runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound cancel", {
 			runId: "bound-registry-cancel", acceptance: false, disableWatchdog: true, signal: controller.signal,
 			activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+			activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 		});
 		const readinessDeadline = Date.now() + 5_000; while (mockPi.callCount() < 1 && Date.now() < readinessDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
 		assert.equal(mockPi.callCount(), 1, "mock Pi must install its SIGTERM handler before cancellation"); const cancelledAt = Date.now(); controller.abort(); const result = await run;
@@ -1753,7 +1754,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			result = await runSync(tempDir, [makeAgent("echo", { tools: ["read"] })], "echo", "bound spawn error", {
 				runId: "bound-registry-spawn-error", acceptance: false, disableWatchdog: true,
 				activeBoundProjectSkills: true, activeBoundEnvironment: {}, launchToolsOverride: ["read"],
-				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.3", required: ["read"], internalTools: [], packageExtensions: [] },
+				activeBoundToolRegistry: { version: 1, modelApi: "openai-responses", piRuntimeVersion: "0.84.4", required: ["read"], internalTools: [], runtimeBuiltins: { version: 1, names: ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"], digest: "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693" }, packageExtensions: [] },
 			});
 		} finally {
 			if (previousBinary === undefined) delete process.env.PI_SUBAGENT_PI_BINARY;

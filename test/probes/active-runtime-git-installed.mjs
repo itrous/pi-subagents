@@ -17,6 +17,7 @@ while (path.dirname(inferredRuntimeRoot) !== inferredRuntimeRoot) { const manife
 const runtimeRoot = process.env.A1_PROBE_PI_RUNTIME_ROOT || inferredRuntimeRoot;
 assert.ok(fs.existsSync(path.join(inferredRuntimeRoot, "dist", "index.js")), "Pi binary must resolve inside its runtime package"); assert.equal(fs.realpathSync.native(runtimeRoot), fs.realpathSync.native(inferredRuntimeRoot), "SDK runtime root differs from launched Pi runtime");
 const coding = await import(pathToFileURL(path.join(runtimeRoot, "dist", "index.js")).href);
+const runtimeTools = await import(pathToFileURL(path.join(runtimeRoot, "dist", "core", "tools", "index.js")).href);
 const piAiRoot = path.join(runtimeRoot, "node_modules", "@earendil-works", "pi-ai");
 const faux = await import(pathToFileURL(path.join(piAiRoot, "dist", "providers", "faux.js")).href);
 const { createAgentSession, createEventBus, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } = coding;
@@ -47,7 +48,8 @@ const npmCache = path.resolve(process.env.A1_PROBE_NPM_CACHE || path.join(os.hom
 process.env.HOME = root; process.env.PI_CODING_AGENT_DIR = agentDir; process.env.PI_SUBAGENT_PI_BINARY = resolvedPiBinary; process.env.A1_PROBE_EXPECTED_COMMIT = commit;
 
 const versionProbe = spawnSync(resolvedPiBinary, ["--version"], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 }); assert.equal(versionProbe.status, 0, versionProbe.stderr); const piVersion = versionProbe.stdout.trim();
-assert.equal(piVersion, "0.84.3", `active-runtime publication probe requires Pi 0.84.3, got ${piVersion}`); assert.equal(JSON.parse(fs.readFileSync(path.join(runtimeRoot, "package.json"), "utf8")).version, piVersion, "Pi binary and SDK package versions differ");
+assert.ok(piVersion && Buffer.byteLength(piVersion, "utf8") <= 128 && !/[\0\r\n]/.test(piVersion), "active-runtime identity is unavailable"); assert.equal(JSON.parse(fs.readFileSync(path.join(runtimeRoot, "package.json"), "utf8")).version, piVersion, "Pi binary and SDK package versions differ");
+const runtimeBuiltinNames = [...runtimeTools.allToolNames].sort(); assert.ok(runtimeBuiltinNames.length > 0, "active runtime exposes no builtin capability set");
 installExactCommit({ extensionDir, stateDir: installerState, repositoryUrl, commit, expectedRepository: mode === "github" ? undefined : (value) => path.resolve(value) === repoRoot, npmCommand: ["npm", "--cache", npmCache], quiet: true });
 if (mode === "local") git(["remote", "set-url", "origin", canonicalRepository], extensionDir);
 assert.equal(git(["rev-parse", "HEAD"], extensionDir), commit); assert.equal(git(["status", "--porcelain=v1", "--untracked-files=all"], extensionDir), "");
@@ -93,17 +95,19 @@ fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers:
 async function runRegistryStopGate() {
 	const runtimeExtensionPaths = ["bound-tool-registry-bootstrap.ts", "subagent-prompt-runtime.ts", "bound-package-mediator.ts", "bound-tool-registry-gate.ts"].map((name) => path.join(extensionDir, "src", "runs", "shared", name));
 	const evidenceModule = await import(pathToFileURL(path.join(extensionDir, "src", "runs", "shared", "bound-runtime-evidence.ts")).href);
+	const registryModule = await import(pathToFileURL(path.join(extensionDir, "src", "runs", "shared", "tool-registry-proof.ts")).href);
+	const runtimeBuiltins = registryModule.runtimeBuiltinProjection(runtimeBuiltinNames.map((name) => ({ name, sourceInfo: { source: "builtin" } })));
+	assert.ok(runtimeBuiltins, "runtime builtin projection unavailable");
 	const proofNonce = "9".repeat(64), beforeRequests = allRequests.length;
-	const policy = { version: 1, modelApi: "openai-completions", piRuntimeVersion: piVersion, proofNonce, denialFd: 4, required: ["powershell"], internalTools: [], runtimeExtensions: evidenceModule.attestBoundRuntimeExtensions(runtimeExtensionPaths), packageExtensions: [] };
+	const policy = { version: 1, modelApi: "openai-completions", piRuntimeVersion: piVersion, proofNonce, denialFd: 4, required: ["powershell"], internalTools: [], runtimeExtensions: evidenceModule.attestBoundRuntimeExtensions(runtimeExtensionPaths), runtimeBuiltins, packageExtensions: [] };
 	const proofPath = path.join(root, "negative-registry-proof.json"), denialPath = path.join(root, "negative-denial-proof.json"), proofFd = fs.openSync(proofPath, "w"), denialFd = fs.openSync(denialPath, "w");
 	let stdout = "", stdoutOverflow = false, stderr = "", stderrOverflow = false, outcome;
 	try {
 		outcome = await new Promise((resolve, reject) => { const child = spawn(resolvedPiBinary, ["--no-extensions", "--no-context-files", "--no-skills", "--no-themes", "--no-session", "--model", "probe/child", "--tools", "read", "--extension", runtimeExtensionPaths[0], "--extension", runtimeExtensionPaths[1], "--extension", runtimeExtensionPaths[2], "--extension", runtimeExtensionPaths[3], "--mode", "json", "REAL_NEGATIVE_REGISTRY"], { cwd: project, env: { ...process.env, PI_OFFLINE: "1", PI_SUBAGENT_TOOL_REGISTRY_ACTIVE: "1", PI_SUBAGENT_TOOL_REGISTRY_POLICY: JSON.stringify(policy), PI_SUBAGENT_TOOL_REGISTRY_FD: "3", PI_SUBAGENT_TOOL_REGISTRY_CWD: fs.realpathSync(project) }, stdio: ["ignore", "pipe", "pipe", proofFd, denialFd] }); child.stdout.setEncoding("utf8"); child.stdout.on("data", (chunk) => { if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > 64 * 1024) { stdoutOverflow = true; child.kill("SIGKILL"); return; } stdout += chunk; }); child.stderr.setEncoding("utf8"); child.stderr.on("data", (chunk) => { if (Buffer.byteLength(stderr) + Buffer.byteLength(chunk) > 64 * 1024) { stderrOverflow = true; child.kill("SIGKILL"); return; } stderr += chunk; }); child.once("error", reject); const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} reject(new Error("negative registry child timed out")); }, 30_000); child.once("close", (code, signal) => { clearTimeout(timer); if (stdoutOverflow || stderrOverflow) reject(new Error("negative registry output exceeded 64 KiB")); else resolve({ code, signal }); }); });
 	} finally { fs.closeSync(proofFd); fs.closeSync(denialFd); }
 	const providerRequests = allRequests.length - beforeRequests, turns = stdout.split(/\r?\n/).filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return undefined; } }).filter((event) => event?.type === "turn_end").length; assert.deepEqual(outcome, { code: 78, signal: null }, stderr); assert.equal(providerRequests, 0, "registry mismatch reached provider turn"); assert.equal(turns, 0, `registry mismatch completed a Pi turn: ${stdout}`);
-	const proofBytes = fs.readFileSync(proofPath, "utf8"); assert.ok(Buffer.byteLength(proofBytes) > 0 && Buffer.byteLength(proofBytes) <= 64 * 1024, `negative registry proof is empty or oversized: ${JSON.stringify({ outcome, stderr, stdout })}`); const frame = JSON.parse(proofBytes); assert.equal(frame.kind, "registry"); assert.deepEqual(frame.projection.required, ["powershell"]); assert.deepEqual(frame.projection.effectiveCallerTools, ["read"]); assert.deepEqual(frame.projection.internalTools, []); assert.deepEqual(frame.projection.missing, ["powershell"]);
-	const digest = createHash("sha256").update('{"effectiveCallerTools":["read"],"internalTools":[],"missing":["powershell"],"projectionVersion":1,"required":["powershell"],"version":1}').digest("hex"); assert.equal(frame.projection.digest, digest);
-	return { status: outcome.code, signal: outcome.signal, providerRequests, turns, projection: frame.projection };
+	const proofBytes = fs.readFileSync(proofPath, "utf8"); assert.ok(Buffer.byteLength(proofBytes) > 0 && Buffer.byteLength(proofBytes) <= 64 * 1024, `negative registry proof is empty or oversized: ${JSON.stringify({ outcome, stderr, stdout })}`); const frame = JSON.parse(proofBytes); assert.equal(frame.kind, "protocol"); assert.equal(frame.code, "active_registry_drift");
+	return { status: outcome.code, signal: outcome.signal, providerRequests, turns, capabilityError: frame.code };
 }
 
 const eventBus = createEventBus();

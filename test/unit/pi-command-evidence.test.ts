@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { attestPiSpawnCommand, resolveAttestedPiSpawnCommand } from "../../src/runs/shared/pi-command-evidence.ts";
+import { attestPiRuntimeCapabilities, attestPiSpawnCommand, attestRunningPiRuntimeCapabilities, resolveAttestedPiSpawnCommand } from "../../src/runs/shared/pi-command-evidence.ts";
 
 test("attests a closed shell Pi wrapper, interpreter, and target script", () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-command-evidence-"));
@@ -24,11 +24,12 @@ test("attests a closed shell Pi wrapper, interpreter, and target script", () => 
 
 test("materializes active-root Pi command before an external-cwd spawn", () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-command-dual-root-")); const active = path.join(root, "active"); const external = path.join(root, "external"); fs.mkdirSync(active); fs.mkdirSync(external);
-	const trusted = path.join(active, "pi"); const attacker = path.join(external, "pi"); const trustedScript = path.join(active, "cli.mjs"); fs.writeFileSync(trustedScript, "console.log('trusted');\n"); fs.writeFileSync(path.join(active, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.84.2" }));
+	const trusted = path.join(active, "pi"); const attacker = path.join(external, "pi"); const trustedScript = path.join(active, "cli.mjs"); fs.writeFileSync(trustedScript, "console.log('trusted');\n"); fs.writeFileSync(path.join(active, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.84.2", type: "module" })); fs.mkdirSync(path.join(active, "dist", "core", "tools"), { recursive: true }); fs.writeFileSync(path.join(active, "dist", "core", "tools", "index.js"), "export const allToolNames = new Set(['read','future_builtin']);\n");
 	fs.writeFileSync(trusted, `#!/bin/sh\nexec "${process.execPath}" "./cli.mjs" "$@"\n`, { mode: 0o755 }); fs.writeFileSync(attacker, "#!/bin/sh\nexit 99\n", { mode: 0o755 }); fs.writeFileSync(path.join(external, "cli.mjs"), "throw new Error('attacker');\n");
 	const previous = process.env.PI_SUBAGENT_PI_BINARY; process.env.PI_SUBAGENT_PI_BINARY = "./pi";
-	try { const resolved = resolveAttestedPiSpawnCommand(["-p", "task"], active); assert.equal(resolved.command, fs.realpathSync(process.execPath)); assert.notEqual(resolved.command, attacker); assert.deepEqual(resolved.args, [trustedScript, "-p", "task"]); }
-	finally { if (previous === undefined) delete process.env.PI_SUBAGENT_PI_BINARY; else process.env.PI_SUBAGENT_PI_BINARY = previous; fs.rmSync(root, { recursive: true, force: true }); }
+	const previousArgv1 = process.argv[1];
+	try { const resolved = resolveAttestedPiSpawnCommand(["-p", "task"], active); assert.equal(resolved.command, fs.realpathSync(process.execPath)); assert.notEqual(resolved.command, attacker); assert.deepEqual(resolved.args, [trustedScript, "-p", "task"]); assert.deepEqual(attestPiRuntimeCapabilities(active).runtimeBuiltins.names, ["future_builtin", "read"]); process.argv[1] = trustedScript; assert.deepEqual(attestRunningPiRuntimeCapabilities(external).runtimeBuiltins.names, ["future_builtin", "read"]); }
+	finally { process.argv[1] = previousArgv1; if (previous === undefined) delete process.env.PI_SUBAGENT_PI_BINARY; else process.env.PI_SUBAGENT_PI_BINARY = previous; fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("materializes a nested shell-wrapper script and bounds cycles", () => {

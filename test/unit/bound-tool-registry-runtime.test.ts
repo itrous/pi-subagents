@@ -5,8 +5,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { attestBoundRuntimeExtensions } from "../../src/runs/shared/bound-runtime-evidence.ts";
-import { ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS, ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from "../../src/runs/shared/core-runtime-tools.ts";
+import { activeBoundRuntimeReservedTools, CORE_RUNTIME_OWNED_TOOLS } from "../../src/runs/shared/core-runtime-tools.ts";
 import { packageEvidenceRoot, packageTreeDigest, packageTreeEvidence } from "../../src/runs/shared/package-tree-evidence.ts";
+import { runtimeBuiltinProjection } from "../../src/runs/shared/tool-registry-proof.ts";
 import {
 	BOUND_TOOL_REGISTRY_ACTIVE_ENV,
 	BOUND_TOOL_REGISTRY_CWD_ENV,
@@ -20,6 +21,9 @@ import {
 	resetBoundToolRegistryRuntimeForTests,
 } from "../../src/runs/shared/bound-tool-registry-runtime.ts";
 
+const runtimeBuiltinTools = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
+const runtimeToolInfo = () => runtimeBuiltinTools.map((name) => ({ name, sourceInfo: { source: "builtin" } }));
+const visibleRuntimeToolInfo = () => [];
 function policy(packageExtensionPaths: string[] = [], modelApi = "openai-responses", required = ["a"]) {
 	process.env[BOUND_TOOL_REGISTRY_ACTIVE_ENV] = "1";
 	process.env[BOUND_TOOL_REGISTRY_CWD_ENV] = fs.realpathSync(process.cwd());
@@ -31,7 +35,7 @@ function policy(packageExtensionPaths: string[] = [], modelApi = "openai-respons
 	const runtimeExtensions = attestBoundRuntimeExtensions([
 		path.join(sharedDir, "bound-tool-registry-bootstrap.ts"), path.join(sharedDir, "subagent-prompt-runtime.ts"), path.join(sharedDir, "bound-package-mediator.ts"), path.join(sharedDir, "bound-tool-registry-gate.ts"),
 	]);
-	return { version: 1, modelApi, piRuntimeVersion: "0.84.3", proofNonce: "d".repeat(64), denialFd: 4, required, internalTools: [], packageExtensions, runtimeExtensions };
+	return { version: 1, modelApi, piRuntimeVersion: "0.84.3", proofNonce: "d".repeat(64), denialFd: 4, required, internalTools: [], packageExtensions, runtimeExtensions, runtimeBuiltins: runtimeBuiltinProjection(runtimeToolInfo())! };
 }
 
 function openAiPayload() {
@@ -42,7 +46,9 @@ describe("bound tool registry child runtime", () => {
 	const originalArgv1 = process.argv[1];
 	const fakePiRoot = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-pi-package-"));
 	const fakePiCli = path.join(fakePiRoot, "dist", "cli.js");
-	fs.mkdirSync(path.dirname(fakePiCli), { recursive: true });
+	fs.mkdirSync(path.dirname(fakePiCli), { recursive: true }); fs.mkdirSync(path.join(fakePiRoot, "dist", "core", "tools"), { recursive: true });
+	fs.writeFileSync(path.join(fakePiRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.84.3", type: "module" }));
+	fs.writeFileSync(path.join(fakePiRoot, "dist", "core", "tools", "index.js"), `export const allToolNames = new Set(${JSON.stringify(runtimeBuiltinTools)});\n`);
 	fs.writeFileSync(fakePiCli, "if (process.argv.includes('--version')) console.log('0.84.3');\n");
 	before(() => { process.argv[1] = fakePiCli; });
 	after(() => {
@@ -57,9 +63,19 @@ describe("bound tool registry child runtime", () => {
 		resetBoundToolRegistryRuntimeForTests();
 	});
 
-	it("keeps legacy general builtins separate from exact Pi 0.84.3 active-bound ownership", () => {
+	it("keeps legacy builtins separate from capability-projected active-bound ownership", () => {
 		assert.deepEqual([...CORE_RUNTIME_OWNED_TOOLS], ["read", "grep", "find", "ls", "bash", "edit", "write"]);
-		assert.deepEqual([...ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS], ["read", "grep", "find", "ls", "bash", "edit", "write", "powershell"]);
+		assert.ok(activeBoundRuntimeReservedTools(runtimeBuiltinTools).has("powershell"));
+	});
+
+	it("rejects a session-filtered parent projection that omits a real child builtin", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-runtime-filtered-parent-")); const proof = path.join(root, "proof"), fd = fs.openSync(proof, "w");
+		const filtered = policy(); filtered.runtimeBuiltins = runtimeBuiltinProjection([{ name: "read", sourceInfo: { source: "builtin" } }])!;
+		process.env[BOUND_TOOL_REGISTRY_POLICY_ENV] = JSON.stringify(filtered); process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
+		const originalExit = process.exit; (process as any).exit = (code: number) => { throw new Error(`exit:${code}`); };
+		try { initializeBoundToolRegistryBootstrap(); assert.throws(() => registerBoundToolRegistryGate({} as any), /exit:78/); }
+		finally { process.exit = originalExit; }
+		assert.equal(JSON.parse(fs.readFileSync(proof, "utf8")).code, "active_registry_drift"); fs.rmSync(root, { recursive: true, force: true });
 	});
 
 	it("probes script wrappers and standalone Pi with the correct argv shape", () => {
@@ -94,7 +110,7 @@ describe("bound tool registry child runtime", () => {
 		let providerHandler: ((event: { payload: unknown }, ctx: any) => unknown) | undefined;
 		const pi = {
 			on(event: string, handler: (event: { payload: unknown }, ctx: any) => unknown) { if (event === "before_provider_request") providerHandler = handler; },
-			getActiveTools() { return ["a"]; },
+			getActiveTools() { return ["a"]; }, getAllTools: visibleRuntimeToolInfo,
 		} as any;
 		registerBoundToolRegistryGate(pi);
 		const original = { model: "x", tools: [{ type: "function", name: "a", description: "x", parameters: {} }] };
@@ -116,7 +132,7 @@ describe("bound tool registry child runtime", () => {
 		process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
 		initializeBoundToolRegistryBootstrap();
 		let providerHandler: ((event: { payload: unknown }, ctx: any) => unknown) | undefined;
-		const pi = { on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; } } as any;
+		const pi = { on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; }, getAllTools: visibleRuntimeToolInfo } as any;
 		registerBoundToolRegistryGate(pi);
 		const constrainedSampling = { type: "json_schema", strict: "prefer" };
 		const outgoing = providerHandler!({ payload: { model: "x", context: { tools: [{ name: "a", label: "A", description: "x", parameters: {}, constrainedSampling, execute() {} }] }, options: {} } }, { model: { api: "pi-messages" } }) as any;
@@ -132,7 +148,7 @@ describe("bound tool registry child runtime", () => {
 		process.env[BOUND_TOOL_REGISTRY_FD_ENV] = String(fd);
 		initializeBoundToolRegistryBootstrap();
 		let providerHandler: ((event: { payload: unknown }, ctx: any) => unknown) | undefined;
-		const pi = { on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; } } as any;
+		const pi = { on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; }, getAllTools: visibleRuntimeToolInfo } as any;
 		registerBoundToolRegistryGate(pi);
 		const signal = new AbortController().signal;
 		const original = { model: "x", contents: [], config: { abortSignal: signal, tools: [{ functionDeclarations: [{ name: "a", description: "x", parametersJsonSchema: {} }] }] } };
@@ -153,7 +169,7 @@ describe("bound tool registry child runtime", () => {
 		let providerHandler: ((event: { payload: unknown }, ctx: any) => unknown) | undefined;
 		try {
 			initializeBoundToolRegistryBootstrap();
-			const pi = { on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; } } as any;
+			const pi = { on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; }, getAllTools: visibleRuntimeToolInfo } as any;
 			registerBoundToolRegistryGate(pi);
 			assert.throws(() => providerHandler!({ payload: openAiPayload() }, { model: { api: "anthropic-messages" } }), /exit:78/);
 		} finally { process.exit = originalExit; }
@@ -169,7 +185,7 @@ describe("bound tool registry child runtime", () => {
 		let providerHandler: ((event: { payload: unknown }, ctx: any) => unknown) | undefined;
 		try {
 			initializeBoundToolRegistryBootstrap(); fs.closeSync(fd);
-			registerBoundToolRegistryGate({ on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; } } as any);
+			registerBoundToolRegistryGate({ on(_event: string, handler: typeof providerHandler) { providerHandler = handler; }, getActiveTools() { return ["a"]; }, getAllTools: visibleRuntimeToolInfo } as any);
 			assert.throws(() => providerHandler!({ payload: openAiPayload() }, { model: { api: "openai-responses" } }), /exit:78/);
 		} finally { process.exit = originalExit; fs.rmSync(root, { recursive: true, force: true }); }
 	});
@@ -229,7 +245,7 @@ describe("bound tool registry child runtime", () => {
 				const active = new Set<string>(); let providerHandler: ((event: { payload: unknown }, ctx: any) => unknown) | undefined;
 				const pi = {
 					registerTool(tool: { name: string }) { active.add(tool.name); },
-					getActiveTools() { return [...active]; },
+					getActiveTools() { return [...active]; }, getAllTools: visibleRuntimeToolInfo,
 					on(event: string, handler: typeof providerHandler) { if (event === "before_provider_request") providerHandler = handler; },
 				} as any;
 				await loadBoundPackageFactories(pi); registerBoundToolRegistryGate(pi);
@@ -292,14 +308,15 @@ describe("bound tool registry child runtime", () => {
 
 	it("rejects package ownership collisions with every runtime-owned builtin", () => {
 		const registrations: string[] = [];
-		const mediated = createBoundPackageApi({ registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any) as any;
-		for (const name of ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS) assert.throws(() => mediated.registerTool({ name, execute() {} }));
+		const ownership = { occupiedToolNames: new Set(activeBoundRuntimeReservedTools(runtimeBuiltinTools)), packageToolOwners: new Map<string, symbol>() };
+		const mediated = (createBoundPackageApi as any)({ registerTool(tool: { name: string }) { registrations.push(tool.name); } }, ownership) as any;
+		for (const name of activeBoundRuntimeReservedTools(runtimeBuiltinTools)) assert.throws(() => mediated.registerTool({ name, execute() {} }));
 		assert.deepEqual(registrations, []);
 	});
 
 	it("rejects one package factory replacing another package factory tool", () => {
 		const registrations: string[] = [];
-		const ownership = { occupiedToolNames: new Set(ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS), packageToolOwners: new Map<string, symbol>() };
+		const ownership = { occupiedToolNames: new Set(runtimeBuiltinTools), packageToolOwners: new Map<string, symbol>() };
 		const pi = { registerTool(tool: { name: string }) { registrations.push(tool.name); } } as any;
 		const first = (createBoundPackageApi as any)(pi, ownership);
 		const second = (createBoundPackageApi as any)(pi, ownership);

@@ -773,7 +773,7 @@ describe("buildPiArgs system prompt mode wiring", () => {
 		]);
 		assert.throws(() => buildPiArgs({
 			baseArgs: ["-p"], task: "hello", sessionEnabled: false, inheritProjectContext: false, inheritSkills: false,
-			tools: ["structured_output"], activeBoundPackageMediator: true,
+			tools: ["structured_output"], activeBoundPackageMediator: true, activeBoundRuntimeBuiltinTools: ["read", "powershell"],
 			structuredOutput: { schema: { type: "object" }, schemaPath: "/tmp/schema.json", outputPath: "/tmp/output.json" },
 		}), /must not overlap/);
 	});
@@ -1543,10 +1543,11 @@ describe("bound runtime extension evidence", () => {
 });
 
 describe("active-bound mediated extension order", () => {
+	const runtimeBuiltins = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
 	it("accepts exact package-provided caller names only with a factory projection", () => {
 		const plan = resolvePiLaunchToolPlan({
 			tools: ["read", "git_read", "web_search"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],
-			activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+			activeBoundPackageMediator: true, activeBoundRuntimeBuiltinTools: runtimeBuiltins, disablePermissionSystemExtension: true,
 		});
 		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "git_read", "web_search"]);
 		assert.deepEqual(plan.requiredChildTools, ["read", "git_read", "web_search"]);
@@ -1565,20 +1566,20 @@ describe("active-bound mediated extension order", () => {
 		] as string[][]) {
 			assert.throws(() => resolvePiLaunchToolPlan({
 				tools, extensions: [], subagentOnlyExtensions: tools[1] === "git_read" ? [] : ["/trusted/package-extension.ts"],
-				activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+				activeBoundPackageMediator: true, activeBoundRuntimeBuiltinTools: runtimeBuiltins, disablePermissionSystemExtension: true,
 			}), /Active-bound/);
 		}
 	});
 
 	it("rejects direct MCP shadowing of the Pi 0.84.3 powershell builtin only in active-bound mode", () => {
 		const fixture = createMcpFixture(); writeMcpFixture(fixture, { serverName: "sys", definition: { command: "probe", toolPrefix: "none" }, tools: [{ name: "powershell" }] });
-		assert.throws(() => resolvePiLaunchToolPlan({ tools: ["read"], extensions: [], mcpDirectTools: ["sys"], cwd: fixture.projectDir, activeBoundPackageMediator: true, disablePermissionSystemExtension: true }), /must not overlap/);
+		assert.throws(() => resolvePiLaunchToolPlan({ tools: ["read"], extensions: [], mcpDirectTools: ["sys"], cwd: fixture.projectDir, activeBoundPackageMediator: true, activeBoundRuntimeBuiltinTools: runtimeBuiltins, disablePermissionSystemExtension: true }), /must not overlap/);
 	});
 
 	it("loads bootstrap, mediator and registry gate without direct package entries", () => {
 		const plan = resolvePiLaunchToolPlan({
 			tools: ["read"], extensions: [], subagentOnlyExtensions: ["/trusted/package-extension.ts"],
-			activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+			activeBoundPackageMediator: true, activeBoundRuntimeBuiltinTools: runtimeBuiltins, disablePermissionSystemExtension: true,
 		});
 		assert.equal(plan.disableAmbientExtensions, true);
 		assert.equal(plan.extensionArgs.length, 4);

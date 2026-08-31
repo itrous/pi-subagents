@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { VERSION as PI_RUNTIME_VERSION } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { discoverAgents, discoverProjectAgentsRestricted, resolveAgentName, type AgentConfig } from "../agents/agents.ts";
@@ -23,8 +22,8 @@ import { activeBoundPreflightRequestDigest } from "./active-bound-preflight.ts";
 import { projectActiveBoundEnvironment, type ActiveBoundEnvironmentProjectionV1 } from "./active-bound-environment.ts";
 import { resolveActiveBoundPackageExtensions, type ActiveBoundPackageExtensionProjectionV1 } from "./active-bound-package-extensions.ts";
 import { attestPiSpawnCommand } from "../runs/shared/pi-command-evidence.ts";
-import { expectedToolRegistryProjection, SUPPORTED_BOUND_MODEL_APIS, SUPPORTED_BOUND_PI_VERSIONS, type ToolRegistryProjectionV1 } from "../runs/shared/tool-registry-proof.ts";
-import { ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS, ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, isActiveBoundPackageToolName } from "../runs/shared/core-runtime-tools.ts";
+import { expectedToolRegistryProjection, runtimeBuiltinProjection, SUPPORTED_BOUND_MODEL_APIS, type RuntimeBuiltinProjectionV1, type ToolRegistryProjectionV1 } from "../runs/shared/tool-registry-proof.ts";
+import { activeBoundRuntimeReservedTools, isActiveBoundPackageToolName } from "../runs/shared/core-runtime-tools.ts";
 
 export const ACTIVE_BOUND_LAUNCH_CONTRACT_VERSION = 1 as const;
 
@@ -38,6 +37,8 @@ export interface ResolveActiveBoundLaunchContractInput {
 	activeCwd: string;
 	sessionManager: SessionManager;
 	availableModels: ReadonlyArray<AvailableModelInfo>;
+	runtimeToolInfo: readonly unknown[];
+	runtimeVersionIdentity: string;
 	serverInstanceId: string;
 	sourceIdentityDigest: string;
 	defaultSessionDir?: string;
@@ -84,7 +85,7 @@ export interface ActiveBoundLaunchContractV1 {
 	packageExtensionsDigest: string;
 	tools: { effectiveAllowlist: string[]; requiredChildTools: string[]; disableAmbientExtensions: boolean; capabilityCeiling?: ResolvedSubagentCapabilityCeiling };
 	mcpDirectTools: string[];
-	toolRegistry: { modelApi: string; piRuntimeVersion: string; projection: ToolRegistryProjectionV1; runtimeExtensions: import("../runs/shared/pi-args.ts").BoundRuntimeExtensionEvidenceV1; digest: string };
+	toolRegistry: { modelApi: string; piRuntimeVersion: string; projection: ToolRegistryProjectionV1; runtimeExtensions: import("../runs/shared/pi-args.ts").BoundRuntimeExtensionEvidenceV1; runtimeBuiltins: RuntimeBuiltinProjectionV1; digest: string };
 	roots: { baseRootPathDigest: string; baseRootIdentityDigest?: string; baseRootParentIdentityDigest?: string; sessionRootDigest: string; sessionDirDigest: string; sessionFileDigest: string; artifactRootDigest?: string };
 	policy: { foregroundOnly: true; async: false; clarify: false; share: false; acceptance: false; mission: false; output: false; outputMode: "inline"; artifacts: boolean; artifactDir?: "session"; watchdog: false; control: false; intercom: false; usageBudget: false; waitToolEnabled: boolean; parentDepth: number; maxSubagentDepth?: number; permissionsDigest?: string; modelScopeDigest: string };
 	result: ActiveBoundPreflightRequestV1["result"];
@@ -270,7 +271,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const exactModel = input.availableModels.find((entry) => `${entry.provider}/${entry.id}` === input.request.model && (entry.fullId === undefined || entry.fullId === input.request.model));
 	if (!exactModel || checkModelScope(input.request.model, discovered.modelScope, "explicit")
 		|| !getSupportedThinkingLevels({ ...exactModel, fullId: input.request.model }).includes(input.request.thinking)) return failure("unavailable_model");
-	if (!exactModel.api || !SUPPORTED_BOUND_MODEL_APIS.has(exactModel.api) || !SUPPORTED_BOUND_PI_VERSIONS.has(PI_RUNTIME_VERSION)) return failure("unsupported_mode");
+	if (!exactModel.api || !SUPPORTED_BOUND_MODEL_APIS.has(exactModel.api)) return failure("unsupported_mode");
 	const modelRegistryDigest = canonicalSha256({
 		provider: exactModel.provider, id: exactModel.id,
 		...(exactModel.fullId !== undefined ? { fullId: exactModel.fullId } : {}),
@@ -299,8 +300,12 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	const boundCeiling = input.capabilityCeiling;
 	const explicitAgentTools = agent.tools ?? [];
 	if (new Set(explicitAgentTools).size !== explicitAgentTools.length) return failure("unsupported_mode");
-	const packageProvidedTools = explicitAgentTools.filter((tool) => !ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS.has(tool));
-	if (packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
+	const runtimeBuiltins = runtimeBuiltinProjection(input.runtimeToolInfo);
+	if (!runtimeBuiltins) return failure("unsupported_mode");
+	const runtimeBuiltinNames = new Set(runtimeBuiltins.names);
+	const runtimeReservedTools = activeBoundRuntimeReservedTools(runtimeBuiltinNames);
+	const packageProvidedTools = explicitAgentTools.filter((tool) => !runtimeBuiltinNames.has(tool));
+	if (packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || runtimeReservedTools.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
 		|| (packageProvidedTools.length > 0 && (agent.source !== "package" || packageExtensions.paths.length === 0
 			|| packageExtensions.paths.length !== packageExtensions.projection.length))) return failure("unsupported_mode");
 	const boundTools = resolvedSkills.resolved.length > 0 && !explicitAgentTools.includes("read") ? ["read", ...explicitAgentTools] : explicitAgentTools;
@@ -313,6 +318,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 			structuredOutput: input.request.result.kind === "structured", capabilityCeiling: boundCeiling, agentName: agent.name,
 			disablePermissionSystemExtension: true,
 			activeBoundPackageMediator: true,
+			activeBoundRuntimeBuiltinTools: runtimeBuiltins.names,
 		});
 	} catch { return failure("restricted_agent"); }
 	if (packageProvidedTools.some((tool) => !toolPlan.effectiveToolAllowlist.includes(tool) || !toolPlan.requiredChildTools.includes(tool))) return failure("restricted_agent");
@@ -358,13 +364,15 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 	let runtimeExtensions;
 	try { runtimeExtensions = attestBoundRuntimeExtensions(toolPlan.runtimeExtensions); }
 	catch { return failure("unsupported_mode"); }
-	const toolRegistryDigest = canonicalSha256({ modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions });
-	let piCommandEvidence; try { piCommandEvidence = attestPiSpawnCommand(activeCwd); } catch { return failure("unsupported_mode"); }
+	let piCommandEvidence; const piRuntimeVersion = input.runtimeVersionIdentity;
+	try { piCommandEvidence = attestPiSpawnCommand(activeCwd); } catch { return failure("unsupported_mode"); }
+	if (!piRuntimeVersion || Buffer.byteLength(piRuntimeVersion, "utf8") > 128 || /[\0\r\n]/u.test(piRuntimeVersion)) return failure("unsupported_mode");
+	const toolRegistryDigest = canonicalSha256({ modelApi: exactModel.api, piRuntimeVersion, projection: toolRegistryProjection, runtimeExtensions, runtimeBuiltins });
 	const launchBindingInput = {
 		definitionDigest, canonicalCwd: requestCwd, task: input.request.task,
 		model: materializedModel, modelCandidates: [materializedModel], thinking: input.request.thinking, systemPrompt,
 		systemPromptMode: agent.systemPromptMode, inheritProjectContext: agent.inheritProjectContext, inheritSkills: agent.inheritSkills,
-		skills: skillNames, environment, packageExtensions: packageExtensions.projection, piCommandEvidence, toolRegistry: { modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions, digest: toolRegistryDigest }, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: packageExtensions.paths, mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
+		skills: skillNames, environment, packageExtensions: packageExtensions.projection, piCommandEvidence, toolRegistry: { modelApi: exactModel.api, piRuntimeVersion, projection: toolRegistryProjection, runtimeExtensions, runtimeBuiltins, digest: toolRegistryDigest }, artifactPolicy: { enabled: input.request.artifacts, ...(input.request.artifactDir ? { dir: input.request.artifactDir, root: artifactRoot, includeInput: true, includeOutput: true, includeJsonl: true, includeTranscript: true, includeMetadata: true } : {}) }, tools: toolPlan.effectiveToolAllowlist, extensions: toolPlan.extensionArgs, subagentOnlyExtensions: packageExtensions.paths, mcpDirectTools: toolPlan.effectiveMcpTools, permissionRules: effectivePermissions,
 		outputMode: "inline" as const, ...(input.request.result.kind === "structured" ? { structuredOutputSchema: input.request.result.schema } : {}),
 	};
 	const base: Omit<ActiveBoundLaunchContractV1, "digest"> = {
@@ -378,7 +386,7 @@ export function resolveActiveBoundLaunchContract(input: ResolveActiveBoundLaunch
 		packageExtensionsDigest: canonicalSha256(packageExtensions.projection),
 		tools: { effectiveAllowlist: toolPlan.effectiveToolAllowlist, requiredChildTools: toolPlan.requiredChildTools, disableAmbientExtensions: toolPlan.disableAmbientExtensions, ...(boundCeiling ? { capabilityCeiling: boundCeiling } : {}) },
 		mcpDirectTools: toolPlan.effectiveMcpTools,
-		toolRegistry: { modelApi: exactModel.api, piRuntimeVersion: PI_RUNTIME_VERSION, projection: toolRegistryProjection, runtimeExtensions, digest: toolRegistryDigest },
+		toolRegistry: { modelApi: exactModel.api, piRuntimeVersion, projection: toolRegistryProjection, runtimeExtensions, runtimeBuiltins, digest: toolRegistryDigest },
 		roots: {
 			baseRootPathDigest: canonicalSha256(baseRoot),
 			...(baseRootIdentityDigest ? { baseRootIdentityDigest } : {}),
