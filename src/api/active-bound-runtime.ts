@@ -4,6 +4,7 @@ import type { ResolvedSubagentCapabilityCeiling } from "../runs/shared/capabilit
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { resolveCurrentMaxSubagentDepth, type ExtensionConfig } from "../shared/types.ts";
 import type { AvailableModelInfo } from "../runs/shared/model-fallback.ts";
+import type { PiRuntimeCapabilitiesV1 } from "../runs/shared/pi-command-evidence.ts";
 import {
 	activeBoundPreflightRequestDigest,
 	parseActiveBoundPreflightRequest,
@@ -81,6 +82,7 @@ export interface CreateActiveBoundRuntimeServiceOptions {
 	serverInstanceId: string;
 	sourceIdentityDigest: string;
 	getContext: () => ActiveBoundRuntimeContext | null;
+	getRuntimeCapabilities: () => PiRuntimeCapabilitiesV1;
 	config: ExtensionConfig;
 	waitToolEnabled: boolean;
 	resolveCapabilityCeiling: (sessionId: string) => ResolvedSubagentCapabilityCeiling | undefined;
@@ -154,11 +156,15 @@ export function createActiveBoundRuntimeService(options: CreateActiveBoundRuntim
 			if (!ctx) return { ok: false, code: "host_required" };
 			let sessionId: string;
 			try { sessionId = resolveCurrentSessionId(ctx.sessionManager); } catch { sessionId = ""; }
+			let runtimeCapabilities: PiRuntimeCapabilitiesV1;
+			try { runtimeCapabilities = options.getRuntimeCapabilities(); } catch { return { ok: false, code: "unsupported_mode" }; }
 			return resolveActiveBoundLaunchContract({
 				request,
 				activeCwd: ctx.cwd,
 				sessionManager: ctx.sessionManager,
 				availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
+				runtimeToolInfo: runtimeCapabilities.runtimeBuiltins.names.map((name) => ({ name, sourceInfo: { source: "builtin" } })),
+				runtimeVersionIdentity: runtimeCapabilities.piRuntimeVersion,
 				serverInstanceId: options.serverInstanceId,
 				sourceIdentityDigest: options.sourceIdentityDigest,
 				isProjectTrusted: ctx.isProjectTrusted,

@@ -5,16 +5,17 @@ import { createRequire, Module } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { VERSION as PI_RUNTIME_VERSION } from "@earendil-works/pi-coding-agent";
 import { createJiti } from "jiti/static";
 import { cloneJsonWithinByteLimit } from "../../slash/delegation-json.ts";
 import { attestBoundRuntimeExtensions } from "./bound-runtime-evidence.ts";
-import { ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS } from "./core-runtime-tools.ts";
+import { activeBoundRuntimeReservedTools } from "./core-runtime-tools.ts";
 import { packageTreeEvidence } from "./package-tree-evidence.ts";
+import { attestRunningPiRuntimeCapabilities } from "./pi-command-evidence.ts";
 import {
 	TOOL_REGISTRY_MAX_PAYLOAD_BYTES,
 	encodeToolRegistryFrame,
 	extractProviderPayloadToolNames,
+	runtimeBuiltinProjection,
 	sortToolRegistryNames,
 	toolRegistryProjection,
 	validateBoundToolRegistryPolicy,
@@ -152,14 +153,14 @@ interface BoundPackageToolOwnership {
 
 function newPackageToolOwnership(): BoundPackageToolOwnership {
 	return {
-		occupiedToolNames: new Set([...ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, ...(runtimeHolder.state?.policy.internalTools ?? [])]),
+		occupiedToolNames: new Set([...activeBoundRuntimeReservedTools(runtimeHolder.state?.policy.runtimeBuiltins.names ?? []), ...(runtimeHolder.state?.policy.internalTools ?? [])]),
 		packageToolOwners: new Map(),
 	};
 }
 
 export function createBoundPackageApi(pi: ExtensionAPI, ownership = newPackageToolOwnership()): ExtensionAPI {
-	// Active-bound supports Pi 0.84.3 and protects its exact builtin registry plus
-	// runtime-owned internal tools without calling action APIs during extension load.
+	// Active-bound protects the parent-attested live builtin registry plus runtime-owned
+	// internal tools without inferring compatibility from the Pi version string.
 	const owner = Symbol("bound-package-factory");
 	const { occupiedToolNames, packageToolOwners } = ownership;
 	return opaqueFacade(pi, (property) => {
@@ -271,7 +272,7 @@ function packageNameForEntry(entry: string, evidenceRoot: string): string | unde
 
 export async function loadBoundPackageFactories(pi: ExtensionAPI): Promise<void> {
 	if (!runtimeHolder.state) return;
-	const runtimeOwned = new Set([...ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, ...runtimeHolder.state.policy.internalTools]);
+	const runtimeOwned = new Set([...activeBoundRuntimeReservedTools(runtimeHolder.state.policy.runtimeBuiltins.names), ...runtimeHolder.state.policy.internalTools]);
 	for (const name of runtimeHolder.state.policy.required) {
 		if (runtimeOwned.has(name)) continue;
 		(pi.registerTool as unknown as (tool: unknown) => unknown)({
@@ -375,15 +376,21 @@ function cloneOutgoingPayload(api: string, payload: unknown): { ok: true; value:
 export function registerBoundToolRegistryGate(pi: ExtensionAPI): void {
 	if (!runtimeHolder.state) return;
 	const failStopExit = runtimeHolder.state.exit;
-	if (runningPiVersion() !== runtimeHolder.state.policy.piRuntimeVersion || PI_RUNTIME_VERSION !== runtimeHolder.state.policy.piRuntimeVersion) {
-		protocolExit({ version: 1, kind: "protocol", code: "runtime_version_drift" });
-	}
+	let childCapabilities;
+	try { childCapabilities = attestRunningPiRuntimeCapabilities(); } catch { protocolExit({ version: 1, kind: "protocol", code: "active_registry_drift" }); }
+	if (runningPiVersion() !== runtimeHolder.state.policy.piRuntimeVersion || childCapabilities.piRuntimeVersion !== runtimeHolder.state.policy.piRuntimeVersion) protocolExit({ version: 1, kind: "protocol", code: "runtime_version_drift" });
+	if (JSON.stringify(childCapabilities.runtimeBuiltins) !== JSON.stringify(runtimeHolder.state.policy.runtimeBuiltins)) protocolExit({ version: 1, kind: "protocol", code: "active_registry_drift" });
 	pi.on("agent_start", () => { pi.getActiveTools(); });
 	(pi.on as unknown as (event: string, handler: (event: { payload?: unknown }, ctx: ExtensionContext) => unknown) => void)("before_provider_request", (event, ctx) => {
 		try {
 		if (!runtimeHolder.state || runtimeHolder.state.barrierCommitted) return event.payload;
 		if (runtimeHolder.state.placeholderTools.size > 0) protocolExit({ version: 1, kind: "protocol", code: "package_load_error" });
 		if (ctx.model?.api !== runtimeHolder.state.policy.modelApi) protocolExit({ version: 1, kind: "protocol", code: "model_api_drift" });
+		const liveBuiltins = runtimeBuiltinProjection(pi.getAllTools(), { allowEmpty: true });
+		const expectedVisibleBuiltins = runtimeBuiltinProjection(runtimeHolder.state.policy.runtimeBuiltins.names
+			.filter((name) => runtimeHolder.state!.policy.required.includes(name))
+			.map((name) => ({ name, sourceInfo: { source: "builtin" } })), { allowEmpty: true });
+		if (!liveBuiltins || !expectedVisibleBuiltins || JSON.stringify(liveBuiltins) !== JSON.stringify(expectedVisibleBuiltins)) protocolExit({ version: 1, kind: "protocol", code: "active_registry_drift" });
 		verifyRuntimeEvidence(); verifyPackageEvidence();
 		const cloned = cloneOutgoingPayload(runtimeHolder.state.policy.modelApi, event.payload);
 		if (!cloned.ok) protocolExit({ version: 1, kind: "protocol", code: "unsupported_payload_shape" });

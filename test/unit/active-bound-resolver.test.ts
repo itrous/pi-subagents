@@ -38,7 +38,7 @@ function setup(cwd: string): { agent: string; skill: string } {
 function input(cwd: string, req = request(cwd)): ResolveActiveBoundLaunchContractInput {
 	return {
 		request: req, activeCwd: cwd, sessionManager: { getSessionFile: () => path.join(root, "sessions", "parent.jsonl"), getSessionId: () => "pi-session" },
-		projectTrusted: true, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: true }], serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "child-sessions"),
+		projectTrusted: true, availableModels: [{ provider: "test", id: "exact", fullId: "test/exact", api: "openai-responses", reasoning: true }], runtimeToolInfo: ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name, sourceInfo: { source: "builtin" } })), runtimeVersionIdentity: "0.84.4", serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "child-sessions"),
 		runtimePolicy: { foregroundTimeoutMs: 30 * 60 * 1000, waitToolEnabled: true },
 	};
 }
@@ -70,7 +70,8 @@ describe("restricted active-bound resolver", () => {
 		assert.equal(first.contract.policy.artifacts, false);
 		assert.equal(first.contract.tools.disableAmbientExtensions, true);
 		assert.equal(first.contract.toolRegistry.modelApi, "openai-responses");
-		assert.equal(first.contract.toolRegistry.piRuntimeVersion, "0.84.3");
+		assert.equal(first.contract.toolRegistry.piRuntimeVersion, "0.84.4");
+		assert.deepEqual(first.contract.toolRegistry.runtimeBuiltins.names, ["bash", "edit", "find", "grep", "ls", "powershell", "read", "write"]);
 		assert.deepEqual(first.contract.toolRegistry.projection.effectiveCallerTools, ["read"]);
 		assert.deepEqual(first.contract.toolRegistry.projection.missing, []);
 		assert.match(first.contract.toolRegistry.digest, /^[0-9a-f]{64}$/);

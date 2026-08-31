@@ -14,6 +14,7 @@
 
 import { randomUUID } from "node:crypto";
 import { createActiveBoundRuntimeService } from "../api/active-bound-runtime.ts";
+import { attestPiRuntimeCapabilities, type PiRuntimeCapabilitiesV1 } from "../runs/shared/pi-command-evidence.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -345,6 +346,7 @@ export default function registerSubagentExtension(
 	pi: ExtensionAPI,
 	dependencies: {
 		resolveSourceIdentity?: typeof resolveActiveRuntimeSourceIdentity;
+		resolveRuntimeCapabilities?: () => PiRuntimeCapabilitiesV1;
 		createServerInstanceId?: () => string;
 		registerSlashBridge?: typeof registerSlashSubagentBridge;
 		registerPromptTemplateBridge?: typeof registerPromptTemplateDelegationBridge;
@@ -483,11 +485,14 @@ export default function registerSubagentExtension(
 		state.cleanupTimers.clear();
 	};
 
+	let runtimeCapabilities: PiRuntimeCapabilitiesV1 | undefined;
+	const getRuntimeCapabilities = dependencies.resolveRuntimeCapabilities ?? (() => runtimeCapabilities ??= attestPiRuntimeCapabilities(state.lastUiContext?.cwd ?? process.cwd()));
 	const activeBoundRuntime = sourceIdentityResolution.available
 		? createActiveBoundRuntimeService({
 			serverInstanceId,
 			sourceIdentityDigest: sourceIdentityResolution.sourceIdentity.digest,
 			getContext: () => state.lastUiContext,
+			getRuntimeCapabilities,
 			config,
 			waitToolEnabled: waitToolConfig.enabled,
 			resolveCapabilityCeiling: (sessionId) => resolveCurrentSubagentCapabilityCeiling(sessionId),

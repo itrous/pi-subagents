@@ -434,6 +434,7 @@ async function runSingleAttempt(
 		capabilityCeiling: options.capabilityCeiling,
 		disablePermissionSystemExtension: options.activeBoundProjectSkills,
 		activeBoundPackageMediator: options.activeBoundToolRegistry !== undefined,
+		activeBoundRuntimeBuiltinTools: options.activeBoundToolRegistry?.runtimeBuiltins.names,
 	});
 
 	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget);
@@ -451,6 +452,7 @@ async function runSingleAttempt(
 		agentName: agent.name,
 		disablePermissionSystemExtension: options.activeBoundProjectSkills,
 		activeBoundPackageMediator: options.activeBoundToolRegistry !== undefined,
+		activeBoundRuntimeBuiltinTools: options.activeBoundToolRegistry?.runtimeBuiltins.names,
 	});
 	const launchResolvedExtensions = projectLaunchResolvedChildExtensions(toolPlan);
 	const boundToolRegistryProjection = options.activeBoundToolRegistry
@@ -461,7 +463,7 @@ async function runSingleAttempt(
 		? attestBoundRuntimeExtensions(toolPlan.runtimeExtensions)
 		: undefined;
 	const boundToolRegistryDigest = options.activeBoundToolRegistry && boundToolRegistryProjection && boundRuntimeExtensions
-		? canonicalSha256({ modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions })
+		? canonicalSha256({ modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions, runtimeBuiltins: options.activeBoundToolRegistry.runtimeBuiltins })
 		: undefined;
 	let piCommandEvidence;
 	try { piCommandEvidence = options.activeBoundToolRegistry ? attestPiSpawnCommand(options.activeBoundDiscoveryCwd ?? options.cwd ?? runtimeCwd) : undefined; }
@@ -490,7 +492,7 @@ async function runSingleAttempt(
 		...(options.activeBoundEnvironment !== undefined ? { environment: projectActiveBoundEnvironment(options.activeBoundEnvironment) } : {}),
 		...(boundPackageExtensions ? { packageExtensions: boundPackageExtensions.projection } : {}),
 		...(piCommandEvidence ? { piCommandEvidence } : {}),
-		...(options.activeBoundToolRegistry && boundToolRegistryProjection && boundToolRegistryDigest ? { toolRegistry: { modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions, digest: boundToolRegistryDigest } } : {}),
+		...(options.activeBoundToolRegistry && boundToolRegistryProjection && boundToolRegistryDigest ? { toolRegistry: { modelApi: options.activeBoundToolRegistry.modelApi, piRuntimeVersion: options.activeBoundToolRegistry.piRuntimeVersion, projection: boundToolRegistryProjection, runtimeExtensions: boundRuntimeExtensions, runtimeBuiltins: options.activeBoundToolRegistry.runtimeBuiltins, digest: boundToolRegistryDigest } } : {}),
 		...(options.activeBoundEnvironment !== undefined ? { artifactPolicy: options.deferArtifactsUntilSpawn ? { enabled: true, dir: "session", root: options.artifactsDir, includeInput: options.artifactConfig?.includeInput !== false, includeOutput: options.artifactConfig?.includeOutput !== false, includeJsonl: options.artifactConfig?.includeJsonl !== false, includeTranscript: options.artifactConfig?.includeTranscript !== false, includeMetadata: options.artifactConfig?.includeMetadata !== false } : { enabled: false } } : {}),
 		tools: toolPlan.effectiveToolAllowlist,
 		extensions: toolPlan.extensionArgs,

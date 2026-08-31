@@ -1,7 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { canonicalSha256 } from "../../shared/canonical-json.ts";
+import { runtimeBuiltinProjection, type RuntimeBuiltinProjectionV1 } from "./tool-registry-proof.ts";
 import { getPiSpawnCommand } from "./pi-spawn.ts";
 import { packageTreeEvidence } from "./package-tree-evidence.ts";
 
@@ -118,6 +120,37 @@ export function resolveAttestedPiSpawnCommand(args: string[], cwd = process.cwd(
 		command = wrapper.command; resolvedArgs = [wrapper.script, ...(scriptCandidate ? resolvedArgs.slice(1) : resolvedArgs)];
 	}
 	throw new Error("Pi shell wrapper depth exceeded.");
+}
+
+export interface PiRuntimeCapabilitiesV1 { version: 1; piRuntimeVersion: string; runtimeBuiltins: RuntimeBuiltinProjectionV1 }
+
+function runtimeCapabilitiesAt(root: string, cwd: string): PiRuntimeCapabilitiesV1 {
+	const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { name?: unknown; version?: unknown };
+	if (manifest.name !== "@earendil-works/pi-coding-agent" || typeof manifest.version !== "string" || !manifest.version || Buffer.byteLength(manifest.version, "utf8") > 128 || /[\0\r\n]/u.test(manifest.version)) throw new Error("Pi runtime identity is unavailable.");
+	const toolsModule = path.join(root, "dist", "core", "tools", "index.js");
+	const probeSource = "import {pathToFileURL} from 'node:url'; const m=await import(pathToFileURL(process.argv[1]).href); const names=[...m.allToolNames]; process.stdout.write(JSON.stringify(names));";
+	const probe = spawnSync(process.execPath, ["--input-type=module", "-e", probeSource, toolsModule], { cwd, encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+	let names: unknown; try { names = probe.status === 0 ? JSON.parse(probe.stdout) : undefined; } catch { names = undefined; }
+	if (!Array.isArray(names)) throw new Error("Pi runtime builtin capability export is unavailable.");
+	const runtimeBuiltins = runtimeBuiltinProjection(names.map((name) => ({ name, sourceInfo: { source: "builtin" } })));
+	if (!runtimeBuiltins) throw new Error("Pi runtime builtin capability projection is invalid.");
+	return { version: 1, piRuntimeVersion: manifest.version, runtimeBuiltins };
+}
+
+export function attestPiRuntimeCapabilities(cwd = process.cwd()): PiRuntimeCapabilitiesV1 {
+	const spawn = resolveAttestedPiSpawnCommand([], cwd);
+	let root: string | undefined;
+	for (const candidate of [...spawn.args, spawn.command].filter((entry) => path.isAbsolute(entry))) {
+		try { root = piPackageRoot(fs.realpathSync(candidate)); break; } catch {}
+	}
+	if (!root) throw new Error("Pi spawn-target runtime package is unavailable.");
+	return runtimeCapabilitiesAt(root, cwd);
+}
+
+export function attestRunningPiRuntimeCapabilities(cwd = process.cwd()): PiRuntimeCapabilitiesV1 {
+	const entry = process.argv[1];
+	if (!entry) throw new Error("Running Pi entry point is unavailable.");
+	return runtimeCapabilitiesAt(piPackageRoot(fs.realpathSync(entry)), cwd);
 }
 
 export function attestPiSpawnCommand(cwd = process.cwd()): PiCommandEvidenceV1 {

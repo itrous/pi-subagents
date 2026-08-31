@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { parseActiveBoundPreflightRequest } from "../../src/api/active-bound-preflight.ts";
 import { createActiveBoundRuntimeService } from "../../src/api/active-bound-runtime.ts";
+import { runtimeBuiltinProjection } from "../../src/runs/shared/tool-registry-proof.ts";
 import { createLaunchReceiptService, type LaunchReceiptService } from "../../src/api/launch-receipt.ts";
 
 function fixture(config: Record<string, unknown> = {}, receipts?: LaunchReceiptService) {
@@ -28,6 +29,7 @@ function fixture(config: Record<string, unknown> = {}, receipts?: LaunchReceiptS
 	const runtimeConfig = { defaultSessionDir: sessionRoot, ...config };
 	const runtime = createActiveBoundRuntimeService({
 		serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), getContext: () => ctx,
+		getRuntimeCapabilities: () => ({ version: 1, piRuntimeVersion: "0.84.4", runtimeBuiltins: runtimeBuiltinProjection(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name, sourceInfo: { source: "builtin" } })))! }),
 		config: runtimeConfig, waitToolEnabled: false, resolveCapabilityCeiling: () => undefined,
 		receipts,
 	});

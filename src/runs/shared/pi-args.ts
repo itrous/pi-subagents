@@ -52,7 +52,7 @@ import {
 	PERMISSION_POLICY_ENV,
 	type PermissionRules,
 } from "./permissions.ts";
-import { ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS, ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS, isActiveBoundPackageToolName } from "./core-runtime-tools.ts";
+import { activeBoundRuntimeReservedTools, isActiveBoundPackageToolName } from "./core-runtime-tools.ts";
 import {
 	SUBAGENT_CAPABILITY_CEILING_ENV,
 	capabilityCeilingAgentRestrictionSources,
@@ -170,6 +170,7 @@ export interface BuildPiArgsInput {
 	disablePermissionSystemExtension?: boolean;
 	/** Active-bound only: mediate attested package factories and append final registry gate. */
 	activeBoundPackageMediator?: boolean;
+	activeBoundRuntimeBuiltinTools?: string[];
 }
 
 export interface BuildPiArgsResult {
@@ -238,6 +239,7 @@ export interface ResolvePiLaunchToolPlanInput {
 	agentName?: string;
 	disablePermissionSystemExtension?: boolean;
 	activeBoundPackageMediator?: boolean;
+	activeBoundRuntimeBuiltinTools?: string[];
 }
 
 export interface PiLaunchToolPlan {
@@ -361,10 +363,13 @@ export function resolvePermissionSystemExtension(): string | undefined {
 export function resolvePiLaunchToolPlan(
 	input: ResolvePiLaunchToolPlanInput,
 ): PiLaunchToolPlan {
+	const activeBoundRuntimeBuiltins = new Set(input.activeBoundRuntimeBuiltinTools ?? []);
+	const activeBoundReservedTools = activeBoundRuntimeReservedTools(activeBoundRuntimeBuiltins);
+	if (input.activeBoundPackageMediator && activeBoundRuntimeBuiltins.size === 0) throw new Error("Active-bound runtime builtin ownership is unavailable.");
 	if (input.activeBoundPackageMediator && input.tools !== undefined) {
-		const packageProvidedTools = input.tools.filter((tool) => !ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS.has(tool));
+		const packageProvidedTools = input.tools.filter((tool) => !activeBoundRuntimeBuiltins.has(tool));
 		if (new Set(input.tools).size !== input.tools.length
-			|| packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || ACTIVE_BOUND_RUNTIME_RESERVED_TOOLS.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
+			|| packageProvidedTools.some((tool) => !isActiveBoundPackageToolName(tool) || activeBoundReservedTools.has(tool) || tool === "subagent" || tool.startsWith("mcp:"))
 			|| (packageProvidedTools.length > 0 && (input.subagentOnlyExtensions?.length ?? 0) === 0)) {
 			throw new Error("Active-bound tool names must not overlap reserved names and package names require an attested factory plus wire-safe uniqueness.");
 		}
@@ -424,7 +429,7 @@ export function resolvePiLaunchToolPlan(
 	if (input.activeBoundPackageMediator) {
 		const mcpNames = new Set(effectiveMcpTools);
 		if (mcpNames.size !== effectiveMcpTools.length
-			|| effectiveMcpTools.some((name) => ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS.has(name) || declaredBuiltinTools.includes(name) || internalTools.includes(name))
+			|| effectiveMcpTools.some((name) => activeBoundRuntimeBuiltins.has(name) || declaredBuiltinTools.includes(name) || internalTools.includes(name))
 			|| internalTools.some((name) => declaredBuiltinTools.includes(name))) {
 			throw new Error("Active-bound tool names must not overlap across builtin, MCP, and internal origins.");
 		}
@@ -588,6 +593,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		agentName: input.childAgentName,
 		disablePermissionSystemExtension: input.disablePermissionSystemExtension,
 		activeBoundPackageMediator: input.activeBoundPackageMediator,
+		activeBoundRuntimeBuiltinTools: input.activeBoundRuntimeBuiltinTools,
 	});
 	if (toolPlan.explicitToolAllowlist) {
 		args.push(

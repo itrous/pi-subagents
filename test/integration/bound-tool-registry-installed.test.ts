@@ -9,21 +9,19 @@ import { test } from "node:test";
 import { resolveActiveBoundLaunchContract } from "../../src/api/active-bound-resolver.ts";
 import { attestBoundRuntimeExtensions } from "../../src/runs/shared/bound-runtime-evidence.ts";
 import { packageEvidenceRoot, packageTreeDigest } from "../../src/runs/shared/package-tree-evidence.ts";
+import { attestPiRuntimeCapabilities } from "../../src/runs/shared/pi-command-evidence.ts";
 import { resolvePiLaunchToolPlan } from "../../src/runs/shared/pi-args.ts";
-import { SUPPORTED_BOUND_PI_VERSIONS } from "../../src/runs/shared/tool-registry-proof.ts";
 
 const piBinary = process.env.PI_SUBAGENT_PI_BINARY || "pi";
 
-export function assertRequiredPiVersion(actual: string, required: string | undefined): void {
-	if (required === undefined) return;
-	assert.equal(required, "0.84.3", `required installed Pi version must be 0.84.3, got ${required}`);
-	assert.equal(actual, required, `required installed Pi ${required}, got ${actual || "unavailable"}`);
+export function assertRuntimeIdentityAvailable(actual: string): void {
+	assert.ok(actual && Buffer.byteLength(actual, "utf8") <= 128 && !/[\0\r\n]/u.test(actual), `installed Pi runtime identity is unavailable: ${JSON.stringify(actual)}`);
 }
 
-test("required installed Pi version gate rejects mismatch", () => {
-	assert.throws(() => assertRequiredPiVersion("0.84.2", "0.84.2"), /must be 0\.84\.3/);
-	assert.throws(() => assertRequiredPiVersion("0.84.2", "0.84.3"), /required installed Pi 0\.84\.3/);
-	assert.doesNotThrow(() => assertRequiredPiVersion("0.84.3", "0.84.3"));
+test("installed Pi version is evidence rather than an admission allowlist", () => {
+	assert.doesNotThrow(() => assertRuntimeIdentityAvailable("0.84.4"));
+	assert.doesNotThrow(() => assertRuntimeIdentityAvailable("future-compatible-runtime"));
+	assert.throws(() => assertRuntimeIdentityAvailable("bad\nversion"), /identity is unavailable/);
 });
 
 function runPi(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; fd3: number; fd4: number }): Promise<{ status: number | null; stderr: string }> {
@@ -43,8 +41,10 @@ function runPi(args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; f
 test("installed Pi loads and executes a packed owner tool after exact mediated registry proof", async (t) => {
 	const versionProbe = spawnSync(piBinary, ["--version"], { encoding: "utf8", timeout: 10_000 });
 	const version = versionProbe.status === 0 ? versionProbe.stdout.trim() : "";
-	assertRequiredPiVersion(version, process.env.PI_SUBAGENT_REQUIRED_PI_VERSION);
-	if (!SUPPORTED_BOUND_PI_VERSIONS.has(version)) return t.skip(`installed Pi ${version || "unavailable"} is outside the bound set`);
+	assertRuntimeIdentityAvailable(version);
+	const measuredCapabilities = attestPiRuntimeCapabilities(); assert.equal(measuredCapabilities.piRuntimeVersion, version);
+	const runtimeBuiltins = measuredCapabilities.runtimeBuiltins;
+	const runtimeToolInfo = runtimeBuiltins.names.map((name) => ({ name, sourceInfo: { source: "builtin" } }));
 
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "bound-registry-installed-"));
 	let providerRequests = 0; const wireNames: Array<Array<string | undefined>> = []; let wireBody = ""; const sockets = new Set<import("node:net").Socket>();
@@ -97,6 +97,7 @@ test("installed Pi loads and executes a packed owner tool after exact mediated r
 				request: { version: 1, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestId: "probe-request", ownerRunId: "probe-owner", nodeId: "probe-node", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", agent: "package-probe", task: "Probe", cwd: project, context: "fresh", model: "probe/probe", thinking: "off", artifacts: false, result: { kind: "text" } },
 				activeCwd: project, projectTrusted: true, sessionManager: { getSessionFile: () => path.join(root, "parent.jsonl"), getSessionId: () => "parent-session" },
 				availableModels: [{ provider: "probe", id: "probe", fullId: "probe/probe", api: "openai-completions", reasoning: false }],
+				runtimeToolInfo, runtimeVersionIdentity: version,
 				serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), defaultSessionDir: path.join(root, "sessions"),
 				runtimePolicy: { foregroundTimeoutMs: 30_000, waitToolEnabled: false, currentDepth: 0, maxSubagentDepth: 1 },
 			});
@@ -109,7 +110,7 @@ test("installed Pi loads and executes a packed owner tool after exact mediated r
 		assert.equal(preflight.contract.packageExtensions.length, 1);
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: ["probe_tool"], extensions: [], subagentOnlyExtensions: [packageExtension],
-			activeBoundPackageMediator: true, disablePermissionSystemExtension: true,
+			activeBoundPackageMediator: true, activeBoundRuntimeBuiltinTools: runtimeBuiltins.names, disablePermissionSystemExtension: true,
 		});
 		assert.deepEqual(toolPlan.effectiveToolAllowlist, ["probe_tool"]);
 		assert.deepEqual(toolPlan.requiredChildTools, ["probe_tool"]);
@@ -118,7 +119,7 @@ test("installed Pi loads and executes a packed owner tool after exact mediated r
 		const evidenceRoot = packageEvidenceRoot(packageDir);
 		const policy = {
 			version: 1, modelApi: "openai-completions", piRuntimeVersion: version, proofNonce: "e".repeat(64), denialFd: 4, required: ["probe_tool"], internalTools: [],
-			runtimeExtensions: attestBoundRuntimeExtensions(runtimeExtensionPaths),
+			runtimeExtensions: attestBoundRuntimeExtensions(runtimeExtensionPaths), runtimeBuiltins,
 			packageExtensions: [{ path: packageExtension, contentDigest: createHash("sha256").update(fs.readFileSync(packageExtension)).digest("hex"), evidenceRoot, evidenceRootDigest: createHash("sha256").update(evidenceRoot).digest("hex"), packageTreeDigest: packageTreeDigest(packageExtension, evidenceRoot) }],
 		};
 		const proofPath = path.join(root, "proof");

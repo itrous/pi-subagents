@@ -3,11 +3,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from "../../src/runs/shared/core-runtime-tools.ts";
+import { activeBoundRuntimeReservedTools, CORE_RUNTIME_OWNED_TOOLS } from "../../src/runs/shared/core-runtime-tools.ts";
+import { runtimeBuiltinProjection } from "../../src/runs/shared/tool-registry-proof.ts";
 import { MCP_DIRECT_BUILTIN_TOOL_NAMES } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import { writeChildToolDiagnostic } from "../../src/runs/shared/tool-availability.ts";
 
-describe("Pi 0.84.3 core tool ownership", () => {
+describe("capability-projected Pi core tool ownership", () => {
 	it("requires powershell to be measured in the running child registry", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-core-tools-"));
 		try {
@@ -18,10 +19,12 @@ describe("Pi 0.84.3 core tool ownership", () => {
 		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
-	it("keeps general MCP collisions legacy while active-bound reserves powershell", () => {
+	it("keeps general MCP collisions legacy while active-bound reserves every measured builtin", () => {
 		assert.deepEqual([...MCP_DIRECT_BUILTIN_TOOL_NAMES], [...CORE_RUNTIME_OWNED_TOOLS, "mcp"]);
 		assert.equal(MCP_DIRECT_BUILTIN_TOOL_NAMES.has("powershell"), false);
-		assert.equal(ACTIVE_BOUND_CORE_RUNTIME_OWNED_TOOLS.has("powershell"), true);
+		const projection = runtimeBuiltinProjection(["read", "powershell", "future_builtin"].map((name) => ({ name, sourceInfo: { source: "builtin" } })))!;
+		assert.equal(activeBoundRuntimeReservedTools(projection.names).has("powershell"), true);
+		assert.equal(activeBoundRuntimeReservedTools(projection.names).has("future_builtin"), true);
 		assert.equal(MCP_DIRECT_BUILTIN_TOOL_NAMES.has("mcp"), true);
 		assert.equal(MCP_DIRECT_BUILTIN_TOOL_NAMES.has("structured_output"), false);
 	});
