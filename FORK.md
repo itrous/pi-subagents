@@ -44,6 +44,17 @@ denied-tool runtime, registry collector, `pi-command-evidence`,
 `bound-runtime-evidence`, `active-bound-resolver`, `active-bound-runtime`,
 `install-lib.mjs`, `test/probes/`, and the fork tests covering them.
 
+Coverage gaps introduced here, to be closed when the layer is reconnected:
+
+- `src/api/active-bound-environment.ts` is kept but its only test
+  (`test/unit/active-bound-environment.test.ts`) was removed with the deleted
+  `active-bound-runtime`; the env-name/byte-limit parser is untested in this build.
+- upstream `src/slash/delegation-json.ts` has no `isProxy` rejection, which the fork
+  copy had. `cloneJsonWithinByteLimit` now returns `{ok:true}` for a Proxy input and
+  invokes its traps, and the kept `src/api/launch-receipt.ts` validates untrusted
+  receipts/tokens through it. Latent while the bound layer is unwired; A1R.3 must
+  restore the strict clone in a fork module (or in an upstream PR) before wiring.
+
 Deferred to A1R.3/A1R.4 (removed only because they cannot typecheck against the new
 upstream API, not because the behaviour is dropped): `tool-registry-proof`,
 `denied-tool-proof`, `active-bound-preflight`, `active-bound-package-extensions`,
