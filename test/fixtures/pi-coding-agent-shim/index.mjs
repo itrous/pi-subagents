@@ -3,7 +3,6 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 export const __piSubagentsTestShim = true;
-export const VERSION = process.env.PI_TEST_RUNTIME_VERSION || "0.84.3";
 
 export function getMarkdownTheme() { return {}; }
 export function keyText(keybinding) { return keybinding === "app.tools.expand" ? "configured-expand-key" : ""; }

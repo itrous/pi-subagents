@@ -3,7 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
+import { applySteeringRecoveryAgentConfig, asyncReviveRequiresRecoveryDescriptor, buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
+import type { AgentConfig } from "../../src/agents/agents.ts";
+import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 
 function writeJson(filePath: string, value: object): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -17,8 +19,8 @@ describe("async resume lookup", () => {
 			const asyncRoot = path.join(root, "runs");
 			const sessionFile = path.join(root, "session.jsonl");
 			fs.writeFileSync(sessionFile, "", "utf-8");
-			writeJson(path.join(asyncRoot, "run-abc", "status.json"), {
-				runId: "run-abc",
+			writeJson(path.join(asyncRoot, "run-abcde", "status.json"), {
+				runId: "run-abcde",
 				mode: "single",
 				state: "complete",
 				startedAt: 100,
@@ -29,13 +31,193 @@ describe("async resume lookup", () => {
 				steps: [{ agent: "worker", status: "complete" }],
 			});
 
-			const target = resolveAsyncResumeTarget({ id: "run-a" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
+			const target = resolveAsyncResumeTarget({ id: "run-abcd" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
 
 			assert.equal(target.kind, "revive");
-			assert.equal(target.runId, "run-abc");
+			assert.equal(target.runId, "run-abcde");
 			assert.equal(target.agent, "worker");
 			assert.equal(target.sessionFile, sessionFile);
 			assert.equal(target.cwd, root);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a workflow child session without a recovery descriptor", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-workflow-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const sessionFile = path.join(root, "child-session.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(asyncRoot, "workflow-1", "status.json"), {
+				runId: "workflow-1",
+				mode: "workflow",
+				state: "failed",
+				startedAt: 100,
+				endedAt: 200,
+				lastUpdate: 200,
+				cwd: root,
+				steps: [{ agent: "worker", status: "failed", sessionFile, runId: "child-1" }],
+			});
+
+			const target = resolveAsyncResumeTarget({ id: "workflow-1" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
+
+			assert.equal(target.kind, "revive");
+			assert.equal(target.mode, "workflow");
+			assert.equal(target.agent, "worker");
+			assert.equal(target.sessionFile, sessionFile);
+			assert.equal(target.recoveryDescriptor, undefined);
+			assert.equal(asyncReviveRequiresRecoveryDescriptor(target), false);
+			assert.equal(asyncReviveRequiresRecoveryDescriptor({ mode: "single", sessionFile }), true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a retained managed worktree cwd and fails closed when it is missing", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-missing-cwd-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-missing-cwd");
+			const sessionFile = path.join(root, "session.jsonl");
+			const worktreeCwd = path.join(root, "managed-worktree");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			fs.mkdirSync(worktreeCwd);
+			writeJson(path.join(asyncDir, "status.json"), {
+				runId: "run-missing-cwd", mode: "single", state: "complete", startedAt: 100, endedAt: 200, lastUpdate: 200,
+				cwd: root,
+				steps: [{ agent: "worker", status: "complete", sessionFile }],
+			});
+			writeJson(path.join(asyncDir, "handoff.json"), {
+				version: 1, runId: "run-missing-cwd", mode: "single", source: "async", cwd: root, createdAt: 100, updatedAt: 200,
+				groups: [{
+					stepIndex: 0, baseCommit: "deadbeef", repoRoot: root,
+					children: [{ index: 0, taskIndex: 0, agent: "worker", status: "completed", summary: "done", patch: { path: path.join(root, "patch"), branch: "branch", changed: false, diffStat: "", filesChanged: 0, insertions: 0, deletions: 0 } }],
+					cleanup: { state: "partial", pruned: true, tasks: [{ index: 0, path: worktreeCwd, branch: "branch", worktreeRemoved: false, branchRemoved: false, preserved: true }] },
+				}],
+			});
+
+			const target = resolveAsyncResumeTarget({ id: "run-missing-cwd" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
+			assert.equal(target.cwd, worktreeCwd);
+			assert.equal(target.managedWorktree, true);
+			fs.rmSync(worktreeCwd, { recursive: true });
+
+			assert.throws(
+				() => resolveAsyncResumeTarget({ id: "run-missing-cwd" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }),
+				/required managed worktree cwd is missing/,
+			);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a retained managed worktree cwd in the original repository subdirectory", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-nested-cwd-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-nested-cwd");
+			const repoRoot = path.join(root, "repo");
+			const repoCwd = path.join(repoRoot, "packages", "feature");
+			const worktreeRoot = path.join(root, "managed-worktree");
+			const worktreeCwd = path.join(worktreeRoot, "packages", "feature");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.mkdirSync(repoCwd, { recursive: true });
+			fs.mkdirSync(worktreeCwd, { recursive: true });
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(asyncDir, "status.json"), {
+				runId: "run-nested-cwd", mode: "single", state: "complete", startedAt: 100, endedAt: 200, lastUpdate: 200,
+				cwd: repoCwd,
+				steps: [{ agent: "worker", status: "complete", sessionFile }],
+			});
+			writeJson(path.join(asyncDir, "handoff.json"), {
+				version: 1, runId: "run-nested-cwd", mode: "single", source: "async", cwd: repoCwd, createdAt: 100, updatedAt: 200,
+				groups: [{
+					stepIndex: 0, baseCommit: "deadbeef", repoRoot,
+					children: [{ index: 0, taskIndex: 0, agent: "worker", status: "completed", summary: "done", patch: { path: path.join(root, "patch"), branch: "branch", changed: false, diffStat: "", filesChanged: 0, insertions: 0, deletions: 0 } }],
+					cleanup: { state: "partial", pruned: true, tasks: [{ index: 0, path: worktreeRoot, branch: "branch", worktreeRemoved: false, branchRemoved: false, preserved: true }] },
+				}],
+			});
+
+			const target = resolveAsyncResumeTarget({ id: "run-nested-cwd" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
+			assert.equal(target.cwd, worktreeCwd);
+			assert.equal(target.managedWorktree, true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("resumes a normal child when a sibling has a managed worktree handoff", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-mixed-cwd-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-mixed-cwd");
+			const worktreeCwd = path.join(root, "managed-worktree");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.mkdirSync(worktreeCwd);
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(asyncDir, "status.json"), {
+				runId: "run-mixed-cwd", mode: "parallel", state: "complete", startedAt: 100, endedAt: 200, lastUpdate: 200, cwd: root,
+				steps: [{ agent: "worktree-worker", status: "complete" }, { agent: "normal-worker", status: "complete", sessionFile }],
+			});
+			writeJson(path.join(asyncDir, "handoff.json"), {
+				version: 1, runId: "run-mixed-cwd", mode: "parallel", source: "async", cwd: root, createdAt: 100, updatedAt: 200,
+				groups: [{
+					stepIndex: 0, baseCommit: "deadbeef", repoRoot: root,
+					children: [{ index: 0, taskIndex: 0, agent: "worktree-worker", status: "completed", summary: "done", patch: { path: path.join(root, "patch"), branch: "branch", changed: false, diffStat: "", filesChanged: 0, insertions: 0, deletions: 0 } }],
+					cleanup: { state: "partial", pruned: true, tasks: [{ index: 0, path: worktreeCwd, branch: "branch", worktreeRemoved: false, branchRemoved: false, preserved: true }] },
+				}],
+			});
+
+			const target = resolveAsyncResumeTarget({ id: "run-mixed-cwd", index: 1 }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") });
+			assert.equal(target.agent, "normal-worker");
+			assert.equal(target.cwd, root);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a retained managed worktree cwd that resolves outside the preserved worktree", (context) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-escaped-cwd-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const asyncDir = path.join(asyncRoot, "run-escaped-cwd");
+			const repoRoot = path.join(root, "repo");
+			const repoCwd = path.join(repoRoot, "pkg");
+			const worktreeRoot = path.join(root, "managed-worktree");
+			const outsideCwd = path.join(root, "outside");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.mkdirSync(repoCwd, { recursive: true });
+			fs.mkdirSync(worktreeRoot);
+			fs.mkdirSync(outsideCwd);
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			try {
+				fs.symlinkSync(outsideCwd, path.join(worktreeRoot, "pkg"), "dir");
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EPERM" || code === "EACCES") {
+					context.skip("directory symlink creation is unavailable");
+					return;
+				}
+				throw error;
+			}
+			writeJson(path.join(asyncDir, "status.json"), {
+				runId: "run-escaped-cwd", mode: "single", state: "complete", startedAt: 100, endedAt: 200, lastUpdate: 200,
+				cwd: repoCwd,
+				steps: [{ agent: "worker", status: "complete", sessionFile }],
+			});
+			writeJson(path.join(asyncDir, "handoff.json"), {
+				version: 1, runId: "run-escaped-cwd", mode: "single", source: "async", cwd: repoCwd, createdAt: 100, updatedAt: 200,
+				groups: [{
+					stepIndex: 0, baseCommit: "deadbeef", repoRoot,
+					children: [{ index: 0, taskIndex: 0, agent: "worker", status: "completed", summary: "done", patch: { path: path.join(root, "patch"), branch: "branch", changed: false, diffStat: "", filesChanged: 0, insertions: 0, deletions: 0 } }],
+					cleanup: { state: "partial", pruned: true, tasks: [{ index: 0, path: worktreeRoot, branch: "branch", worktreeRemoved: false, branchRemoved: false, preserved: true }] },
+				}],
+			});
+
+			assert.throws(
+				() => resolveAsyncResumeTarget({ id: "run-escaped-cwd" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }),
+				/invalid managed worktree cwd/,
+			);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -97,8 +279,8 @@ describe("async resume lookup", () => {
 				steps: [{ agent: "worker", status: "paused", sessionFile }],
 			});
 			const descriptor = {
-				version: 1, sourceRunId: "run-descriptor", agent: "worker", cwd: root, systemPromptMode: "replace",
-				inheritProjectContext: false, inheritSkills: false, outputMode: "inline", maxSubagentDepth: 2, share: false,
+				version: 1, runFanoutBudget: createRunFanoutBudget("run-descriptor", 64), sourceRunId: "run-descriptor", agent: "worker", cwd: root, systemPromptMode: "replace",
+				inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, outputMode: "inline", maxSubagentDepth: 2, share: false,
 			};
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, token: "must-not-be-accepted" });
 			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /unknown field 'token'/);
@@ -112,10 +294,47 @@ describe("async resume lookup", () => {
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), {
 				...descriptor,
 				launchContractDigest: "launch-contract-digest",
+				allowNestedSubagents: true,
+				allowedAgents: ["worker", "scout", "worker"],
+				intercomBridge: { mode: "off" },
+				extensionBindings: { "shepherd.dispatch/1": { role: "coder" } },
+				requiredExtensions: [{ id: "provider", path: path.join(root, "provider.mjs") }],
 			});
 			const valid = resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir });
 			assert.equal(valid.launchContractDigest, "launch-contract-digest");
 			assert.equal(valid.recoveryDescriptor?.launchContractDigest, "launch-contract-digest");
+			assert.equal(valid.recoveryDescriptor?.allowNestedSubagents, true);
+			assert.deepEqual(valid.recoveryDescriptor?.allowedAgents, ["scout", "worker"]);
+			assert.deepEqual(valid.recoveryDescriptor?.intercomBridge, { mode: "off" });
+			assert.deepEqual(valid.recoveryDescriptor?.extensionBindings, { "shepherd.dispatch/1": { role: "coder" } });
+			assert.deepEqual(valid.recoveryDescriptor?.requiredExtensions, [{ id: "provider", path: path.join(root, "provider.mjs") }]);
+			assert.ok(Object.isFrozen(valid.recoveryDescriptor?.requiredExtensions));
+			const currentAgent = {
+				name: "worker", description: "Current", systemPrompt: "Current", systemPromptMode: "replace",
+				inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+				source: "project", filePath: "/current/worker.md", allowedAgents: ["reviewer", "worker"],
+			} as AgentConfig;
+			assert.deepEqual(applySteeringRecoveryAgentConfig(currentAgent, valid.recoveryDescriptor!).allowedAgents, ["scout", "worker"]);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, allowedAgents: [] });
+			const denied = resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.deepEqual(applySteeringRecoveryAgentConfig(currentAgent, denied.recoveryDescriptor!).allowedAgents, []);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), descriptor);
+			const unrestricted = resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.equal(applySteeringRecoveryAgentConfig(currentAgent, unrestricted.recoveryDescriptor!).allowedAgents, undefined);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, allowNestedSubagents: "true" });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /allowNestedSubagents/);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, allowedAgents: ["bad name"] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /allowedAgents entry 'bad name'/);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, extensionBindings: { invalid: true } });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /namespace/);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, requiredExtensions: [{ id: "unsafe id", path: "/provider.mjs" }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /safe id/);
 
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, sourceRunId: "another-run" });
 			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /different source run/);
@@ -127,7 +346,7 @@ describe("async resume lookup", () => {
 		}
 	});
 
-	it("normalizes persisted turn-budget state without weakening public input validation", () => {
+	it("ignores removed turn budgets in persisted recovery descriptors", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-turn-budget-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
@@ -141,10 +360,12 @@ describe("async resume lookup", () => {
 			});
 			const descriptor = {
 				version: 1,
+				runFanoutBudget: createRunFanoutBudget("run-turn-budget", 64),
 				sourceRunId: "run-turn-budget",
 				agent: "worker",
 				cwd: root,
 				systemPromptMode: "replace",
+				inheritGlobalContext: false,
 				inheritProjectContext: false,
 				inheritSkills: false,
 				outputMode: "inline",
@@ -166,22 +387,20 @@ describe("async resume lookup", () => {
 
 			const target = resolveAsyncResumeTarget({ id: "run-turn-budget" }, { asyncDirRoot: asyncRoot, resultsDir });
 
-			assert.deepEqual(target.recoveryDescriptor?.initialTurnBudget, { maxTurns: 8, graceTurns: 2 });
+			assert.equal("initialTurnBudget" in (target.recoveryDescriptor ?? {}), false);
 
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), {
 				...descriptor,
 				initialTurnBudget: { maxTurns: 8, graceTurns: 2, unrelated: true },
 			});
-			assert.throws(
-				() => resolveAsyncResumeTarget({ id: "run-turn-budget" }, { asyncDirRoot: asyncRoot, resultsDir }),
-				/recoveryDescriptor\.initialTurnBudget\.unrelated is not supported/,
-			);
+			const malformedLegacy = resolveAsyncResumeTarget({ id: "run-turn-budget" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.equal("initialTurnBudget" in (malformedLegacy.recoveryDescriptor ?? {}), false);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
-	it("accepts legacy resolved acceptance metadata in recovery descriptors", () => {
+	it("accepts current acceptance metadata in recovery descriptors", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-acceptance-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
@@ -195,10 +414,12 @@ describe("async resume lookup", () => {
 			});
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), {
 				version: 1,
+				runFanoutBudget: createRunFanoutBudget("run-acceptance", 64),
 				sourceRunId: "run-acceptance",
 				agent: "worker",
 				cwd: root,
 				systemPromptMode: "replace",
+				inheritGlobalContext: false,
 				inheritProjectContext: false,
 				inheritSkills: false,
 				outputMode: "inline",
@@ -206,8 +427,6 @@ describe("async resume lookup", () => {
 				share: false,
 				acceptance: {
 					level: "attested",
-					explicit: true,
-					inferredReason: ["async write-capable or risky run"],
 					criteria: [{ id: "criterion-1", must: "Return evidence", evidence: ["manual-notes"], severity: "required" }],
 					evidence: ["manual-notes", "residual-risks"],
 					verify: [],
@@ -230,7 +449,7 @@ describe("async resume lookup", () => {
 		}
 	});
 
-	it("rejects stale explicit reviewed acceptance metadata in recovery descriptors", () => {
+	it("rejects reviewed acceptance metadata in recovery descriptors", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-reviewed-acceptance-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
@@ -244,10 +463,12 @@ describe("async resume lookup", () => {
 			});
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), {
 				version: 1,
+				runFanoutBudget: createRunFanoutBudget("run-reviewed-acceptance", 64),
 				sourceRunId: "run-reviewed-acceptance",
 				agent: "worker",
 				cwd: root,
 				systemPromptMode: "replace",
+				inheritGlobalContext: false,
 				inheritProjectContext: false,
 				inheritSkills: false,
 				outputMode: "inline",
@@ -255,8 +476,6 @@ describe("async resume lookup", () => {
 				share: false,
 				acceptance: {
 					level: "reviewed",
-					explicit: true,
-					inferredReason: ["async write-capable or risky run"],
 					criteria: ["Return evidence"],
 					evidence: ["validation-output"],
 					verify: [],
@@ -274,7 +493,7 @@ describe("async resume lookup", () => {
 		}
 	});
 
-	it("drops inferred legacy acceptance metadata from recovery descriptors", () => {
+	it("rejects legacy acceptance metadata in recovery descriptors", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-inferred-acceptance-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
@@ -288,33 +507,62 @@ describe("async resume lookup", () => {
 			});
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), {
 				version: 1,
+				runFanoutBudget: createRunFanoutBudget("run-inferred-acceptance", 64),
 				sourceRunId: "run-inferred-acceptance",
 				agent: "worker",
 				cwd: root,
 				systemPromptMode: "replace",
+				inheritGlobalContext: false,
 				inheritProjectContext: false,
 				inheritSkills: false,
 				outputMode: "inline",
 				maxSubagentDepth: 2,
 				share: false,
 				acceptance: {
-					level: "reviewed",
+					level: "attested",
 					explicit: false,
 					inferredReason: ["async write-capable or risky run"],
 					criteria: [],
 					evidence: [],
 					verify: [],
-					review: { agent: "reviewer", required: true },
 					stopRules: [],
 				},
 			});
 
-			const target = resolveAsyncResumeTarget({ id: "run-inferred-acceptance" }, { asyncDirRoot: asyncRoot, resultsDir });
-
-			assert.equal(target.kind, "revive");
-			assert.equal(target.recoveryDescriptor?.acceptance, undefined);
+			assert.throws(
+				() => resolveAsyncResumeTarget({ id: "run-inferred-acceptance" }, { asyncDirRoot: asyncRoot, resultsDir }),
+				/recoveryDescriptor\.acceptance\.(explicit|inferredReason) is not supported/i,
+			);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a stopped child selected from a terminal aggregate", () => {
+		for (const stoppedStep of [{ status: "stopped" }, { status: "failed", stopped: true }]) {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-stopped-child-"));
+			try {
+				const asyncRoot = path.join(root, "runs");
+				const stoppedSession = path.join(root, "stopped.jsonl");
+				const completedSession = path.join(root, "completed.jsonl");
+				fs.writeFileSync(stoppedSession, "", "utf-8");
+				fs.writeFileSync(completedSession, "", "utf-8");
+				writeJson(path.join(asyncRoot, "run-aggregate", "status.json"), {
+					runId: "run-aggregate", mode: "parallel", state: "failed", startedAt: 100, endedAt: 200, lastUpdate: 200, cwd: root,
+					steps: [
+						{ agent: "stopped-child", ...stoppedStep, sessionFile: stoppedSession },
+						{ agent: "completed-child", status: "complete", sessionFile: completedSession },
+					],
+				});
+
+				assert.throws(
+					() => resolveAsyncResumeTarget({ id: "run-aggregate", index: 0 }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }),
+					/child 0 was stopped and cannot be resumed/,
+				);
+				assert.equal(resolveAsyncResumeTarget({ id: "run-aggregate", index: 1 }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }).agent, "completed-child");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
 		}
 	});
 
@@ -350,15 +598,15 @@ describe("async resume lookup", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-ambiguous-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
-			writeJson(path.join(asyncRoot, "run-aa", "status.json"), {
-				runId: "run-aa",
+			writeJson(path.join(asyncRoot, "run-aaaa-1", "status.json"), {
+				runId: "run-aaaa-1",
 				mode: "single",
 				state: "running",
 				startedAt: 100,
 				steps: [{ agent: "scout", status: "running" }],
 			});
-			writeJson(path.join(asyncRoot, "run-ab", "status.json"), {
-				runId: "run-ab",
+			writeJson(path.join(asyncRoot, "run-aaaa-2", "status.json"), {
+				runId: "run-aaaa-2",
 				mode: "single",
 				state: "running",
 				startedAt: 100,
@@ -366,8 +614,12 @@ describe("async resume lookup", () => {
 			});
 
 			assert.throws(
+				() => resolveAsyncResumeTarget({ id: "run-aaaa" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }),
+				/Ambiguous async run id prefix 'run-aaaa' matched: run-aaaa-1, run-aaaa-2/,
+			);
+			assert.throws(
 				() => resolveAsyncResumeTarget({ id: "run-a" }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }),
-				/Ambiguous async run id prefix 'run-a' matched: run-aa, run-ab/,
+				/at least 8 characters/,
 			);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

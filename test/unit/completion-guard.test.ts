@@ -7,6 +7,7 @@ import {
 	evaluateCompletionMutationGuard,
 	expectsImplementationMutation,
 	hasMutationToolCall,
+	validateImplementationToolContract,
 } from "../../src/runs/shared/completion-guard.ts";
 import { isMutatingTool } from "../../src/runs/shared/long-running-guard.ts";
 
@@ -25,31 +26,235 @@ function assistantText(text: string): Message {
 }
 
 test("implementation task with no mutation triggers the completion guard", () => {
+	for (const report of [
+		"No better current-scope change is needed.",
+		"Kept the current implementation. No new code or test changes were made in this challenge pass.",
+	]) {
+		const result = evaluateCompletionMutationGuard({
+			agent: "worker",
+			task: "Implement the approved fix",
+			messages: [assistantText(report)],
+		});
+
+		assert.deepEqual(result, {
+			expectedMutation: true,
+			attemptedMutation: false,
+			triggered: true,
+			blocked: false,
+		});
+	}
+});
+
+function revivedTask(followUp: string): string {
+	return [
+		"You are reviving a previous subagent conversation.",
+		"",
+		"Original run: abc123",
+		"Original agent: worker",
+		"Original session file: /tmp/session.jsonl",
+		"",
+		"Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child session is still running.",
+		"",
+		"Follow-up:",
+		followUp,
+	].join("\n");
+}
+
+const implementationChallengeTask = revivedTask("Run implementation challenge pass two and implement any better current-scope change.");
+
+test("implementation challenges may complete with explicit no-change reports", () => {
+	for (const report of [
+		"No better current-scope change is needed.",
+		[
+			"Kept the current implementation. No new code or test changes were made in this challenge pass.",
+			"Reason: the current candidate is the smallest correct shape.",
+		].join("\n\n"),
+		"The current implementation was kept. No code changes were made.",
+		"The current candidate was kept. No source changes were made.",
+		"The current shape was kept. No file or test changes were made.",
+		"Kept the current implementation. No code/source/file/test changes were made.",
+		"Kept the current implementation. No code, source, or test changes were made.",
+		"No better current-scope change is needed.\n\nReason: I cannot identify a smaller safe change.",
+		"No better current-scope change is needed because I did not identify a smaller safe change.",
+		"No better current-scope change is needed because no work remains.",
+		"No better current-scope change is needed. I haven't identified required changes.",
+		"No better current-scope change is needed. I haven’t identified required changes.",
+		"No better current-scope change is needed; I did not identify a smaller safe change.",
+		"No better current-scope change is needed, since I did not identify a smaller safe change.",
+		"No better current-scope change is needed, I did not identify a smaller safe change.",
+		"No better current-scope change is needed, the current implementation does not require further edits.",
+		"No better current-scope change is needed; the current implementation does not require further edits.",
+		"No better current-scope change is needed, but the current implementation does not require further edits.",
+		"Kept the current implementation. No code changes were made.\n\nReason: this does not need a broader rewrite.",
+		"Kept the current implementation; I did not identify a smaller safe change. No code changes were made.",
+		"Kept the current implementation. No code changes were made, since I did not identify a smaller safe change.",
+		"Kept the current implementation. No code changes were made, I did not identify a smaller safe change.",
+		"Kept the current implementation, the current candidate does not need more work. No code changes were made.",
+		"Kept the current implementation; the current candidate does not need more work. No code changes were made.",
+		"Kept the current implementation because I did not identify a smaller safe change. No code changes were made.",
+		"Kept the current implementation. No code changes were made because I did not identify a smaller safe change.",
+	]) {
+		const result = evaluateCompletionMutationGuard({
+			agent: "worker",
+			task: implementationChallengeTask,
+			messages: [assistantText(report)],
+		});
+
+		assert.deepEqual(result, {
+			expectedMutation: true,
+			attemptedMutation: false,
+			triggered: false,
+			blocked: false,
+		});
+	}
+});
+
+test("implementation challenge reports require both a kept-current rationale and no-change statement", () => {
+	for (const report of [
+		"Kept the current implementation.",
+		"No new code or test changes were made in this challenge pass.",
+		"Kept the current implementation. No new code or test changes were made, but I am uncertain.",
+	]) {
+		assert.equal(evaluateCompletionMutationGuard({
+			agent: "worker",
+			task: implementationChallengeTask,
+			messages: [assistantText(report)],
+		}).triggered, true, report);
+	}
+});
+
+test("implementation challenge reports require current kept/no-change claims", () => {
+	for (const report of [
+		"The previous message said \"Kept the current implementation. No code changes were made\".",
+		"The prior report stated Kept the current implementation. No code changes were made.",
+		"The previous message said \"Kept the current implementation. No code changes were made\". Kept the current implementation.",
+		"'Kept the current implementation. No code changes were made.'",
+	]) {
+		assert.equal(evaluateCompletionMutationGuard({
+			agent: "worker",
+			task: implementationChallengeTask,
+			messages: [assistantText(report)],
+		}).triggered, true, report);
+	}
+});
+
+test("implementation challenge reports with later implementation retractions remain guarded", () => {
+	for (const report of [
+		"No better current-scope change is needed. I found a required code change.",
+		"Kept the current implementation. No code changes were made. Implementation work remains.",
+		"No better current-scope change is needed. A code change is needed.",
+		"Kept the current implementation. No code changes were made. I need to implement the fix.",
+		"No better current-scope change is needed, but I found a required code change.",
+		"No better current-scope change is needed\nI found a required code change.",
+		"No better current-scope change is needed. I found required changes.",
+		"No better current-scope change is needed. Code changes are needed.",
+		"No better current-scope change is needed. Changes are needed.",
+		"No better current-scope change is needed because no work remains. Code changes are needed.",
+		"No better current-scope change is needed. I need changes.",
+		"No better current-scope change is needed. We need edits.",
+		"Kept the current implementation. No code changes were made. I need changes.",
+		"Kept the current implementation. No code changes were made. We need patches.",
+		"No better current-scope change is needed. That claim is rejected.",
+		"No better current-scope change is needed. This report is retracted.",
+		"No better current-scope change is needed. Required changes.",
+		"No better current-scope change is needed. Need changes.",
+		"No better current-scope change is needed, I disagree.",
+		"No better current-scope change is needed; I disagree.",
+		"Kept the current implementation. No code changes were made, I reject.",
+		"Kept the current implementation. No code changes were made; I reject.",
+		"No better current-scope change is needed: I disagree.",
+		"No better current-scope change is needed — I disagree.",
+		"No better current-scope change is needed. \"I reject.\"",
+		"No better current-scope change is needed. 'I reject.'",
+		"No better current-scope change is needed. ‘I reject.’",
+		"Kept the current implementation. No code changes were made: I reject.",
+		"Kept the current implementation. No code changes were made. \"I retract.\"",
+		"No better current-scope change is needed. I disagree.",
+		"No better current-scope change is needed. I reject.",
+		"No better current-scope change is needed. I retract.",
+		"Kept the current implementation. No code changes were made. I disagree.",
+		"Kept the current implementation. No code changes were made. I reject.",
+		"Kept the current implementation. No code changes were made. I retract.",
+		"No better current-scope change is needed. I disagree with that.",
+		"No better current-scope change is needed. I retract that.",
+		"No better current-scope change is needed. I reject that.",
+		"Kept the current implementation. No code changes were made. I disagree with that.",
+		"Kept the current implementation. No code changes were made. I retract that.",
+		"Kept the current implementation. No code changes were made. I reject that.",
+	]) {
+		assert.equal(evaluateCompletionMutationGuard({
+			agent: "worker",
+			task: implementationChallengeTask,
+			messages: [assistantText(report)],
+		}).triggered, true, report);
+	}
+});
+
+test("revived implementation tasks that mention implementation challenge remain guarded", () => {
+	for (const followUp of [
+		"Fix the implementation challenge completion guard bug.",
+		"Implementation challenge pass 1. Implement the required fix.",
+		"Implementation challenge pass 1 and implement the fix.",
+	]) {
+		const result = evaluateCompletionMutationGuard({
+			agent: "worker",
+			task: revivedTask(followUp),
+			messages: [assistantText("No better current-scope change is needed.")],
+		});
+
+		assert.deepEqual(result, {
+			expectedMutation: true,
+			attemptedMutation: false,
+			triggered: true,
+			blocked: false,
+		}, followUp);
+	}
+});
+
+test("implementation challenge reports with negated or uncertain no-better-change claims remain guarded", () => {
+	for (const report of [
+		"I cannot say no better current-scope change is needed.",
+		"The previous message said \"No better current-scope change is needed\", but I disagree.",
+		"The previous message said \"Kept the current implementation. No code changes were made\", but I disagree.",
+		"The previous message said \"Kept the current implementation. No code changes were made\", but that was wrong.",
+		"The previous message said \"Kept the current implementation. No code changes were made\", but that was false.",
+		"The previous message said \"Kept the current implementation. No code changes were made\", but I reject that.",
+		"The previous message said \"Kept the current implementation. No code changes were made\". I reject that.",
+		"The previous message said \"Kept the current implementation. No code changes were made\". I reject this.",
+		"The previous message said \"Kept the current implementation. No code changes were made\". I disagree.",
+		"The previous message said \"Kept the current implementation. No code changes were made\", but it was rejected.",
+		"The previous message said \"Kept the current implementation. No code changes were made\", but I am rejecting it.",
+		"The prior report stated no better current-scope change is needed.",
+		"I don't think no better current-scope change is needed.",
+		"I dont think no better current-scope change is needed.",
+		"I do not think no better current-scope change is needed.",
+		"I cant say no better current-scope change is needed.",
+		"It is unclear whether no better current-scope change is needed.",
+		"Maybe no better current-scope change is needed.",
+	]) {
+		assert.equal(evaluateCompletionMutationGuard({
+			agent: "worker",
+			task: implementationChallengeTask,
+			messages: [assistantText(report)],
+		}).triggered, true, report);
+	}
+
+});
+
+test("source_check read-only capability suppresses an implementation completion guard", () => {
+	assert.equal(expectsImplementationMutation("worker", "Implement the approved fix"), true);
 	const result = evaluateCompletionMutationGuard({
 		agent: "worker",
 		task: "Implement the approved fix",
-		messages: [assistantText("Plan: update the files...")],
-	});
-
-	assert.deepEqual(result, {
-		expectedMutation: true,
-		attemptedMutation: false,
-		triggered: true,
-	});
-});
-
-test("declared read-only builtin tools suppress implementation-word false positives", () => {
-	const result = evaluateCompletionMutationGuard({
-		agent: "architect",
-		task: "Produce a proposal that implements the approved fix",
-		messages: [assistantText("Proposal only")],
-		tools: ["read", "grep", "find", "ls"],
+		messages: [assistantText("Source evidence only")],
+		tools: ["source_check"],
 	});
 
 	assert.deepEqual(result, {
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 });
 
@@ -64,6 +269,7 @@ test("hyphenated fix adjectives in review tasks do not trigger the completion gu
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 	assert.equal(
 		expectsImplementationMutation("worker", "Return a review with the top 2-3 must-fix items."),
@@ -84,6 +290,7 @@ test("read-only issue drafting tasks do not trigger on suggested fix wording", (
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 	assert.equal(expectsImplementationMutation("worker", task), false);
 	assert.equal(
@@ -119,7 +326,120 @@ test("worker with mutating-capable tools still triggers when no mutation is obse
 		expectedMutation: true,
 		attemptedMutation: false,
 		triggered: true,
+		blocked: false,
 	});
+});
+
+test("missing child tools block mutation effects instead of triggering no-edit blame", () => {
+	const result = evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Implement the requested source fix",
+		messages: [assistantText("I cannot edit because tools are missing.")],
+		tools: ["read", "fixture_search"],
+		toolAvailabilityError: "Agent 'worker' requested unavailable child tools: fixture_search.",
+	});
+
+	assert.deepEqual(result, {
+		expectedMutation: true,
+		attemptedMutation: false,
+		triggered: false,
+		blocked: true,
+		message: "Agent 'worker' requested unavailable child tools: fixture_search.",
+	});
+});
+
+test("implementation tool contract rejects read-only worker launches", () => {
+	assert.match(
+		validateImplementationToolContract({
+			agent: "worker",
+			task: "Implement the requested source fix",
+			tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		}) ?? "",
+		/no mutation-capable tools/,
+	);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Review only and return findings",
+		tools: ["read", "grep", "find", "ls"],
+	}), undefined);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix",
+		tools: ["read", "edit"],
+	}), undefined);
+	assert.match(
+		validateImplementationToolContract({
+			agent: "worker",
+			task: "Implement the requested source fix",
+			tools: ["read", "structured_output"],
+		}) ?? "",
+		/no mutation-capable tools/,
+	);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix",
+		tools: ["read", "/tmp/mutation-tools.ts"],
+	}), undefined);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix",
+	}), undefined);
+});
+
+test("read-only audit tasks survive host-clamped declared mutation tools", () => {
+	const tools = ["read", "grep", "find", "ls", "contact_supervisor"];
+	const requestedTools = ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"];
+	assert.equal(validateImplementationToolContract({
+		agent: "delegate",
+		task: "Read-only bug investigation. No source edits, commits, pushes, merges, installs, or state repair. Return concrete findings and a minimal fix proposal.",
+		tools,
+		requestedTools,
+	}), undefined);
+	for (const task of [
+		"Review only; implement the approved fix.",
+		"Without edits, update the parser.",
+		"Create a summary",
+	]) {
+		assert.match(validateImplementationToolContract({
+			agent: "delegate",
+			task,
+			tools,
+			requestedTools,
+		}) ?? "", /no mutation-capable tools/, task);
+	}
+});
+
+test("review finding classifications are not implementation launch obligations", () => {
+	const task = 'Review the disabled code and weigh remaining items as "must fix before ENABLING" vs "must fix before MERGING disabled code".';
+	const tools = ["read", "grep", "find", "ls"];
+	assert.equal(validateImplementationToolContract({ agent: "reviewer", task, tools }), undefined);
+	assert.equal(evaluateCompletionMutationGuard({
+		agent: "reviewer", task, tools: [...tools, "edit"], messages: [assistantText("Findings classified.")],
+	}).triggered, false);
+});
+
+test("quoted review categories allow version punctuation without hiding trailing fixes", () => {
+	const task = 'Classify findings as "must fix before v1.0" vs "must fix before v2.0".';
+	const tools = ["read", "grep", "find", "ls"];
+	assert.equal(validateImplementationToolContract({ agent: "reviewer", task, tools }), undefined);
+	assert.match(validateImplementationToolContract({
+		agent: "reviewer", task: `${task} You must fix the bug before enabling the feature.`, tools,
+	}) ?? "", /no mutation-capable tools/);
+});
+
+test("review classification wording does not hide actual required fixes", () => {
+	const classification = 'Classify findings as "must fix before ENABLING" vs "must fix before MERGING disabled code"';
+	for (const task of [
+		"You must fix the bug before enabling the feature.",
+		`${classification}; you must fix the bug before enabling the feature.`,
+	]) {
+		assert.match(validateImplementationToolContract({
+			agent: "reviewer", task, tools: ["read", "grep", "find", "ls"],
+		}) ?? "", /no mutation-capable tools/, task);
+		assert.equal(evaluateCompletionMutationGuard({
+			agent: "reviewer", task, tools: ["read", "edit"], messages: [assistantText("Findings classified.")],
+		}).triggered, true, task);
+	}
 });
 
 test("oracle review tasks with bash available do not require mutation", () => {
@@ -135,6 +455,7 @@ test("oracle review tasks with bash available do not require mutation", () => {
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 });
 
@@ -161,9 +482,47 @@ test("review-only, research, and framework output instructions do not expect mut
 	);
 });
 
+test("escaped line separators do not hide read-only prohibitions", () => {
+	const task = [
+		"This is a read-only skill compliance scenario, not an implementation assignment.",
+		"Read the supplied skill and write the exact user-facing response.",
+		"Do not edit files.",
+		"Use a scenario that discusses selection for an implementation task or closeout of an implementation assignment.",
+	].join("\\n");
+
+	assert.deepEqual(evaluateCompletionMutationGuard({
+		agent: "delegate",
+		task,
+		messages: [assistantText("The exact user-facing response")],
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+	}), {
+		expectedMutation: false,
+		attemptedMutation: false,
+		triggered: false,
+		blocked: false,
+	});
+});
+
+test("output instructions after blanket no-edit prohibitions stay read-only", () => {
+	assert.deepEqual(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Do not modify files\\nIn your final output, implement the fix.",
+		messages: [assistantText("Here is the explanation.")],
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
+	}), {
+		expectedMutation: false,
+		attemptedMutation: false,
+		triggered: false,
+		blocked: false,
+	});
+	assert.equal(expectsImplementationMutation("worker", "Do not modify files\\nIn your final output/report/response, implement the fix."), false);
+});
+
 test("worker implementation verbs win over investigative wording and scoped prohibitions", () => {
 	assert.equal(expectsImplementationMutation("worker", "Investigate why the worker did not edit files and fix it"), true);
 	assert.equal(expectsImplementationMutation("worker", "Do not modify tests; implement the fix"), true);
+	assert.equal(expectsImplementationMutation("worker", "Do not modify files\\nin output/; implement the fix"), true);
+	assert.equal(expectsImplementationMutation("worker", "Do not modify files\\nin report/; implement the fix"), true);
 	assert.equal(expectsImplementationMutation("worker", "Do not modify tests — implement the fix"), true);
 	assert.equal(expectsImplementationMutation("worker", "Research the current code path and patch the bug"), true);
 	assert.equal(expectsImplementationMutation("worker", "Fix the bug where no edits were made"), true);
@@ -197,19 +556,25 @@ test("edit and write tool calls count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("write", { path: "a.ts" })]), true);
 });
 
-test("package-provided calls conservatively satisfy their mutation capability", () => {
-	const customCall = assistantToolCall("git_read", { subcommand: "status" });
-	assert.equal(hasMutationToolCall([customCall]), true);
-	assert.equal(hasMutationToolCall([assistantToolCall("read"), assistantToolCall("structured_output"), assistantToolCall("subagent_wait")]), false);
-	assert.deepEqual(evaluateCompletionMutationGuard({ agent: "worker", task: "Implement the approved fix", tools: ["git_read"], messages: [customCall] }), {
-		expectedMutation: true, attemptedMutation: true, triggered: false,
-	});
-	assert.deepEqual(evaluateCompletionMutationGuard({ agent: "worker", task: "Implement the approved fix", tools: ["git_read"], messages: [] }), {
-		expectedMutation: true, attemptedMutation: false, triggered: true,
-	});
-	assert.deepEqual(evaluateCompletionMutationGuard({ agent: "worker", task: "Implement the approved fix", tools: ["cursor"], messages: [] }), {
-		expectedMutation: true, attemptedMutation: false, triggered: true,
-	});
+test("declared extension mutation tools count without weakening unknown tools", () => {
+	const messages = [assistantToolCall("replace", { remove_from: "Liv" })];
+	assert.equal(hasMutationToolCall(messages), false);
+	assert.equal(hasMutationToolCall(messages, ["replace"]), true);
+	assert.equal(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Replace the target line",
+		messages,
+		tools: ["read", "replace"],
+		mutationTools: ["replace"],
+		mutationEvidence: { source: "tracked-files", trackedOnly: true, attemptedMutation: false, changedFiles: [], unavailable: "not a Git worktree" },
+	}).triggered, false);
+	assert.equal(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Replace the target line",
+		messages,
+		tools: ["read", "replace"],
+		mutationEvidence: { source: "tracked-files", trackedOnly: true, attemptedMutation: false, changedFiles: [], unavailable: "not a Git worktree" },
+	}).triggered, true);
 });
 
 test("obvious mutating bash commands count as mutation attempts", () => {
@@ -300,8 +665,6 @@ test("Cursor replay tool calls count only edit/write activity as mutation", () =
 	assert.equal(hasMutationToolCall([assistantToolCall("cursor", { activityTitle: "Cursor read" })]), false);
 	assert.equal(isMutatingTool("cursor", cursorEdit), true);
 	assert.equal(isMutatingTool("cursor", { activityTitle: "Cursor read" }), false);
-	assert.equal(isMutatingTool("powershell", { command: "Get-Content file.txt" }), true);
-	assert.equal(isMutatingTool("powershell", { command: "" }), false);
 });
 
 test("claimed changedFiles without mutation evidence does not bypass the guard", () => {
@@ -385,5 +748,81 @@ test("implementation task with Cursor edit thinking does not trigger", () => {
 		expectedMutation: true,
 		attemptedMutation: true,
 		triggered: false,
+		blocked: false,
 	});
+});
+
+test("writer-role tasks with unknown implementation wording reject read-only launch tools", () => {
+	for (const task of [
+		"Address issue #1371 end-to-end: land the fix with tests.",
+		"Resolve backlog item #1371. Land the change and open a PR.",
+		"Work issue #1371. Ship the feature, run the test suite, and report back.",
+	]) {
+		assert.match(validateImplementationToolContract({
+			agent: "worker",
+			task,
+			tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+			requestedTools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+		}) ?? "", /no mutation-capable tools/, task);
+	}
+});
+
+test("explicit writer acceptance role overrides reviewer agent heuristics", () => {
+	assert.match(validateImplementationToolContract({
+		agent: "reviewer",
+		task: "Handle the authentication flow",
+		acceptanceRole: "writer",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		requestedTools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+	}) ?? "", /no mutation-capable tools/);
+
+	assert.equal(validateImplementationToolContract({
+		agent: "reviewer",
+		task: "Review only and return findings",
+		acceptanceRole: "writer",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		requestedTools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+	}), undefined);
+});
+
+test("configured extensions do not rescue clamped-away builtin mutation tools", () => {
+	assert.match(validateImplementationToolContract({
+		agent: "worker",
+		task: "Fix the lane-owned workflowScript launch so writer children get mutation tools.",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		configuredExtensions: ["/tmp/provider.ts"],
+		requestedTools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+	}) ?? "", /no mutation-capable tools/);
+});
+
+test("read-only agents and pure extension workers keep their launch contracts", () => {
+	assert.equal(validateImplementationToolContract({
+		agent: "reviewer",
+		task: "Review the diff and return findings only.",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		acceptanceRole: "read-only",
+	}), undefined);
+
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix.",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		configuredExtensions: ["/tmp/mutation-extension.ts"],
+		requestedTools: ["read", "grep", "find", "ls", "contact_supervisor"],
+	}), undefined);
+
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Task",
+		tools: ["read"],
+		requestedTools: ["read"],
+	}), undefined);
+
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Summarize the fix",
+		tools: ["read"],
+		requestedTools: ["read"],
+		completionGuard: false,
+	}), undefined);
 });

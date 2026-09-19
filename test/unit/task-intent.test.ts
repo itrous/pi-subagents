@@ -16,6 +16,49 @@ describe("classifyTaskMutationIntent", () => {
 		assert.equal(classifyTaskMutationIntent("worker", "Do not modify tests; implement the fix").kind, "implementation");
 		assert.equal(classifyTaskMutationIntent("worker", "Fix the bug. Do not edit files outside src/.").kind, "implementation");
 		assert.equal(classifyTaskMutationIntent("worker", "Must not touch the production database; implement the fix locally").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify tests\\nImplement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify tests\\r\\nImplement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\\nin src; implement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\\nin output/; implement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\\nin report/; implement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\\r\\noutside docs; implement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\nin src; implement the fix").kind, "implementation");
+	});
+
+	it("does not let read-only markers swallow generic implementation imperatives", () => {
+		assert.equal(classifyTaskMutationIntent("delegate", "Without edits, update the parser").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("delegate", "Review only; implement the approved fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("delegate", "Review only; update the report").kind, "read-only");
+	});
+
+	it("keeps advisory infinitives read-only without hiding later imperatives", () => {
+		for (const task of [
+			"Review only; explain how to update the parser.",
+			"Read-only audit; recommend how to fix the parser.",
+			"Review only; describe how to implement the approved fix.",
+		]) {
+			assert.equal(classifyTaskMutationIntent("delegate", task).kind, "read-only", task);
+		}
+		assert.equal(
+			classifyTaskMutationIntent("delegate", "Review only; explain how to update the parser, then implement the approved fix.").kind,
+			"implementation",
+		);
+	});
+
+	it("does not treat review nouns or negated implement as follow-on work", () => {
+		for (const task of [
+			"Review only and fix any real issues",
+			"Review only. Check the update handler.",
+			"Review only. Inspect the create function.",
+			"Review-only: flag issues and suggest how to fix them",
+			"Read-only review of the add user endpoint",
+			"Review only. Determine whether they add tests.",
+			"Review only. Do not implement anything.",
+			"Review only; do not implement the approved fix.",
+		]) {
+			assert.equal(classifyTaskMutationIntent("delegate", task).kind, "read-only", task);
+		}
+		assert.equal(classifyTaskMutationIntent("reviewer", "Review only and fix any real issues").kind, "read-only");
 	});
 
 	it("stops the prohibition object before a following implementation clause", () => {
@@ -33,9 +76,29 @@ describe("classifyTaskMutationIntent", () => {
 		assert.equal(classifyTaskMutationIntent("worker", "Do not modify tests and fixtures").kind, "read-only");
 	});
 
+	it("recognizes coordinated read-only prohibitions", () => {
+		for (const task of [
+			"Do not read more files, run commands, or edit anything.",
+			"Do not read more files, run commands, and edit anything.",
+			"Do not read files or modify anything.",
+		]) {
+			assert.notEqual(classifyTaskMutationIntent("worker", task).kind, "implementation", task);
+			assert.equal(expectsImplementationMutation("worker", task), false, task);
+			assert.equal(taskMayMutate(task), false, task);
+		}
+		assert.equal(classifyTaskMutationIntent("worker", "Do not read more files, run commands, or edit anything; implement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not read more files, run commands, or edit anything\\r\\nImplement the fix").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not read more files\\r\\nImplement or edit the fix").kind, "implementation");
+		assert.equal(taskMayMutate("Do not read more files\\r\\nImplement or edit the fix"), true);
+	});
+
 	it("lets blanket no-edit prohibitions win over write verbs", () => {
 		assert.equal(classifyTaskMutationIntent("worker", "Implement this. Do not edit files.").kind, "read-only");
 		assert.equal(classifyTaskMutationIntent("worker", "Do not edit files. Tell me how to fix the bug.").kind, "read-only");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\nIn your final response, explain how to implement the fix.").kind, "read-only");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\\nIn your final output, implement the fix.").kind, "read-only");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\\nIn your final output/report/response, implement the fix.").kind, "read-only");
+		assert.equal(classifyTaskMutationIntent("worker", "Do not modify files\\nIn your report, explain how to fix the bug.").kind, "read-only");
 		assert.equal(classifyTaskMutationIntent("worker", "Report on the extraction pipeline. Do not modify project/source files.").kind, "read-only");
 		assert.equal(classifyTaskMutationIntent("reviewer", "Final correctness review after prior fixes. Inspect all changed files and tests. Do not modify project/source files. Report findings.").kind, "read-only");
 		assert.equal(classifyTaskMutationIntent("worker", "Verification-only task. Do not edit product/source/config files.\n   Run a disposable check, delete its temporary harness, and retain only\n   a sanitized report at an explicitly named artifact path.").kind, "read-only");
@@ -104,6 +167,27 @@ describe("classifyTaskMutationIntent", () => {
 		assert.equal(expectsImplementationMutation("worker", "Do not modify tests; implement the fix"), true);
 		assert.equal(expectsImplementationMutation("worker", "Review the diff and suggest fixes only. Do not edit files."), false);
 	});
+
+	it("does not treat verbs inside artifact filenames as implementation", () => {
+		const brief = "Render an audio briefing with the existing renderer to artifacts/daily-briefing.mp3.";
+		const renamed = "Render an audio briefing with the existing renderer to artifacts/daily-update.mp3.";
+		assert.equal(classifyTaskMutationIntent("worker", brief).kind, "unknown");
+		assert.equal(classifyTaskMutationIntent("worker", renamed).kind, "unknown");
+	});
+
+	it("keeps a later real imperative after a filename token", () => {
+		assert.equal(
+			classifyTaskMutationIntent("worker", "Render an audio briefing to artifacts/daily-update.mp3. Then update the source file.").kind,
+			"implementation",
+		);
+	});
+
+	it("keeps a real verb whose object is a filename", () => {
+		assert.equal(classifyTaskMutationIntent("worker", "Fix package.json").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Update daily-update.mp3").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("delegate", "Update package.json").kind, "implementation");
+		assert.equal(classifyTaskMutationIntent("worker", "Review only; fix the package.json").kind, "implementation");
+	});
 });
 
 describe("taskMayMutate", () => {
@@ -117,6 +201,13 @@ describe("taskMayMutate", () => {
 		assert.equal(taskMayMutate("Do not modify project/source files. Report findings."), false);
 		assert.equal(taskMayMutate("Write a report on the API"), false);
 		assert.equal(taskMayMutate("Summarize the build output"), false);
+	});
+
+	it("distinguishes quoted finding categories from sibling fix instructions", () => {
+		const task = 'Classify findings as "must fix before ENABLING" vs "must fix before MERGING disabled code"';
+		assert.equal(taskMayMutate(task), false);
+		assert.equal(taskMayMutate(`${task}; you must fix the bug.`), true);
+		assert.equal(taskMayMutate('You "must fix before ENABLING" the feature.'), true);
 	});
 
 	it("keeps verbs that survive outside a scoped prohibition", () => {

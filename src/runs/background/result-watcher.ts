@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
+import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import {
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
 	type IntercomEventBus,
@@ -22,12 +23,15 @@ import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-
 import { resolveWatchPath } from "../../shared/utils.ts";
 import { recordWaitCompletion } from "./wait-completions.ts";
 import { MISSION_BINDING_FILE, syncMissionFromAsyncCompletion } from "../../missions/lifecycle.ts";
+import { missionObserverResultCandidateFiles, promotePendingResultFile, removeMissionObserverIndex, removeResultIndex, resultCandidateFilesForSession, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, writeAsyncResultFile, writeResultIndexForData } from "./result-files.ts";
 import type { CompletionNotifier, CompletionNotification } from "./notify.ts";
+import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 
 const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
 const HEALTHY_SCAN_INTERVAL_MS = 60_000;
 const RETRY_DELAY_MS = 100;
+const SLOW_RESULT_SCAN_MS = 500;
 
 type ResultWatcherFs = Pick<typeof fs, "existsSync" | "readFileSync" | "unlinkSync" | "readdirSync" | "mkdirSync" | "realpathSync" | "statSync" | "watch">;
 
@@ -50,12 +54,23 @@ type ResultWatcherDeps = {
 	parseResult?: (raw: string) => ResultFileData;
 	/** External grouped-result transport. Disable when native completion notifications own delivery. */
 	deliverIntercomResults?: boolean;
+	/** Coalesces result-file events. Tests can lower this without changing retry timing. */
+	coalesceDelayMs?: number;
+	/** Returns true while a durable completion source needs periodic delivery checks. */
+	hasDeliveryDemand?: () => boolean;
+	/** Control how slow result-index scans are logged. Defaults to \"activity\". */
+	resultScanLogging?: "all" | "activity" | "off";
+	platform?: NodeJS.Platform;
+	/** Shared current/predecessor session ownership used by the notifier. */
+	ownership?: Pick<ResultDeliveryOwnership, "owns" | "claimedSessionIds">;
 };
 
 type ResultFileChild = {
 	agent?: string;
+	sessionName?: string;
 	output?: string;
 	structuredOutput?: unknown;
+	structuredOutputPath?: string;
 	outputState?: SubagentOutputState;
 	error?: string;
 	success?: boolean;
@@ -67,6 +82,8 @@ type ResultFileChild = {
 	processSignal?: string | null;
 	sessionFile?: string;
 	artifactPaths?: { outputPath?: string };
+	outputSaveError?: string;
+	artifactOutputSaveFailed?: true;
 	intercomTarget?: string;
 	children?: unknown;
 };
@@ -79,13 +96,21 @@ type ResultFileData = CompletionNotification & {
 	asyncDir?: string;
 	intercomTarget?: string;
 	parallelHandoff?: ParallelHandoffReference;
+	notificationDeliveredAt?: unknown;
 };
 
 type ResultFileIdentity = {
 	sessionId?: string;
+	completionOwnerId?: string;
 	runId?: string;
 	asyncDir?: string;
 };
+
+interface ResultScanStats {
+	files: number;
+	scheduled: number;
+	startedAt: number;
+}
 
 function jsonStringProperty(raw: string, property: string): string | undefined {
 	const matches = raw.matchAll(new RegExp(`"${property}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`, "g"));
@@ -103,6 +128,7 @@ function jsonStringProperty(raw: string, property: string): string | undefined {
 function resultFileIdentity(raw: string, file: string): ResultFileIdentity {
 	return {
 		sessionId: jsonStringProperty(raw, "sessionId"),
+		completionOwnerId: jsonStringProperty(raw, "completionOwnerId"),
 		runId: file.replace(/\.json$/i, ""),
 		asyncDir: jsonStringProperty(raw, "asyncDir"),
 	};
@@ -129,9 +155,43 @@ function isNotFound(error: unknown): boolean {
 	return errorCode(error) === "ENOENT";
 }
 
+function isAbsentResultCandidate(error: unknown): boolean {
+	return isNotFound(error) || errorCode(error) === "ENAMETOOLONG";
+}
+
+function isAccessDenied(error: unknown): boolean {
+	const code = errorCode(error);
+	return code === "EPERM" || code === "EACCES";
+}
+
 function shouldPoll(error: unknown): boolean {
 	const code = errorCode(error);
 	return code === "EMFILE" || code === "ENOSPC";
+}
+
+function hasDeliveredNotification(data: ResultFileData): boolean {
+	return typeof data.notificationDeliveredAt === "number" && Number.isFinite(data.notificationDeliveredAt);
+}
+
+type PublicResultIdentity = {
+	state?: string;
+	timestamp?: number;
+};
+
+function resultPayloadWasReplaced(delivered: ResultFileData, disk: PublicResultIdentity | undefined): boolean {
+	if (!disk) return false;
+	const deliveredState = typeof delivered.state === "string" ? delivered.state : undefined;
+	if (disk.state && deliveredState && disk.state !== deliveredState) return true;
+	const deliveredTimestamp = typeof delivered.timestamp === "number" && Number.isFinite(delivered.timestamp)
+		? delivered.timestamp
+		: undefined;
+	return disk.timestamp !== undefined && deliveredTimestamp !== undefined && disk.timestamp !== deliveredTimestamp;
+}
+
+function markDeliveredNotification(resultPath: string, data: ResultFileData, runId: string, now: number): ResultFileData {
+	const marked = { ...data, runId, notificationDeliveredAt: now };
+	writeAsyncResultFile(resultPath, marked);
+	return marked;
 }
 
 /**
@@ -147,7 +207,9 @@ export function createResultWatcher(
 	deps: ResultWatcherDeps = {},
 ): {
 	startResultWatcher: () => void;
+	transitionResultDelivery: () => void;
 	primeExistingResults: (options?: { triggerTurn?: boolean }) => void;
+	refreshResultDelivery: () => void;
 	stopResultWatcher: () => void;
 } {
 	const fsApi = deps.fs ?? fs;
@@ -164,11 +226,16 @@ export function createResultWatcher(
 	// The sole in-memory ownership lease. It is acquired for one active session
 	// and revoked before the watcher, queues, or callbacks are torn down.
 	let activeSessionId: string | null = null;
+	const ownsResult = deps.ownership?.owns
+		?? ((sessionId: string, completionOwnerId: unknown) => sessionId === state.currentSessionId
+			&& typeof completionOwnerId === "string"
+			&& completionOwnerId === state.completionOwnerId);
+	const claimedSessionIds = () => deps.ownership?.claimedSessionIds() ?? [];
 
-	const ownsSession = (sessionId: string, epoch: number) => {
+	const ownsCompletion = (sessionId: string, completionOwnerId: unknown, epoch: number) => {
 		if (!deliveryActive || epoch !== deliveryEpoch) return false;
 		if (!activeSessionId && state.currentSessionId) activeSessionId = state.currentSessionId;
-		return activeSessionId === sessionId && state.currentSessionId === sessionId;
+		return activeSessionId === state.currentSessionId && ownsResult(sessionId, completionOwnerId);
 	};
 
 	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0) => {
@@ -177,19 +244,63 @@ export function createResultWatcher(
 		state.resultFileCoalescer.schedule(file, delayMs);
 	};
 
-	const inspectResult = (file: string): ResultFileIdentity | undefined => {
-		const resultPath = path.join(resultsDir, file);
+	const publicResultPath = (file: string): string => path.join(resultsDir, file);
+	const publicResultFileExists = (file: string): boolean => {
+		try {
+			return fsApi.statSync(publicResultPath(file)).isFile();
+		} catch (error) {
+			if (!isAbsentResultCandidate(error)) console.error(`Failed to inspect subagent result file '${publicResultPath(file)}':`, error);
+			return false;
+		}
+	};
+	const resultPayloadPath = (file: string, observed?: ReadonlySet<string>): string | undefined => {
+		if (file !== path.basename(file) || !file.endsWith(".json")) return undefined;
+		const runId = file.replace(/\.json$/i, "");
+		for (const sessionId of [state.currentSessionId, ...claimedSessionIds()]) {
+			if (!sessionId) continue;
+			const sessionResult = resultPayloadPathForSessionRun(resultsDir, sessionId, runId);
+			if (sessionResult) return sessionResult;
+		}
+		const observerResult = resultPayloadPathForMissionObserverRun(resultsDir, runId);
+		if (observerResult) return observerResult;
+		if (observed?.has(runId)) {
+			const indexedResult = resultPayloadPathForIndexedRun(resultsDir, runId);
+			if (indexedResult) return indexedResult;
+		}
+		return publicResultFileExists(file) ? publicResultPath(file) : undefined;
+	};
+	const resultSignature = (file: string, observed?: ReadonlySet<string>): string | undefined => {
+		const resultPath = resultPayloadPath(file, observed);
+		if (!resultPath) {
+			identityCache.delete(file);
+			return undefined;
+		}
 		try {
 			const stat = fsApi.statSync(resultPath);
-			const signature = `${stat.size}:${stat.mtimeMs}`;
-			const cached = identityCache.get(file);
-			if (cached?.signature === signature) return cached.identity;
-			const identity = resultFileIdentity(fsApi.readFileSync(resultPath, "utf-8"), file);
-			identityCache.set(file, { signature, identity });
-			return identity;
+			if (!stat.isFile()) return undefined;
+			return `${resultPath}:${stat.size}:${stat.mtimeMs}`;
 		} catch (error) {
 			identityCache.delete(file);
-			if (!isNotFound(error)) console.error(`Failed to inspect subagent result file '${resultPath}':`, error);
+			if (isAccessDenied(error)) throw error;
+			if (!isAbsentResultCandidate(error)) console.error(`Failed to inspect subagent result file '${resultPath}':`, error);
+			return undefined;
+		}
+	};
+	const inspectResult = (file: string, knownSignature?: string, observed?: ReadonlySet<string>): { identity: ResultFileIdentity; signature: string } | undefined => {
+		const resultPath = resultPayloadPath(file, observed);
+		if (!resultPath) return undefined;
+		try {
+			const signature = knownSignature ?? resultSignature(file, observed);
+			if (!signature) return undefined;
+			const cached = identityCache.get(file);
+			if (cached?.signature === signature) return { identity: cached.identity, signature };
+			const identity = resultFileIdentity(fsApi.readFileSync(resultPath, "utf-8"), file);
+			identityCache.set(file, { signature, identity });
+			return { identity, signature };
+		} catch (error) {
+			identityCache.delete(file);
+			if (isAccessDenied(error)) throw error;
+			if (!isAbsentResultCandidate(error)) console.error(`Failed to inspect subagent result file '${resultPath}':`, error);
 			return undefined;
 		}
 	};
@@ -203,44 +314,128 @@ export function createResultWatcher(
 		}
 	};
 
-	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>): boolean => {
-		const identity = inspectResult(file);
-		if (!identity) return false;
+	const shouldProcessResult = (file: string, observed?: ReadonlySet<string>, knownSignature?: string): boolean => {
+		const inspected = inspectResult(file, knownSignature, observed);
+		if (!inspected) return false;
+		const { identity } = inspected;
 		// Missing identity stays on the normal parser path so malformed or legacy
 		// files keep their existing diagnostics and compatibility behavior.
 		if (!identity.sessionId) return true;
-		if (identity.sessionId === state.currentSessionId) return true;
+		if (ownsResult(identity.sessionId, identity.completionOwnerId)) return true;
 		if (identity.asyncDir && fsApi.existsSync(path.join(identity.asyncDir, MISSION_BINDING_FILE))) return true;
 		if (identity.runId && (observed ?? observedRunIds()).has(identity.runId)) return true;
 		return Boolean(deps.observeCompletion && !deps.observedCompletionRunIds);
 	};
 
-	const handleResult = async (file: string, triggerTurn: boolean) => {
-		const resultPath = path.join(resultsDir, file);
-		if (processing.has(file) || !fsApi.existsSync(resultPath)) return;
-		if (!shouldProcessResult(file)) return;
-		processing.add(file);
+	const removeDeliveredResult = (file: string, sessionId: string, runId: string, toolCallId: string | undefined): boolean => {
 		try {
-			const data = parseResult(fsApi.readFileSync(resultPath, "utf-8"));
+			if (publicResultFileExists(file)) fsApi.unlinkSync(publicResultPath(file));
+			identityCache.delete(file);
+			removeResultIndex(resultsDir, sessionId, runId, toolCallId);
+			return true;
+		} catch (error) {
+			if (!isAbsentResultCandidate(error)) {
+				console.error(`Failed to remove delivered subagent result '${publicResultPath(file)}'; will retry:`, error);
+				return false;
+			}
+			return true;
+		}
+	};
+	const handleResult = async (file: string, triggerTurn: boolean) => {
+		if (processing.has(file)) return;
+		let observed: ReadonlySet<string> | undefined;
+		try {
+			if (!shouldProcessResult(file)) {
+				const runId = file === path.basename(file) && file.endsWith(".json") ? file.replace(/\.json$/i, "") : undefined;
+				observed = observedRunIds();
+				if (!runId || !observed.has(runId) || !shouldProcessResult(file, observed)) return;
+			}
+		} catch (error) {
+			if (!isAccessDenied(error)) throw error;
+			console.error(`Failed to inspect subagent result file '${publicResultPath(file)}'; will retry:`, error);
+			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+			return;
+		}
+		processing.add(file);
+		let rereadReplacedPayload = false;
+		let resultPath = publicResultPath(file);
+		const readPublicResultIdentity = (): PublicResultIdentity | undefined => {
+			if (!publicResultFileExists(file)) return undefined;
+			const parsed: unknown = JSON.parse(fsApi.readFileSync(publicResultPath(file), "utf-8"));
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+			const record = parsed as Record<string, unknown>;
+			const state = typeof record.state === "string" && record.state ? record.state : undefined;
+			const timestamp = typeof record.timestamp === "number" && Number.isFinite(record.timestamp)
+				? record.timestamp
+				: undefined;
+			if (!state && timestamp === undefined) return undefined;
+			return { state, timestamp };
+		};
+		try {
+			const payloadPath = resultPayloadPath(file, observed);
+			if (!payloadPath) return;
+			resultPath = payloadPath;
+			let raw = fsApi.readFileSync(resultPath, "utf-8");
+			let identity = resultFileIdentity(raw, file);
+			if (identity.sessionId && identity.runId) {
+				const pendingState = promotePendingResultFile(resultsDir, identity.sessionId, identity.runId, file);
+				if (pendingState === "promoted") {
+					identityCache.delete(file);
+					resultPath = publicResultPath(file);
+					raw = fsApi.readFileSync(resultPath, "utf-8");
+					identity = resultFileIdentity(raw, file);
+				} else if (pendingState === "pending") {
+					const pendingPath = resultPayloadPathForSessionRun(resultsDir, identity.sessionId, identity.runId);
+					if (!pendingPath) {
+						scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+						return;
+					}
+					resultPath = pendingPath;
+					raw = fsApi.readFileSync(resultPath, "utf-8");
+					identity = resultFileIdentity(raw, file);
+				}
+			}
+			let data = parseResult(raw);
+			const markReplacedPayload = (): boolean => {
+				try {
+					if (!resultPayloadWasReplaced(data, readPublicResultIdentity())) return false;
+				} catch (error) {
+					if (isAccessDenied(error)) throw error;
+					if (isAbsentResultCandidate(error)) return false;
+					console.error(`Failed to re-read subagent result file '${publicResultPath(file)}':`, error);
+				}
+				identityCache.delete(file);
+				rereadReplacedPayload = true;
+				return true;
+			};
 			if (typeof data.sessionId !== "string" || !data.sessionId) return;
-			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
+			const sessionId = data.sessionId;
+			const completionOwnerId = data.completionOwnerId;
+			const runId = typeof data.runId === "string" && data.runId
+				? data.runId
+				: typeof data.id === "string" && data.id ? data.id : file.replace(/\.json$/i, "");
+			const toolCallId = typeof data.toolCallId === "string" ? data.toolCallId : undefined;
+			let observerSucceeded = true;
 			try {
 				syncMissionFromAsyncCompletion({ ...data, runId });
 			} catch (error) {
+				observerSucceeded = false;
 				console.error(`Mission completion sync failed for '${resultPath}':`, error);
 			}
 			try {
 				deps.observeCompletion?.({ ...data, runId });
 			} catch (error) {
+				observerSucceeded = false;
 				console.error(`Completion observer failed for '${resultPath}':`, error);
 			}
+			if (observerSucceeded) removeMissionObserverIndex(resultsDir, runId);
 			const epoch = deliveryEpoch;
-			if (!ownsSession(data.sessionId, epoch)) return;
-			// Recorded before dedupe and before the unlink below so subagent_wait can
+			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+			// Recorded before dedupe and before the unlink below so bg_wait can
 			// use the in-memory record or its bounded durable replay after cleanup.
-			recordWaitCompletion(state, runId, data, Date.now(), completionTtlMs, {
+			const completionPersisted = recordWaitCompletion(state, runId, data, Date.now(), completionTtlMs, {
 				resultsDir,
-				sessionId: data.sessionId,
+				sessionId,
 			});
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
 			let nestedChildren = compactNestedResultChildren(sanitizeNestedResultChildren(data.nestedChildren, resultPath, "nestedChildren"));
@@ -255,20 +450,22 @@ export function createResultWatcher(
 			}
 
 			const completionKey = buildCompletionKey(data, `result:${file}`);
+			const alreadyDelivered = hasDeliveredNotification(data);
 			const lastSeenAt = state.completionSeen.get(completionKey);
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
 			} else if (lastSeenAt !== undefined) {
-				if (!ownsSession(data.sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
-				try {
-					fsApi.unlinkSync(resultPath);
-					identityCache.delete(file);
-				} catch (error) {
-					if (!isNotFound(error)) {
-						console.error(`Failed to remove delivered subagent result '${resultPath}'; will retry:`, error);
-						scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-					}
+				if (!observerSucceeded) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
 				}
+				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+				if (markReplacedPayload()) return;
+				if (!completionPersisted) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
+				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
 
@@ -286,7 +483,7 @@ export function createResultWatcher(
 					: output;
 				const sessionPath = result.sessionFile ?? (resultChildren.length === 1 ? data.sessionFile : undefined);
 				const childNestedChildren = sanitizeNestedResultChildren(result.children, resultPath, `results[${index}].children`);
-				const childState = result.state === "paused" || result.state === "stopped"
+				const childState = result.state === "running" || result.state === "queued" || result.state === "paused" || result.state === "stopped"
 					? result.state
 					: result.stopped === true
 						? "stopped"
@@ -295,6 +492,7 @@ export function createResultWatcher(
 							: undefined;
 				return {
 					agent: result.agent ?? data.agent ?? `step-${index + 1}`,
+					...(result.sessionName ? { sessionName: result.sessionName } : {}),
 					status: resolveSubagentResultStatus({
 						success: result.success,
 						state: childState,
@@ -316,6 +514,22 @@ export function createResultWatcher(
 				};
 			}), nestedChildren);
 
+			if (alreadyDelivered) {
+				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
+				if (!observerSucceeded) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
+				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+				if (markReplacedPayload()) return;
+				if (!completionPersisted) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
+				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				return;
+			}
+
 			const intercomTarget = data.intercomTarget?.trim();
 			let intercomDelivered = false;
 			if (deliverIntercomResults && intercomTarget && triggerTurn) {
@@ -332,7 +546,7 @@ export function createResultWatcher(
 					asyncDir: data.asyncDir,
 					...(data.parallelHandoff ? { parallelHandoff: data.parallelHandoff } : {}),
 				}));
-				if (!ownsSession(data.sessionId, epoch)) return;
+				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 				if (!intercomDelivered) console.error(`Subagent async grouped result intercom delivery was not acknowledged for '${resultPath}'.`);
 			}
 
@@ -356,8 +570,17 @@ export function createResultWatcher(
 					})) : [],
 				} : {}),
 			});
-			if (!ownsSession(data.sessionId, epoch)) return;
+			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 			if (!accepted) {
+				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				return;
+			}
+			if (markReplacedPayload()) return;
+			try {
+				data = markDeliveredNotification(publicResultPath(file), data, runId, Date.now());
+				identityCache.delete(file);
+			} catch (error) {
+				console.error(`Failed to mark subagent result notification delivered for '${resultPath}'; will retry:`, error);
 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
@@ -385,20 +608,24 @@ export function createResultWatcher(
 			} catch (error) {
 				console.error(`Completion observer failed for '${resultPath}':`, error);
 			}
-			if (!ownsSession(data.sessionId, epoch) || !fsApi.existsSync(resultPath)) return;
-			try {
-				fsApi.unlinkSync(resultPath);
-				identityCache.delete(file);
-			} catch (error) {
-				if (!isNotFound(error)) {
-					console.error(`Failed to remove delivered subagent result '${resultPath}'; will retry:`, error);
-					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
-				}
+			if (!observerSucceeded) {
+				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				return;
 			}
+			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+			if (!completionPersisted) {
+				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				return;
+			}
+			if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		} catch (error) {
-			if (!isNotFound(error)) console.error(`Failed to process subagent result file '${resultPath}':`, error);
+			if (isAccessDenied(error)) {
+				console.error(`Failed to process subagent result file '${resultPath}'; will retry:`, error);
+				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+			} else if (!isNotFound(error)) console.error(`Failed to process subagent result file '${resultPath}':`, error);
 		} finally {
 			processing.delete(file);
+			if (rereadReplacedPayload) scheduleResult(file, triggerTurn);
 		}
 	};
 
@@ -406,24 +633,77 @@ export function createResultWatcher(
 		const triggerTurn = pendingTriggerTurn.get(file) !== false;
 		pendingTriggerTurn.delete(file);
 		void handleResult(file, triggerTurn);
-	}, 50);
+	}, deps.coalesceDelayMs ?? 50);
 
+	const logScanStats = (stats: ResultScanStats) => {
+		const elapsed = Date.now() - stats.startedAt;
+		if (elapsed < SLOW_RESULT_SCAN_MS) return;
+		const resultScanLogging = deps.resultScanLogging ?? "activity";
+		if (resultScanLogging === "off") return;
+		// A scan that inspected and scheduled nothing is a quiet no-op (e.g. the
+		// healthy periodic rescan while no async runs are pending). Under
+		// "activity", skip it so empty scans do not burn context tokens in the
+		// session transcript.
+		if (resultScanLogging === "activity" && stats.files === 0 && stats.scheduled === 0) return;
+		console.error(`Subagent result scan inspected ${stats.files} indexed result file(s), scheduled ${stats.scheduled} in ${elapsed}ms (${resultsDir}).`);
+	};
+	const indexedResultCandidates = (observed: ReadonlySet<string>): string[] => {
+		const files = new Set<string>();
+		for (const sessionId of [state.currentSessionId, ...claimedSessionIds()]) {
+			if (!sessionId) continue;
+			for (const file of resultCandidateFilesForSession(resultsDir, sessionId)) files.add(file);
+		}
+		for (const runId of state.asyncJobs.keys()) files.add(`${runId}.json`);
+		for (const file of missionObserverResultCandidateFiles(resultsDir)) files.add(file);
+		for (const runId of observed) files.add(`${runId}.json`);
+		return [...files];
+	};
 	const primeExistingResults = (options: { triggerTurn?: boolean } = {}) => {
 		try {
 			const triggerTurn = options.triggerTurn !== false;
-			fsApi.readdirSync(resultsDir)
-				.filter((f) => f.endsWith(".json"))
-				.forEach((file) => {
-					if (shouldProcessResult(file)) scheduleResult(file, triggerTurn);
-				});
+			const stats: ResultScanStats = { files: 0, scheduled: 0, startedAt: Date.now() };
+			const observed = observedRunIds();
+			for (const file of indexedResultCandidates(observed)) {
+				stats.files += 1;
+				const signature = resultSignature(file, observed);
+				if (!signature) continue;
+				if (!shouldProcessResult(file, observed, signature)) continue;
+				stats.scheduled += 1;
+				scheduleResult(file, triggerTurn);
+			}
+			logScanStats(stats);
 		} catch (error) {
-			if (!isNotFound(error)) console.error(`Failed to scan subagent result directory '${resultsDir}':`, error);
+			if (!isNotFound(error)) console.error(`Failed to scan subagent result index in '${resultsDir}':`, error);
 		}
 	};
 
 	const clearResultScan = () => {
 		if (resultScanTimer) timers.clearInterval(resultScanTimer);
 		resultScanTimer = null;
+	};
+	const useNativeWatcher = () => shouldUseNativeFsWatch("result-delivery", deps.platform);
+	const hasDeliveryDemand = () => {
+		try {
+			return deps.hasDeliveryDemand?.() === true;
+		} catch (error) {
+			console.error("Failed to inspect subagent result delivery demand:", error);
+			return false;
+		}
+	};
+	const clearResultPoller = () => {
+		if (!state.watcherRestartTimer) return;
+		timers.clearTimeout(state.watcherRestartTimer);
+		timers.clearInterval(state.watcherRestartTimer);
+		state.watcherRestartTimer = null;
+	};
+	const startDemandPolling = () => {
+		if (!deliveryActive || useNativeWatcher() || state.watcherRestartTimer) return;
+		if (!hasDeliveryDemand()) return;
+		state.watcherRestartTimer = timers.setInterval(() => {
+			primeExistingResults();
+			if (!hasDeliveryDemand()) clearResultPoller();
+		}, POLL_INTERVAL_MS);
+		state.watcherRestartTimer.unref?.();
 	};
 
 	const startPolling = (reason: unknown) => {
@@ -464,6 +744,10 @@ export function createResultWatcher(
 			timers.clearInterval(state.watcherRestartTimer);
 			state.watcherRestartTimer = null;
 		}
+		if (!useNativeWatcher()) {
+			startDemandPolling();
+			return;
+		}
 		try {
 			const watchDir = resolveWatchPath(resultsDir, fsApi.realpathSync.native);
 			state.watcher = fsApi.watch(watchDir, (_event, file) => {
@@ -474,6 +758,11 @@ export function createResultWatcher(
 				const fileName = file.toString();
 				if (fileName.endsWith(".json")) {
 					identityCache.delete(fileName);
+					try {
+						writeResultIndexForData(path.join(resultsDir, fileName), JSON.parse(fsApi.readFileSync(path.join(resultsDir, fileName), "utf-8")) as Record<string, unknown>);
+					} catch {
+						// The writer may still be renaming the file; handleResult will retry from the normal result path.
+					}
 					scheduleResult(fileName, true);
 				}
 			});
@@ -495,17 +784,20 @@ export function createResultWatcher(
 		}
 	};
 
+	const transitionResultDelivery = () => {
+		deliveryActive = true;
+		activeSessionId = state.currentSessionId;
+		deliveryEpoch += 1;
+		identityCache.clear();
+	};
+
 	const stopResultWatcher = () => {
 		deliveryActive = false;
 		activeSessionId = null;
 		deliveryEpoch += 1;
 		state.watcher?.close();
 		state.watcher = null;
-		if (state.watcherRestartTimer) {
-			timers.clearTimeout(state.watcherRestartTimer);
-			timers.clearInterval(state.watcherRestartTimer);
-		}
-		state.watcherRestartTimer = null;
+		clearResultPoller();
 		clearResultScan();
 		state.resultFileCoalescer.clear();
 		pendingTriggerTurn.clear();
@@ -513,5 +805,5 @@ export function createResultWatcher(
 		identityCache.clear();
 	};
 
-	return { startResultWatcher, primeExistingResults, stopResultWatcher };
+	return { startResultWatcher, transitionResultDelivery, primeExistingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 }

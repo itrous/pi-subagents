@@ -12,8 +12,10 @@ import {
 	resolveIntercomSessionTarget,
 	resolveSubagentIntercomTarget,
 	resolveIntercomBridgeMode,
+	validateIntercomBridgeConfig,
 	type IntercomBridgeState,
 } from "../../src/intercom/intercom-bridge.ts";
+import { agentDefinitionDigest } from "../../src/shared/launch-contract.ts";
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -104,6 +106,19 @@ describe("resolveIntercomBridge", () => {
 		assert.equal(bridge.extensionDir, NATIVE_INTERCOM_EXTENSION_DIR);
 	});
 
+	it("uses a per-run override instead of the global config", () => {
+		const bridge = resolveIntercomBridge({
+			config: { mode: "always", resultDelivery: true },
+			override: { mode: "off" },
+			context: "fresh",
+			orchestratorTarget: "main",
+		});
+
+		assert.equal(bridge.active, false);
+		assert.equal(bridge.mode, "off");
+		assert.equal(bridge.resultDelivery, false);
+	});
+
 	it("can disable external grouped-result delivery without disabling supervisor coordination", () => {
 		const bridge = resolveIntercomBridge({
 			config: { mode: "always", resultDelivery: false },
@@ -135,9 +150,20 @@ describe("resolveIntercomBridge", () => {
 			});
 			assert.equal(bridge.active, true);
 			assert.match(bridge.instruction, /Custom bridge for main/);
+			assert.equal(bridge.interpolatesOrchestratorTarget, true);
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	it("keeps the default instruction independent of the parent session", () => {
+		const first = resolveIntercomBridge({ config: { mode: "always" }, context: "fresh", orchestratorTarget: "subagent-chat-first" });
+		const second = resolveIntercomBridge({ config: { mode: "always" }, context: "fresh", orchestratorTarget: "subagent-chat-second" });
+		assert.equal(first.active, true);
+		assert.equal(first.interpolatesOrchestratorTarget, false);
+		assert.equal(first.instruction, second.instruction);
+		assert.doesNotMatch(first.instruction, /subagent-chat-first/);
+		assert.equal(first.orchestratorTarget, "subagent-chat-first");
 	});
 
 	it("uses stronger default instructions for fork-aware coordination", () => {
@@ -164,19 +190,31 @@ describe("applyIntercomBridgeToAgent", () => {
 		orchestratorTarget: "main",
 		extensionDir: NATIVE_INTERCOM_EXTENSION_DIR,
 		instruction: "Intercom orchestration channel:\n- Need a decision or blocked: contact_supervisor({ reason: \"need_decision\", message: \"<question>\" })\n- Blocked/update: contact_supervisor({ reason: \"progress_update\", message: \"UPDATE: <summary>\" })",
+		interpolatesOrchestratorTarget: false,
 	};
 
-	it("injects intercom tool and prompt instructions", () => {
+	it("preserves the parsed definition digest across the overlay", () => {
+		const agent = makeAgent({ tools: ["read"] });
+		const parsedDigest = agentDefinitionDigest(agent);
+		const bridged = applyIntercomBridgeToAgent(agent, activeBridge);
+		assert.equal(bridged.definitionDigest, parsedDigest);
+		assert.equal(agentDefinitionDigest(bridged), parsedDigest);
+		assert.equal(agentDefinitionDigest(applyIntercomBridgeToAgent(bridged, activeBridge)), parsedDigest);
+		assert.equal(agent.definitionDigest, undefined);
+	});
+
+	it("injects contact_supervisor and prompt instructions", () => {
 		const updated = applyIntercomBridgeToAgent(makeAgent({ tools: ["read", "bash"] }), activeBridge);
-		assert.deepEqual(updated.tools, ["read", "bash", "intercom", "contact_supervisor"]);
+		assert.deepEqual(updated.tools, ["read", "bash", "contact_supervisor"]);
 		assert.match(updated.systemPrompt, /Intercom orchestration channel:/);
 		assert.match(updated.systemPrompt, /contact_supervisor/);
+		assert.doesNotMatch(updated.systemPrompt ?? "", /Generic intercom/);
 	});
 
 	it("is idempotent", () => {
 		const first = applyIntercomBridgeToAgent(makeAgent({ tools: ["read"] }), activeBridge);
 		const second = applyIntercomBridgeToAgent(first, activeBridge);
-		assert.equal(second.tools?.filter((tool) => tool === "intercom").length, 1);
+		assert.equal(second.tools?.filter((tool) => tool === "intercom").length, 0);
 		assert.equal(second.tools?.filter((tool) => tool === "contact_supervisor").length, 1);
 		assert.equal(second.systemPrompt, first.systemPrompt);
 	});
@@ -184,8 +222,13 @@ describe("applyIntercomBridgeToAgent", () => {
 	it("does not block native supervisor tools for agents with explicit extension allowlists", () => {
 		const agent = makeAgent({ tools: ["read"], extensions: ["/tmp/other-extension/index.ts"] });
 		const updated = applyIntercomBridgeToAgent(agent, activeBridge);
-		assert.deepEqual(updated.tools, ["read", "intercom", "contact_supervisor"]);
+		assert.deepEqual(updated.tools, ["read", "contact_supervisor"]);
 		assert.match(updated.systemPrompt, /contact_supervisor/);
+	});
+
+	it("preserves explicitly requested external intercom tools", () => {
+		const updated = applyIntercomBridgeToAgent(makeAgent({ tools: ["read", "intercom"] }), activeBridge);
+		assert.deepEqual(updated.tools, ["read", "intercom", "contact_supervisor"]);
 	});
 
 	it("does not widen explicit empty or MCP-only builtin allowlists", () => {
@@ -197,5 +240,29 @@ describe("applyIntercomBridgeToAgent", () => {
 		assert.deepEqual(mcpOnly.tools, []);
 		assert.deepEqual(mcpOnly.mcpDirectTools, ["github/search_repositories"]);
 		assert.match(mcpOnly.systemPrompt, /contact_supervisor/);
+	});
+});
+
+describe("validateIntercomBridgeConfig", () => {
+	it("accepts the documented fields and drops nothing", () => {
+		const result = validateIntercomBridgeConfig({ value: { mode: "fork-only", instructionFile: "./bridge.md", resultDelivery: true }, label: "intercomBridge" });
+		assert.deepEqual(result, { ok: true, value: { mode: "fork-only", instructionFile: "./bridge.md", resultDelivery: true } });
+		assert.deepEqual(validateIntercomBridgeConfig({ value: {}, label: "intercomBridge" }), { ok: true, value: {} });
+	});
+
+	it("rejects unknown fields and wrong types with the caller's label", () => {
+		const cases: Array<[unknown, RegExp]> = [
+			[null, /^bridge must be an object\.$/],
+			[[], /^bridge must be an object\.$/],
+			[{ extra: 1 }, /^bridge\.extra is not supported\.$/],
+			[{ mode: "loud" }, /^bridge\.mode is invalid\.$/],
+			[{ instructionFile: 1 }, /^bridge\.instructionFile must be a string\.$/],
+			[{ resultDelivery: "yes" }, /^bridge\.resultDelivery must be a boolean\.$/],
+		];
+		for (const [value, expected] of cases) {
+			const result = validateIntercomBridgeConfig({ value, label: "bridge" });
+			assert.equal(result.ok, false);
+			if (!result.ok) assert.match(result.error, expected);
+		}
 	});
 });

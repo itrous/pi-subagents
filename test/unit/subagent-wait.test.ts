@@ -3,8 +3,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { randomUUID } from "node:crypto";
+import { nestedRunScope } from "../../src/runs/shared/nested-events.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
-import { WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, waitForSubagents, type SubagentWaitDeps } from "../../src/runs/background/subagent-wait.ts";
+import { writeAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
+import { WAIT_TOOL_DEFAULT_TIMEOUT_MS_ENV, WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, waitForSubagents, type SubagentWaitDeps } from "../../src/runs/background/subagent-wait.ts";
 import { recordWaitCompletion } from "../../src/runs/background/wait-completions.ts";
 import type { AsyncStatus, SubagentState } from "../../src/shared/types.ts";
 
@@ -30,6 +34,24 @@ function writeStatus(asyncRoot: string, runId: string, state: AsyncStatus["state
 	updateActiveRunIndex(dir, state);
 }
 
+function writeRecoveryDescriptor(asyncRoot: string, runId: string, agent: string, sessionFile: string, cwd: string): void {
+	fs.writeFileSync(path.join(asyncRoot, runId, "recovery-descriptor.json"), JSON.stringify({
+		version: 1,
+		sourceRunId: runId,
+		agent,
+		sessionFile,
+		cwd,
+		systemPromptMode: "append",
+		outputMode: "inline",
+		inheritGlobalContext: false,
+		inheritProjectContext: false,
+		inheritSkills: false,
+		maxSubagentDepth: 0,
+		share: false,
+		runFanoutBudget: createRunFanoutBudget(runId, 64),
+	}), "utf-8");
+}
+
 function makeState(sessionId: string | null): SubagentState {
 	return {
 		baseCwd: "",
@@ -51,6 +73,18 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 	return result.content.map((c) => c.text ?? "").join("");
 }
 
+function assertSupervisorYield(
+	result: Awaited<ReturnType<typeof waitForSubagents>>,
+	activeRunIds: string[],
+	activeProviderItems: Array<{ provider: string; id: string }> = [],
+): void {
+	assert.equal(result.isError, undefined);
+	assert.deepEqual(result.details.wait, { reason: "supervisor_request", timedOut: false, activeRunIds, activeProviderItems });
+	assert.match(textOf(result), /yielded for a pending supervisor request/i);
+	assert.doesNotMatch(textOf(result), /(?:done|complete|window elapsed)/i);
+	assert.equal(result.details.completions, undefined);
+}
+
 function baseDeps(root: string, state: SubagentState, overrides: Partial<SubagentWaitDeps> = {}): SubagentWaitDeps {
 	return {
 		state,
@@ -64,15 +98,142 @@ function baseDeps(root: string, state: SubagentState, overrides: Partial<Subagen
 	};
 }
 
-describe("subagent_wait tool", () => {
+describe("bg_wait tool", () => {
+	for (const alreadyTerminal of [false, true]) {
+		for (const prefix of [false, true]) {
+			it(`collects nested results by ${prefix ? "prefix" : "exact id"} ${alreadyTerminal ? "after early completion" : "across active-to-terminal transition"}`, async (t) => {
+				const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-nested-"));
+				const nestedRootRunId = randomUUID();
+				const scope = nestedRunScope(nestedRootRunId);
+				t.after(() => {
+					for (const dir of [root, scope.asyncDirRoot, scope.resultsDir]) fs.rmSync(dir, { recursive: true, force: true });
+				});
+				const runId = randomUUID();
+				const resultPath = path.join(scope.resultsDir, `${runId}.json`);
+				const outputPath = path.join(root, "persona.md");
+				fs.writeFileSync(outputPath, "PERSONA_EVIDENCE");
+				const finish = () => {
+					writeAsyncResultFile(resultPath, { runId, sessionId: "owner", success: true, results: [{ agent: "persona", output: "PERSONA_EVIDENCE", artifactPaths: { outputPath } }] });
+					writeStatus(scope.asyncDirRoot, runId, "complete", { sessionId: "owner" });
+				};
+				if (alreadyTerminal) finish();
+				else writeStatus(scope.asyncDirRoot, runId, "running", { sessionId: "owner" });
+				let polls = 0;
+				const result = await waitForSubagents({ id: prefix ? runId.slice(0, 8) : runId }, undefined, baseDeps(root, makeState("owner"), {
+					nestedRootRunId, sleep: async () => { polls++; finish(); },
+				}));
+				assert.equal(result.isError, undefined, textOf(result));
+				assert.equal(polls, alreadyTerminal ? 0 : 1);
+				assert.equal(result.details.completions?.[0]?.runId, runId);
+				assert.equal(result.details.completions?.[0]?.results?.[0]?.artifactPaths?.outputPath, outputPath);
+				assert.ok(textOf(result).includes(resultPath));
+				assert.equal(JSON.parse(fs.readFileSync(resultPath, "utf8")).results[0].output, "PERSONA_EVIDENCE");
+			});
+		}
+	}
+
+	it("all:true collects ordinary workflow and nested results but excludes siblings and other roots", async (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-mixed-"));
+		const nestedRootRunId = randomUUID();
+		const nested = nestedRunScope(nestedRootRunId);
+		const otherRoot = nestedRunScope(randomUUID());
+		const ordinary = { asyncDirRoot: path.join(root, "runs"), resultsDir: path.join(root, "results") };
+		t.after(() => { for (const dir of [root, nested.asyncDirRoot, nested.resultsDir, otherRoot.asyncDirRoot]) fs.rmSync(dir, { recursive: true, force: true }); });
+		const owned = [[ordinary, "workflow-owned"], [nested, "persona-one"], [nested, "persona-two"]] as const;
+		for (const [scope, id] of owned) writeStatus(scope.asyncDirRoot, id, "running", { sessionId: "owner" });
+		writeStatus(nested.asyncDirRoot, "sibling-persona", "running", { sessionId: "sibling-coordinator" });
+		writeStatus(ordinary.asyncDirRoot, "foreign-workflow", "running", { sessionId: "other-session" });
+		writeStatus(otherRoot.asyncDirRoot, "outside-route", "running", { sessionId: "owner" });
+		const state = makeState("owner");
+		let polls = 0;
+		const deps = baseDeps(root, state, { nestedRootRunId, sleep: async () => {
+			const [scope, id] = owned[polls++]!;
+			writeAsyncResultFile(path.join(scope.resultsDir, `${id}.json`), { runId: id, sessionId: "owner", results: [{ structuredOutput: { finding: id } }] });
+			writeStatus(scope.asyncDirRoot, id, "complete", { sessionId: "owner" });
+		} });
+		const result = await waitForSubagents({ all: true }, undefined, deps);
+		assert.equal(polls, 3);
+		assert.match(textOf(result), /3 complete/);
+		assert.deepEqual(new Set(result.details.completions?.map((c) => c.runId)), new Set(owned.map(([, id]) => id)));
+		for (const completion of result.details.completions ?? []) assert.deepEqual(completion.results?.[0]?.structuredOutput, { finding: completion.runId });
+		for (const id of ["sibling-persona", "sibling-", "foreign-workflow", "outside-route"]) {
+			assert.match(textOf(await waitForSubagents({ id }, undefined, deps)), /No active run matched/);
+		}
+		writeStatus(nested.asyncDirRoot, "sibling-persona", "complete", { sessionId: "sibling-coordinator" });
+		assert.match(textOf(await waitForSubagents({ id: "sibling-persona" }, undefined, deps)), /No active run matched/);
+	});
+
+	it("does not reconcile a sibling coordinator's nested runs during aggregate discovery", async (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-sibling-reconcile-"));
+		const nestedRootRunId = randomUUID();
+		const scope = nestedRunScope(nestedRootRunId);
+		t.after(() => { for (const dir of [root, scope.asyncDirRoot]) fs.rmSync(dir, { recursive: true, force: true }); });
+		writeStatus(scope.asyncDirRoot, "foreign-persona", "running", { sessionId: "sibling", pid: 987654, lastUpdate: 1, startedAt: 1 });
+		const statusPath = path.join(scope.asyncDirRoot, "foreign-persona", "status.json");
+		const before = fs.readFileSync(statusPath, "utf8");
+		let probes = 0;
+		const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, makeState("owner"), {
+			nestedRootRunId, kill: () => { probes++; return false; },
+		}));
+		assert.equal(probes, 0, "sharing a root does not authorize probing or reconciling sibling processes");
+		assert.match(textOf(result), /Nothing to wait for/);
+		assert.equal(fs.readFileSync(statusPath, "utf8"), before);
+	});
+
+	it("resolves prefix ambiguity across scopes and prefers an exact already-terminal id", async (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-prefix-scopes-"));
+		const nestedRootRunId = randomUUID();
+		const scope = nestedRunScope(nestedRootRunId);
+		t.after(() => { for (const dir of [root, scope.asyncDirRoot]) fs.rmSync(dir, { recursive: true, force: true }); });
+		const deps = baseDeps(root, makeState("owner"), { nestedRootRunId });
+		writeStatus(deps.asyncDirRoot!, "shared-prefix-active", "running", { sessionId: "owner" });
+		writeStatus(scope.asyncDirRoot, "shared-prefix", "complete", { sessionId: "owner" });
+		const ambiguous = await waitForSubagents({ id: "shared-p" }, undefined, deps);
+		assert.equal(ambiguous.isError, true);
+		assert.match(textOf(ambiguous), /Ambiguous.*2 runs/);
+		const exact = await waitForSubagents({ id: "shared-prefix" }, undefined, deps);
+		assert.equal(exact.isError, undefined);
+		assert.match(textOf(exact), /is terminal.*1 complete/);
+	});
+
+	it("preserves nested timeout, supervisor attention, and session-change boundaries", async (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-nested-control-"));
+		const nestedRootRunId = randomUUID();
+		const scope = nestedRunScope(nestedRootRunId);
+		t.after(() => { for (const dir of [root, scope.asyncDirRoot]) fs.rmSync(dir, { recursive: true, force: true }); });
+		const runId = randomUUID();
+		const state = makeState("owner");
+		let clock = Date.now();
+		const deps = baseDeps(root, state, { nestedRootRunId, now: () => clock, sleep: async () => { clock += 250; } });
+		writeStatus(scope.asyncDirRoot, runId, "running", { sessionId: "owner" });
+		const timed = await waitForSubagents({ all: true, timeoutMs: 250 }, undefined, deps);
+		assert.equal(timed.isError, undefined);
+		assert.deepEqual(timed.details.wait?.activeRunIds, [runId]);
+		assert.equal(timed.details.wait?.reason, "window_elapsed");
+		writeStatus(scope.asyncDirRoot, runId, "running", { sessionId: "owner", activityState: "needs_attention", currentTool: "contact_supervisor" });
+		const attention = await waitForSubagents({ all: true, stopOnAttention: false }, undefined, deps);
+		assert.match(textOf(attention), /attention required/);
+		const barrier = await waitForSubagents({ all: true }, undefined, { ...deps, hasPendingSupervisorRequest: () => true });
+		assertSupervisorYield(barrier, [runId]);
+		writeStatus(scope.asyncDirRoot, runId, "running", { sessionId: "owner" });
+		const changed = await waitForSubagents({ id: runId }, undefined, { ...deps, sleep: async () => { state.currentSessionId = "sibling"; } });
+		assert.equal(changed.isError, true);
+		assert.match(textOf(changed), /session changed/);
+	});
+
 	it("resolves waitTool config and environment overrides strictly", () => {
 		assert.deepEqual(resolveWaitToolConfig(undefined, {}), { enabled: true });
 		assert.deepEqual(resolveWaitToolConfig(false, {}), { enabled: false });
 		assert.deepEqual(resolveWaitToolConfig({ enabled: false }, {}), { enabled: false });
+		assert.deepEqual(resolveWaitToolConfig({ defaultTimeoutMs: 120_000 }, {}), { enabled: true, defaultTimeoutMs: 120_000 });
+		assert.deepEqual(resolveWaitToolConfig({ defaultTimeoutMs: 120_000 }, { [WAIT_TOOL_DEFAULT_TIMEOUT_MS_ENV]: "3000" }), { enabled: true, defaultTimeoutMs: 3_000 });
 		assert.deepEqual(resolveWaitToolConfig({ enabled: false }, { [WAIT_TOOL_ENABLED_ENV]: "true" }), { enabled: true });
 		assert.deepEqual(resolveWaitToolConfig(true, { [WAIT_TOOL_ENABLED_ENV]: "off" }), { enabled: false });
 		assert.throws(() => resolveWaitToolConfig("false" as never, {}), /config\.waitTool/);
 		assert.throws(() => resolveWaitToolConfig({ enabled: "false" } as never, {}), /config\.waitTool\.enabled/);
+		assert.throws(() => resolveWaitToolConfig({ defaultTimeoutMs: 0 }, {}), /config\.waitTool\.defaultTimeoutMs/);
+		assert.throws(() => resolveWaitToolConfig({ defaultTimeoutMs: 1.5 }, {}), /config\.waitTool\.defaultTimeoutMs/);
+		assert.throws(() => resolveWaitToolConfig(undefined, { [WAIT_TOOL_DEFAULT_TIMEOUT_MS_ENV]: "0" }), /PI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS/);
 		assert.throws(() => resolveWaitToolConfig(undefined, { [WAIT_TOOL_ENABLED_ENV]: "maybe" }), /PI_SUBAGENT_WAIT_TOOL_ENABLED/);
 	});
 
@@ -87,7 +248,7 @@ describe("subagent_wait tool", () => {
 				enabled: false,
 				sleep: async () => {
 					slept = true;
-					throw new Error("disabled subagent_wait should not sleep");
+					throw new Error("disabled bg_wait should not sleep");
 				},
 			}));
 
@@ -199,6 +360,7 @@ describe("subagent_wait tool", () => {
 			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
 			const state = makeState("sess-1");
 			writeStatus(asyncRoot, "run-revive", "running", { sessionId: "sess-1", pid: 999999 });
+			writeRecoveryDescriptor(asyncRoot, "run-revive", "worker", sessionFile, root);
 			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
 				sleep: async () => writeStatus(asyncRoot, "run-revive", "failed", {
 					sessionId: "sess-1",
@@ -213,6 +375,78 @@ describe("subagent_wait tool", () => {
 			assert.match(text, /subagent\(\{ action: "resume", id: "run-revive", message:/);
 			assert.match(text, /before reporting failure or launching a replacement/);
 			assert.match(text, /only if revive fails or the user explicitly asks/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not advertise resume-first when the recovery descriptor is missing", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-no-recovery-descriptor-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const sessionFile = path.join(root, "worker-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-no-descriptor", "running", { sessionId: "sess-1", pid: 999999 });
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => writeStatus(asyncRoot, "run-no-descriptor", "failed", {
+					sessionId: "sess-1",
+					steps: [{ agent: "worker", status: "failed", sessionFile }],
+				}),
+			}));
+
+			assert.equal(result.isError, undefined);
+			assert.doesNotMatch(textOf(result), /Resume-first/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the single-child run session fallback with a matching recovery descriptor", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-run-session-fallback-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const sessionFile = path.join(root, "worker-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-session-fallback", "running", { sessionId: "sess-1", pid: 999999 });
+			writeRecoveryDescriptor(asyncRoot, "run-session-fallback", "worker", sessionFile, root);
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => writeStatus(asyncRoot, "run-session-fallback", "failed", {
+					sessionId: "sess-1",
+					sessionFile,
+					steps: [{ agent: "worker", status: "failed" }],
+				}),
+			}));
+
+			assert.equal(result.isError, undefined);
+			assert.match(textOf(result), /Resume-first/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("tells blocking callers to reply and wait for intercom-detached failed runs", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-intercom-detach-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const sessionFile = path.join(root, "worker-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-detached", "running", { sessionId: "sess-1", pid: 999999 });
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => writeStatus(asyncRoot, "run-detached", "failed", {
+					sessionId: "sess-1",
+					error: "Step failed: worker",
+					steps: [{ agent: "worker", status: "failed", sessionFile, error: "Detached for intercom coordination before task completion." }],
+				}),
+			}));
+
+			const text = textOf(result);
+			assert.match(text, /Reply to the supervisor request first/);
+			assert.match(text, /wait with bg_wait/);
+			assert.match(text, /do not resume or launch a replacement/);
+			assert.doesNotMatch(text, /Resume-first/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -243,6 +477,7 @@ describe("subagent_wait tool", () => {
 							success: true,
 							outputState: "present",
 							output: "full output text stays out of details",
+							usage: { input: 100, output: 50, cacheRead: 25, cacheWrite: 5, cost: 0.001, turns: 1 },
 							artifactPaths: {
 								outputPath: "/tmp/a1b2c3d4_reviewer_0_output.md",
 								metadataPath: "/tmp/a1b2c3d4_reviewer_0_meta.json",
@@ -258,6 +493,7 @@ describe("subagent_wait tool", () => {
 			assert.equal(completions![0]!.runId, "run-a");
 			assert.equal(completions![0]!.mode, "workflow");
 			assert.equal(completions![0]!.success, true);
+			assert.deepEqual(result.usage, { input: 100, output: 50, cacheRead: 25, cacheWrite: 5, totalTokens: 180, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 } });
 			const child = completions![0]!.results?.[0];
 			assert.equal(child?.agent, "reviewer");
 			assert.equal(child?.runId, "a1b2c3d4");
@@ -270,7 +506,101 @@ describe("subagent_wait tool", () => {
 		}
 	});
 
-	it("reports malformed terminal result files as actionable errors", async () => {
+	it("surfaces bounded recovery guidance for a failed completion", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-recovery-completion-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-recovery", "running", { sessionId: "sess-1", pid: 999999 });
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => {
+					const recovery = {
+						termination: "timed-out",
+						changedFiles: ["input.md"],
+						recoveryNeeded: true,
+						reason: "timed-out-with-dirty-worktree",
+						reportStatus: "missing",
+						message: "raw recovery message must not cross the wait boundary",
+						effects: { settlementDiagnostic: { finalTextPresent: true } },
+					};
+					writeStatus(asyncRoot, "run-recovery", "failed", {
+						sessionId: "sess-1",
+						steps: [{ agent: "worker", status: "failed", timedOut: true, timeoutRecovery: recovery }],
+					});
+					fs.writeFileSync(path.join(resultsDir, "run-recovery.json"), JSON.stringify({
+						id: "run-recovery",
+						runId: "run-recovery",
+						sessionId: "sess-1",
+						mode: "single",
+						state: "failed",
+						success: false,
+						results: [{ agent: "worker", success: false, error: "Subagent timed out.", output: "raw output must not be copied", timeoutRecovery: recovery }],
+					}), "utf-8");
+				},
+			}));
+
+			assert.equal(result.isError, undefined);
+			const text = textOf(result);
+			assert.match(text, /Recovery needed: review the diff and artifacts before resuming or launching dependent stages\./);
+			assert.match(text, /requested report: missing/);
+			assert.match(text, /changed tracked files: input\.md/);
+			assert.doesNotMatch(text, /raw recovery message|settlementDiagnostic|raw output/);
+			const completion = result.details.completions?.[0];
+			assert.equal(completion?.success, false);
+			assert.deepEqual(completion?.results?.[0]?.timeoutRecovery, {
+				termination: "timed-out",
+				changedFiles: ["input.md"],
+				recoveryNeeded: true,
+				reason: "timed-out-with-dirty-worktree",
+				reportStatus: "missing",
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("surfaces terminal completion payloads from an indexed pending result file", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-completions-pending-"));
+		const originalError = console.error;
+		try {
+			console.error = () => {};
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const publicResultPath = path.join(resultsDir, "run-pending.json");
+			fs.mkdirSync(publicResultPath, { recursive: true });
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-pending", "running", { sessionId: "sess-1", pid: 999999 });
+
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => {
+					writeStatus(asyncRoot, "run-pending", "complete", { sessionId: "sess-1" });
+					assert.deepEqual(writeAsyncResultFile(publicResultPath, {
+						id: "run-pending",
+						runId: "run-pending",
+						sessionId: "sess-1",
+						agent: "worker",
+						mode: "single",
+						state: "complete",
+						success: true,
+						results: [{ agent: "worker", success: true, outputState: "present" }],
+					}), { state: "pending" });
+				},
+			}));
+
+			assert.equal(result.isError, undefined);
+			assert.equal(result.details.completions?.[0]?.runId, "run-pending");
+			assert.equal(result.details.completions?.[0]?.success, true);
+			assert.equal(result.details.completions?.[0]?.results?.[0]?.agent, "worker");
+			assert.equal(fs.statSync(publicResultPath).isDirectory(), true);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reports malformed unindexed public result payloads", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-completions-malformed-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
@@ -286,8 +616,8 @@ describe("subagent_wait tool", () => {
 			}));
 
 			assert.equal(result.isError, true);
-			assert.match(textOf(result), /Failed to read subagent result/);
-			assert.match(textOf(result), /run-bad\.json/);
+			assert.equal(result.details.completions, undefined);
+			assert.match(textOf(result), /Failed to read subagent result .*run-bad\.json/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -304,6 +634,8 @@ describe("subagent_wait tool", () => {
 					writeStatus(asyncRoot, "run-b", "complete", { sessionId: "sess-1" });
 					// Simulates the watcher: payload recorded, file consumed and deleted.
 					recordWaitCompletion(state, "run-b", {
+						runId: "run-b",
+						sessionId: "sess-1",
 						agent: "worker",
 						mode: "single",
 						state: "complete",
@@ -348,6 +680,212 @@ describe("subagent_wait tool", () => {
 			assert.match(text, /steer a top-level live async child, resume a paused\/completed\/failed child, or interrupt explicitly/);
 			assert.match(text, /run-a/, "should name the attention run");
 			assert.ok(polls <= 2, `should break on attention promptly, polled ${polls}`);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("can keep blocking through idle attention when stopOnAttention is false", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-tolerant-attn-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-a", "running", { sessionId: "sess-1", pid: 999999 });
+
+			let polls = 0;
+			const sleep = async () => {
+				polls += 1;
+				if (polls === 1) {
+					writeStatus(asyncRoot, "run-a", "running", { sessionId: "sess-1", pid: 999999, activityState: "needs_attention" });
+				}
+				if (polls === 2) writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+			};
+
+			const result = await waitForSubagents({ all: true, stopOnAttention: false }, undefined, baseDeps(root, state, { sleep }));
+			assert.equal(result.isError, undefined);
+			assert.match(textOf(result), /1 complete/);
+			assert.equal(polls, 2, "tolerant wait should not return on idle attention");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("still stops tolerant waits for supervisor attention", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-tolerant-supervisor-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-a", "running", { sessionId: "sess-1", pid: 999999 });
+
+			let polls = 0;
+			const sleep = async () => {
+				polls += 1;
+				writeStatus(asyncRoot, "run-a", "running", {
+					sessionId: "sess-1",
+					pid: 999999,
+					activityState: "needs_attention",
+					currentTool: "contact_supervisor",
+				});
+			};
+
+			const result = await waitForSubagents({ all: true, stopOnAttention: false }, undefined, baseDeps(root, state, { sleep }));
+			assert.equal(result.isError, undefined);
+			assert.match(textOf(result), /Reply to any pending supervisor request/);
+			assert.match(textOf(result), /run-a/);
+			assert.equal(polls, 1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("yields without an error for internal auto-drain on a durable supervisor barrier", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-drain-supervisor-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-a", "running", { sessionId: "sess-1", pid: 999999 });
+
+			let pending = false;
+			const result = await waitForSubagents({ all: true, stopOnAttention: false }, undefined, baseDeps(root, state, {
+				failOnAttention: true,
+				hasPendingSupervisorRequest: () => pending,
+				sleep: async () => {
+					pending = true;
+					writeStatus(asyncRoot, "run-a", "running", {
+						sessionId: "sess-1",
+						pid: 999999,
+						activityState: "needs_attention",
+						currentTool: "contact_supervisor",
+					});
+				},
+			}));
+
+			assertSupervisorYield(result, ["run-a"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("yields when a durable descendant request appears during the wait before status projection", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-drain-nested-supervisor-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "workflow-a", "running", {
+				sessionId: "sess-1",
+				pid: 999999,
+				mode: "workflow",
+				steps: [{ agent: "workflow", status: "running" }],
+			});
+			let pending = false;
+			let polls = 0;
+			let clock = 0;
+			const result = await waitForSubagents({ all: true, stopOnAttention: false, timeoutMs: 50 }, undefined, baseDeps(root, state, {
+				failOnAttention: true,
+				hasPendingSupervisorRequest: () => pending,
+				now: () => clock,
+				sleep: async () => {
+					polls++;
+					pending = true;
+					clock = 100;
+				},
+			}));
+
+			assertSupervisorYield(result, ["workflow-a"]);
+			assert.equal(polls, 1, "the durable mailbox must stop an already-running wait without status projection");
+			const persisted = JSON.parse(fs.readFileSync(path.join(asyncRoot, "workflow-a", "status.json"), "utf-8")) as { state: string };
+			assert.equal(persisted.state, "running", "yielding must not mark the workflow terminal");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reports every still-active initial identity for a mixed supervisor yield", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-supervisor-mixed-scope-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "async-a", "running", { sessionId: "sess-1", pid: 999999 });
+			state.foregroundRuns = new Map(["fg-a", "fg-b"].map((runId, index) => [runId, {
+				runId, mode: "single" as const, cwd: root, sessionId: "sess-1", updatedAt: 1,
+				children: [{ agent: "worker", index, status: "detached" as const, updatedAt: 1 }],
+			}]));
+			const provider = { provider: "herdr", id: "pane-a", sessionId: "sess-1" };
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				hasPendingSupervisorRequest: () => true,
+				backgroundWork: { snapshot: () => ({ providers: ["herdr"], items: [provider] }), wakeChannels: () => [] },
+			}));
+			assertSupervisorYield(result, ["async-a", "fg-a", "fg-b"], [{ provider: "herdr", id: "pane-a" }]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("foreground aggregate yield filters terminal, new, newly detached, and foreign work from its initial scope", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-supervisor-foreground-scope-"));
+		try {
+			const state = makeState("sess-1");
+			state.foregroundRuns = new Map([
+				["fg-first", { runId: "fg-first", mode: "single", cwd: root, sessionId: "sess-1", updatedAt: 1, children: [
+					{ agent: "worker", index: 0, status: "detached", updatedAt: 1 },
+					{ agent: "worker", index: 1, status: "completed", updatedAt: 1 },
+				] }],
+				["fg-later", { runId: "fg-later", mode: "single", cwd: root, sessionId: "sess-1", updatedAt: 1, children: [{ agent: "worker", index: 0, status: "detached", updatedAt: 1 }] }],
+				["fg-foreign", { runId: "fg-foreign", mode: "single", cwd: root, sessionId: "sess-2", updatedAt: 1, children: [{ agent: "worker", index: 0, status: "detached", updatedAt: 1 }] }],
+			] as never);
+			let pending = false;
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				hasPendingSupervisorRequest: () => pending,
+				sleep: async () => {
+					state.foregroundRuns!.get("fg-first")!.children[0]!.status = "completed";
+					state.foregroundRuns!.get("fg-first")!.children[1]!.status = "detached";
+					state.foregroundRuns!.set("fg-new", { runId: "fg-new", mode: "single", cwd: root, sessionId: "sess-1", updatedAt: 2, children: [{ agent: "worker", index: 0, status: "detached", updatedAt: 2 }] });
+					pending = true;
+				},
+			}));
+			assertSupervisorYield(result, ["fg-later"]);
+			assert.equal(state.foregroundRuns.get("fg-later")!.children[0]!.status, "detached");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const currentTool of ["contact_supervisor", "intercom"]) {
+		it(`still errors for ${currentTool} attention without a durable owned request`, async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-drain-unowned-supervisor-"));
+			try {
+				const asyncRoot = path.join(root, "runs");
+				const state = makeState("sess-1");
+				writeStatus(asyncRoot, "run-a", "running", {
+					sessionId: "sess-1",
+					pid: 999999,
+					activityState: "needs_attention",
+					currentTool,
+				});
+				const result = await waitForSubagents({ all: true, stopOnAttention: false }, undefined, baseDeps(root, state, {
+					failOnAttention: true,
+					hasPendingSupervisorRequest: () => false,
+				}));
+				assert.equal(result.isError, true);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("still errors for non-supervisor attention during internal auto-drain", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-drain-nonsupervisor-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-a", "running", {
+				sessionId: "sess-1",
+				pid: 999999,
+				activityState: "needs_attention",
+				currentTool: "read",
+			});
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, { failOnAttention: true }));
+			assert.equal(result.isError, true);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -467,6 +1005,105 @@ describe("subagent_wait tool", () => {
 		}
 	});
 
+	it("waits for session-owned detached foreground runs when all is true", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-foreground-all-"));
+		try {
+			const state = makeState("sess-1");
+			state.foregroundRuns = new Map([["foreground-alpha", {
+				runId: "foreground-alpha", mode: "single", cwd: root, sessionId: "sess-1", updatedAt: 1,
+				children: [{ agent: "reviewer", index: 0, status: "detached", updatedAt: 1 }],
+			}]]);
+			let polls = 0;
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => {
+					polls += 1;
+					state.foregroundRuns!.get("foreground-alpha")!.children[0]!.status = "completed";
+				},
+			}));
+			assert.equal(result.isError, undefined);
+			assert.match(textOf(result), /remembered detached foreground run "foreground-alpha"/i);
+			assert.equal(polls, 1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves timeout metadata and every active foreground identity for aggregate waits", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-foreground-timeout-"));
+		try {
+			const state = makeState("sess-1");
+			state.foregroundRuns = new Map(["foreground-a", "foreground-b"].map((runId) => [runId, {
+				runId, mode: "single", cwd: root, sessionId: "sess-1", updatedAt: 1,
+				children: [{ agent: "worker", index: 0, status: "detached", updatedAt: 1 }],
+			}]));
+			let clock = 0;
+			const result = await waitForSubagents({ all: true, timeoutMs: 500 }, undefined, baseDeps(root, state, {
+				now: () => clock,
+				sleep: async (ms) => { clock += ms + 500; },
+			}));
+
+			assert.doesNotMatch(textOf(result), /; done\./);
+			assert.deepEqual(result.details.wait, {
+				reason: "window_elapsed",
+				timedOut: true,
+				activeRunIds: ["foreground-a", "foreground-b"],
+				activeProviderItems: [],
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("returns async supervisor attention without waiting on foreground descendants", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-attention-before-foreground-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-blocked", "running", {
+				sessionId: "sess-1", pid: 999999, activityState: "needs_attention", currentTool: "contact_supervisor",
+			});
+			state.foregroundRuns = new Map([["foreground-live", {
+				runId: "foreground-live", mode: "single", cwd: root, sessionId: "sess-1", updatedAt: 1,
+				children: [{ agent: "worker", index: 0, status: "detached", updatedAt: 1 }],
+			}]]);
+			let sleeps = 0;
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => { sleeps += 1; },
+			}));
+
+			assert.match(textOf(result), /Reply to any pending supervisor request/);
+			assert.equal(sleeps, 0);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("all:true ignores foreground work detached after invocation", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-new-foreground-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-initial", "running", { sessionId: "sess-1", pid: 999999 });
+			let sleeps = 0;
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
+				sleep: async () => {
+					sleeps += 1;
+					writeStatus(asyncRoot, "run-initial", "complete", { sessionId: "sess-1" });
+					state.foregroundRuns = new Map([["foreground-late", {
+						runId: "foreground-late", mode: "single", cwd: root, sessionId: "sess-1", updatedAt: 1,
+						children: [{ agent: "worker", index: 0, status: "detached", updatedAt: 1 }],
+					}]]);
+				},
+			}));
+
+			assert.match(textOf(result), /1 complete/);
+			assert.doesNotMatch(textOf(result), /foreground-late/);
+			assert.equal(sleeps, 1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("waits for a remembered detached foreground run by id and ignores other sessions", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-foreground-"));
 		try {
@@ -515,6 +1152,39 @@ describe("subagent_wait tool", () => {
 		}
 	});
 
+	it("yields a foreground-only wait when a durable request appears before timeout", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-foreground-supervisor-yield-"));
+		try {
+			const state = makeState("sess-1");
+			state.foregroundRuns = new Map([["foreground-live", {
+				runId: "foreground-live",
+				mode: "single",
+				cwd: root,
+				sessionId: "sess-1",
+				updatedAt: 1,
+				children: [{ agent: "worker", index: 0, status: "detached", updatedAt: 1 }],
+			}]]);
+			let pending = false;
+			let clock = 0;
+			let polls = 0;
+			const result = await waitForSubagents({ all: true, timeoutMs: 50 }, undefined, baseDeps(root, state, {
+				hasPendingSupervisorRequest: () => pending,
+				now: () => clock,
+				sleep: async () => {
+					polls++;
+					pending = true;
+					clock = 100;
+				},
+			}));
+
+			assert.equal(polls, 1);
+			assertSupervisorYield(result, ["foreground-live"]);
+			assert.equal(state.foregroundRuns.get("foreground-live")!.children[0]!.status, "detached");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("wakes when a remembered detached foreground run needs attention", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-foreground-attn-"));
 		try {
@@ -536,6 +1206,7 @@ describe("subagent_wait tool", () => {
 						index: 0,
 						status: "detached",
 						activityState: "needs_attention",
+						currentTool: "contact_supervisor",
 						updatedAt: 2,
 					};
 				},
@@ -546,6 +1217,45 @@ describe("subagent_wait tool", () => {
 			assert.match(textOf(result), /foreground-blocked/);
 			assert.match(textOf(result), /researcher#0/);
 			assert.match(textOf(result), /Reply to any pending supervisor request/);
+			assert.equal(polls, 1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps waiting after a resolved supervisor reply even if idle needs_attention remains", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-foreground-idle-attn-"));
+		try {
+			const state = makeState("sess-1");
+			state.foregroundRuns = new Map([["foreground-working", {
+				runId: "foreground-working",
+				mode: "single",
+				cwd: root,
+				sessionId: "sess-1",
+				updatedAt: 1,
+				children: [{
+					agent: "worker",
+					index: 0,
+					status: "detached",
+					activityState: "needs_attention",
+					updatedAt: 1,
+				}],
+			}]]);
+			let polls = 0;
+			const result = await waitForSubagents({ id: "foreground-working", timeoutMs: 30_000 }, undefined, baseDeps(root, state, {
+				sleep: async () => {
+					polls += 1;
+					state.foregroundRuns!.get("foreground-working")!.children[0] = {
+						agent: "worker",
+						index: 0,
+						status: "completed",
+						updatedAt: 2,
+					};
+				},
+			}));
+
+			assert.equal(result.isError, undefined);
+			assert.match(textOf(result), /done/i);
 			assert.equal(polls, 1);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -585,6 +1295,7 @@ describe("subagent_wait tool", () => {
 			setTimeout(() => {
 				const child = state.foregroundRuns!.get("foreground-repeated")!.children[0]!;
 				child.activityState = "needs_attention";
+				child.currentTool = "contact_supervisor";
 				events.emit("pi-intercom:detach-request", { runId: "foreground-repeated", childIndex: 0 });
 			}, 15);
 
@@ -677,9 +1388,9 @@ describe("subagent_wait tool", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-cross-kind-"));
 		try {
 			const state = makeState("sess-1");
-			writeStatus(path.join(root, "runs"), "shared-async", "running", { sessionId: "sess-1", pid: 999999 });
-			state.foregroundRuns = new Map([["shared-foreground", {
-				runId: "shared-foreground",
+			writeStatus(path.join(root, "runs"), "shared-x-async", "running", { sessionId: "sess-1", pid: 999999 });
+			state.foregroundRuns = new Map([["shared-x-foreground", {
+				runId: "shared-x-foreground",
 				mode: "single",
 				cwd: root,
 				sessionId: "sess-1",
@@ -687,11 +1398,11 @@ describe("subagent_wait tool", () => {
 				children: [{ agent: "reviewer", index: 0, status: "detached", updatedAt: 1 }],
 			}]]);
 
-			const result = await waitForSubagents({ id: "shared" }, undefined, baseDeps(root, state));
+			const result = await waitForSubagents({ id: "shared-x" }, undefined, baseDeps(root, state));
 			assert.equal(result.isError, true);
-			assert.match(textOf(result), /Ambiguous subagent run id prefix "shared"/);
-			assert.match(textOf(result), /shared-async/);
-			assert.match(textOf(result), /shared-foreground/);
+			assert.match(textOf(result), /Ambiguous subagent run id prefix "shared-x"/);
+			assert.match(textOf(result), /shared-x-async/);
+			assert.match(textOf(result), /shared-x-foreground/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -702,15 +1413,15 @@ describe("subagent_wait tool", () => {
 		try {
 			const asyncRoot = path.join(root, "runs");
 			const state = makeState("sess-1");
-			writeStatus(asyncRoot, "run-al", "running", { sessionId: "sess-2", pid: 999999 });
-			writeStatus(asyncRoot, "run-alpha", "running", { sessionId: "sess-1", pid: 999998 });
+			writeStatus(asyncRoot, "run-alph", "running", { sessionId: "sess-2", pid: 999999 });
+			writeStatus(asyncRoot, "run-alpha-current", "running", { sessionId: "sess-1", pid: 999998 });
 
-			const result = await waitForSubagents({ id: "run-al" }, undefined, baseDeps(root, state, {
-				sleep: async () => writeStatus(asyncRoot, "run-alpha", "complete", { sessionId: "sess-1" }),
+			const result = await waitForSubagents({ id: "run-alph" }, undefined, baseDeps(root, state, {
+				sleep: async () => writeStatus(asyncRoot, "run-alpha-current", "complete", { sessionId: "sess-1" }),
 			}));
 
 			assert.equal(result.isError, undefined);
-			assert.match(textOf(result), /run "run-al".*done/is);
+			assert.match(textOf(result), /run "run-alph".*done/is);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -790,9 +1501,9 @@ describe("subagent_wait tool", () => {
 				if (polls === 1) writeStatus(asyncRoot, "run-alpha", "complete", { sessionId: "sess-1" });
 			};
 
-			const result = await waitForSubagents({ id: "run-al" }, undefined, baseDeps(root, state, { sleep }));
+			const result = await waitForSubagents({ id: "run-alph" }, undefined, baseDeps(root, state, { sleep }));
 			assert.equal(result.isError, undefined);
-			assert.match(textOf(result), /run "run-al".*done/is);
+			assert.match(textOf(result), /run "run-alph".*done/is);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -803,13 +1514,14 @@ describe("subagent_wait tool", () => {
 		try {
 			const asyncRoot = path.join(root, "runs");
 			const state = makeState("sess-1");
-			writeStatus(asyncRoot, "run", "running", { sessionId: "sess-1", pid: 999999 });
-			writeStatus(asyncRoot, "run-alpha", "running", { sessionId: "sess-1", pid: 999998 });
+			writeStatus(asyncRoot, "prefix-aa-1", "running", { sessionId: "sess-1", pid: 999999 });
+			writeStatus(asyncRoot, "prefix-aa-2", "running", { sessionId: "sess-1", pid: 999998 });
+			writeStatus(asyncRoot, "run", "running", { sessionId: "sess-1", pid: 999997 });
 
-			const ambiguous = await waitForSubagents({ id: "ru" }, undefined, baseDeps(root, state));
+			const ambiguous = await waitForSubagents({ id: "prefix-aa" }, undefined, baseDeps(root, state));
 			assert.equal(ambiguous.isError, true);
-			assert.match(textOf(ambiguous), /Ambiguous subagent run id prefix "ru"/);
-			assert.match(textOf(ambiguous), /run-alpha/);
+			assert.match(textOf(ambiguous), /Ambiguous subagent run id prefix "prefix-aa"/);
+			assert.match(textOf(ambiguous), /prefix-aa-2/);
 
 			let polls = 0;
 			const exact = await waitForSubagents({ id: "run" }, undefined, baseDeps(root, state, {
@@ -894,11 +1606,62 @@ describe("subagent_wait tool", () => {
 				clock += ms + 10_000;
 			};
 
-			const result = await waitForSubagents({ timeoutMs: 5_000 }, undefined, baseDeps(root, state, { now, sleep }));
-			assert.equal(result.isError, true);
+			const result = await waitForSubagents({ timeoutMs: 5_000 }, undefined, baseDeps(root, state, { now, sleep, defaultTimeoutMs: 1_000 }));
+			assert.equal(result.isError, undefined);
 			const text = textOf(result);
-			assert.match(text, /timed out/i);
+			assert.match(text, /window elapsed after 5\.0s/i, "explicit timeoutMs must override the configured default");
 			assert.match(text, /run-stuck \(running\)/);
+			assert.deepEqual(result.details.wait, {
+				reason: "window_elapsed",
+				timedOut: true,
+				activeRunIds: ["run-stuck"],
+				activeProviderItems: [],
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the configured wait window when timeoutMs is omitted", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-config-timeout-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			writeStatus(asyncRoot, "run-configured", "running", { sessionId: "sess-1", pid: 999999 });
+			let clock = 0;
+			const result = await waitForSubagents({}, undefined, baseDeps(root, state, {
+				now: () => clock,
+				sleep: async (ms) => { clock += ms + 10_000; },
+				defaultTimeoutMs: 2_000,
+			}));
+
+			assert.equal(result.isError, undefined);
+			assert.match(textOf(result), /window elapsed after 2\.0s/i);
+			assert.equal(result.details.wait?.reason, "window_elapsed");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reports still-active provider identities when the wait window elapses", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-provider-timeout-"));
+		try {
+			const state = makeState("sess-1");
+			let clock = 0;
+			const result = await waitForSubagents({ timeoutMs: 1_000 }, undefined, baseDeps(root, state, {
+				now: () => clock,
+				sleep: async (ms) => { clock += ms + 10_000; },
+				backgroundWork: {
+					snapshot: () => ({
+						providers: ["herdr"],
+						items: [{ provider: "herdr", id: "pane-1", sessionId: "sess-1" }],
+					}),
+					wakeChannels: () => [],
+				},
+			}));
+
+			assert.equal(result.isError, undefined);
+			assert.deepEqual(result.details.wait?.activeProviderItems, [{ provider: "herdr", id: "pane-1" }]);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -949,33 +1712,31 @@ describe("subagent_wait tool", () => {
 				},
 			};
 
-			// A real timer-based sleep with a LONG poll interval; if wait waited for
-			// the poll it would take ~10s. The event should wake it in ~10ms.
 			let sleepCalls = 0;
-			const realSleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
+			let sleepArmed!: () => void;
+			const armed = new Promise<void>((resolve) => { sleepArmed = resolve; });
+			const sleep = (_ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
 				sleepCalls += 1;
-				const t = setTimeout(resolve, ms);
-				signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+				signal?.addEventListener("abort", resolve, { once: true });
+				sleepArmed();
 			});
 
-			const startedAt = Date.now();
 			const p = waitForSubagents({ all: true }, undefined, baseDeps(root, state, {
 				events,
 				pollIntervalMs: 10_000,
-				sleep: realSleep,
+				sleep,
 			}));
 
-			// After a short delay, flip the run terminal and emit a completion event.
-			setTimeout(() => {
-				writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
-				events.emit("subagent:async-complete", { id: "run-a" });
-			}, 15);
+			await armed;
+			writeStatus(asyncRoot, "run-a", "complete", { sessionId: "sess-1" });
+			events.emit("subagent:async-complete", { id: "run-a" });
 
-			const result = await p;
-			const elapsed = Date.now() - startedAt;
+			const result = await Promise.race([
+				p,
+				new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("event wake did not resolve bg_wait")), 1_000)),
+			]);
 			assert.equal(result.isError, undefined);
 			assert.match(textOf(result), /done/i);
-			assert.ok(elapsed < 5_000, `should wake via event, not the 10s poll; took ${elapsed}ms`);
 			assert.ok(sleepCalls >= 1, "poll-interval sleep still armed as fallback");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

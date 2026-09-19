@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
+import { PROMPT_REDACTED } from "../shared/utils.ts";
 import type { Details, SubagentRunMode } from "../shared/types.ts";
 import { validateMissionLaunch } from "./actions.ts";
 import type { MissionArtifact, MissionRecord, MissionRunLink, MissionRunMode, MissionStatus, MissionStoreConfig, MissionStoreLocation } from "./types.ts";
@@ -47,11 +49,6 @@ function workflowObjective(params: MissionLaunchParams): string | undefined {
 	return undefined;
 }
 
-function conciseTitle(objective: string): string {
-	const firstLine = objective.split(/\r?\n/, 1)[0]?.trim() || objective.trim();
-	return firstLine.length > 100 ? `${firstLine.slice(0, 97)}...` : firstLine;
-}
-
 export function prepareMissionLaunch(input: {
 	params: MissionLaunchParams;
 	projectRoot: string;
@@ -73,10 +70,11 @@ export function prepareMissionLaunch(input: {
 		return { missionId, location, autoCreated: false, announceInContent: true };
 	}
 	const mission = input.params.mission !== undefined ? validateMissionLaunch(input.params.mission) : undefined;
-	const title = mission?.title || conciseTitle(objective!);
+	const promptDerivedObjective = mission?.objective ?? (mission ? mission.title : objective ? PROMPT_REDACTED : undefined);
+	const title = mission?.title || PROMPT_REDACTED;
 	const record = createMission(location, {
 		title,
-		objective: mission?.objective || objective || title,
+		objective: promptDerivedObjective || title,
 		...(mission?.goal === true ? { goal: true as const } : {}),
 		...(mission?.budget ? { budget: mission.budget } : {}),
 		status: "active",
@@ -297,13 +295,17 @@ export function syncMissionFromAsyncCompletion(value: unknown): MissionRecord | 
 		current = readMission(binding.location, binding.missionId);
 	} catch (error) {
 		if (!(error instanceof MissionNotFoundError)) throw error;
+		const reason = "mission-record-missing";
+		const markerId = createHash("sha256").update(JSON.stringify([runId, binding.missionId, reason])).digest("hex");
+		const markerPath = path.join(event.asyncDir, `.mission-sync-skipped-${markerId}.json`);
 		try {
+			fs.writeFileSync(markerPath, `${JSON.stringify({ runId, missionId: binding.missionId, reason })}\n`, { encoding: "utf-8", mode: 0o600, flag: "wx" });
 			fs.appendFileSync(path.join(event.asyncDir, "events.jsonl"), `${JSON.stringify({
 				type: "subagent.mission.sync.skipped",
 				ts: Date.now(),
 				runId,
 				missionId: binding.missionId,
-				reason: "mission-record-missing",
+				reason,
 				missionPath: missionRecordPath(binding.location, binding.missionId),
 			})}\n`, "utf-8");
 		} catch {

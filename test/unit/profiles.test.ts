@@ -16,10 +16,12 @@ import {
 	refreshProviderModelCatalog,
 	readProviderModelCatalog,
 } from "../../src/profiles/profiles.ts";
+import { PI_SUBAGENT_PI_BINARY_ENV } from "../../src/runs/shared/pi-spawn.ts";
 
 let homeDir = "";
 const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
+const previousPiBinary = process.env[PI_SUBAGENT_PI_BINARY_ENV];
 
 function makeCtx(cwd: string, models: Array<Record<string, unknown>>) {
 	return {
@@ -35,6 +37,7 @@ describe("profiles helpers", () => {
 		homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subprofiles-home-"));
 		process.env.HOME = homeDir;
 		process.env.USERPROFILE = homeDir;
+		process.env[PI_SUBAGENT_PI_BINARY_ENV] = path.join(homeDir, "pi-test-bin");
 	});
 
 	afterEach(() => {
@@ -42,6 +45,8 @@ describe("profiles helpers", () => {
 		else process.env.HOME = previousHome;
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
 		else process.env.USERPROFILE = previousUserProfile;
+		if (previousPiBinary === undefined) delete process.env[PI_SUBAGENT_PI_BINARY_ENV];
+		else process.env[PI_SUBAGENT_PI_BINARY_ENV] = previousPiBinary;
 		fs.rmSync(homeDir, { recursive: true, force: true });
 	});
 
@@ -59,9 +64,8 @@ describe("profiles helpers", () => {
 					scout: {
 						model: "openai-codex/gpt-5.3-codex-spark",
 						thinking: "medium",
-						fallbackModels: ["openai-codex/gpt-5.4-mini"],
 					},
-					reviewer: { thinking: false, fallbackModels: false },
+					reviewer: { thinking: false },
 				},
 			},
 		}, null, 2));
@@ -87,9 +91,29 @@ describe("profiles helpers", () => {
 			scout: {
 				model: "openai-codex/gpt-5.3-codex-spark",
 				thinking: "medium",
-				fallbackModels: ["openai-codex/gpt-5.4-mini"],
 			},
-			reviewer: { thinking: false, fallbackModels: false },
+			reviewer: { thinking: false },
+		});
+	});
+
+	it("keeps machine placement when a model profile replaces the override map", () => {
+		const profilesDir = getSubagentProfilesDir();
+		fs.mkdirSync(profilesDir, { recursive: true });
+		fs.writeFileSync(path.join(profilesDir, "quota.json"), JSON.stringify({
+			subagents: { agentOverrides: { scout: { model: "openai-codex/gpt-5.3-codex-spark" }, "claude-code": { thinking: false } } },
+		}, null, 2));
+		const settingsPath = path.join(homeDir, ".pi", "agent", "settings.json");
+		fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+		fs.writeFileSync(settingsPath, JSON.stringify({
+			subagents: { agentOverrides: { "claude-code": { machine: "workmac", model: "old" }, "codex-exec": { machine: "workmac" }, stale: { model: "remove-me" } } },
+		}, null, 2));
+
+		applySubagentProfile("quota");
+		const written = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+		assert.deepEqual(written.subagents.agentOverrides, {
+			scout: { model: "openai-codex/gpt-5.3-codex-spark" },
+			"claude-code": { thinking: false, machine: "workmac" },
+			"codex-exec": { machine: "workmac" },
 		});
 	});
 
@@ -103,7 +127,6 @@ describe("profiles helpers", () => {
 					worker: {
 						model: "bluebox-azure-openai/gpt-5_6-luna",
 						thinking: "high",
-						fallbackModels: ["bluebox-azure-openai/gpt-5_6-terra"],
 					},
 				},
 			},
@@ -118,12 +141,11 @@ describe("profiles helpers", () => {
 		assert.equal(worker?.source, "user");
 		assert.equal(worker?.model, "bluebox-azure-openai/gpt-5_6-luna");
 		assert.equal(worker?.thinking, "high");
-		assert.deepEqual(worker?.fallbackModels, ["bluebox-azure-openai/gpt-5_6-terra"]);
 		assert.equal(worker?.override?.scope, "user");
 		assert.equal(agents.some((agent) => agent.source === "builtin"), false);
 	});
 
-	it("rejects invalid profile fallback models", () => {
+	it("rejects removed profile fallback models", () => {
 		const profilesDir = getSubagentProfilesDir();
 		fs.mkdirSync(profilesDir, { recursive: true });
 		fs.writeFileSync(path.join(profilesDir, "invalid.json"), JSON.stringify({
@@ -134,7 +156,7 @@ describe("profiles helpers", () => {
 			},
 		}, null, 2));
 
-		assert.throws(() => applySubagentProfile("invalid"), /invalid fallbackModels.*array of strings or false/);
+		assert.throws(() => applySubagentProfile("invalid"), /removed field fallbackModels/);
 	});
 
 	it("rejects profile and provider path traversal names", async () => {
@@ -146,11 +168,14 @@ describe("profiles helpers", () => {
 		);
 	});
 
-	it("refreshes a provider model catalog and writes a cache file", async () => {
+	it("refreshes a provider model catalog using the resolved Pi executable and writes a cache file", async () => {
+		const piBinary = path.join(homeDir, "pi-wrapper.exe");
+		process.env[PI_SUBAGENT_PI_BINARY_ENV] = piBinary;
 		const execCalls: string[] = [];
 		const execCwds: unknown[] = [];
 		const pi = {
-			exec: async (_command: string, args: string[], options?: Record<string, unknown>) => {
+			exec: async (command: string, args: string[], options?: Record<string, unknown>) => {
+				assert.equal(command, piBinary);
 				execCalls.push(args.join(" "));
 				execCwds.push(options?.cwd);
 				return { stdout: "OK\n", stderr: "", code: 0, killed: false };

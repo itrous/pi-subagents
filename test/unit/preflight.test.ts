@@ -4,9 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { registerSubagentCapabilityCeiling, resolveSubagentCapabilityCeiling } from "../../src/api/capability-ceiling.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { resolveSubagentLaunchContract, SUBAGENT_LAUNCH_CONTRACT_VERSION } from "../../src/api/preflight.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
+import { TEMP_ARTIFACTS_DIR } from "../../src/shared/types.ts";
 
 let tempDir = "";
 let previousHome: string | undefined;
@@ -71,6 +73,22 @@ describe("public launch contract preflight", () => {
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 
+	it("exposes required host IDs without exposing their private paths", async () => {
+		const cwd = path.join(tempDir, "repo");
+		fs.mkdirSync(path.join(cwd, ".pi", "agents"), { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "required.md"), "---\nname: required\ndescription: Required extension fixture\n---\nFixture.\n");
+		const extensionPath = path.join(tempDir, "required-provider.mjs");
+		fs.writeFileSync(extensionPath, "export default () => {};\n");
+		const registration = registerRequiredChildExtensions({ sessionId: "preflight-required", extensions: [{ id: "safe-provider", path: extensionPath }] });
+		try {
+			const result = await resolveSubagentLaunchContract({ agent: "required", cwd, parentSessionId: "preflight-required" });
+			assert.equal(result.ok, true);
+			if (!result.ok) return;
+			assert.deepEqual(result.contract.tools.requiredExtensionIds, ["safe-provider"]);
+			assert.equal(result.contract.tools.extensionArgs.includes(fs.realpathSync(extensionPath)), false);
+		} finally { registration.dispose(); }
+	});
+
 	it("resolves an ordinary single-agent contract without creating launch directories", async () => {
 		const cwd = path.join(tempDir, "repo");
 		fs.mkdirSync(cwd, { recursive: true });
@@ -83,8 +101,6 @@ tools:
   - write
   - /tmp/private-tool.ts
 model: test/primary
-fallbackModels:
-  - test/fallback
 thinking: high
 skills:
   - project-skill
@@ -112,21 +128,22 @@ Project prompt.
 			assert.equal(result.ok, true);
 			assert.equal(result.contract.version, SUBAGENT_LAUNCH_CONTRACT_VERSION);
 			assert.equal(result.contract.agent.source, "project");
-			assert.equal(result.contract.agent.definitionProjectionVersion, 1);
+			assert.equal(result.contract.agent.definitionProjectionVersion, 2);
 			assert.match(result.contract.agent.definitionDigest, /^[a-f0-9]{64}$/);
 			assert.match(result.contract.launchContractDigest, /^[a-f0-9]{64}$/);
 			assert.ok(result.contract.agent.shadowedCandidates.some((candidate) => candidate.name === "worker" && candidate.source === "builtin"));
 			assert.equal(result.contract.model, "test/primary:high");
-			assert.deepEqual(result.contract.modelCandidates, ["test/primary:high", "test/fallback:high"]);
 			assert.equal(result.contract.thinking, "high");
 			assert.deepEqual(result.contract.skills.requested, ["project-skill"]);
 			assert.equal(result.contract.skills.resolved[0]?.name, "project-skill");
 			assert.deepEqual(result.contract.tools.effectiveAllowlist, ["read"]);
-			assert.deepEqual(result.contract.tools.capabilityAudit?.removedTools, ["write"]);
+			// The bridge adds contact_supervisor before the ceiling applies, exactly as execution does.
+			assert.deepEqual(result.contract.tools.capabilityAudit?.removedTools, ["write", "contact_supervisor"]);
 			assert.equal(result.contract.tools.capabilityAudit?.removedExtensionCount, 1);
+			assert.deepEqual(result.contract.intercomBridge, { mode: "always", active: true });
 			assert.equal(result.contract.tools.disableAmbientExtensions, true);
 			assert.equal(result.contract.roots.sessionFile, path.join(sessionRoot, "run-123", "run-0", "session.jsonl"));
-			assert.equal(result.contract.roots.outputPath, path.join(cwd, ".pi/subagents", "artifacts", "outputs", "run-123", "report.md"));
+			assert.equal(result.contract.roots.outputPath, path.join(TEMP_ARTIFACTS_DIR, "outputs", "run-123", "report.md"));
 			assert.equal(result.contract.roots.lifecycle?.statusPath.endsWith(path.join("run-123", "status.json")), true);
 			assert.equal(result.contract.roots.lifecycle?.eventsPath.endsWith(path.join("run-123", "events.jsonl")), true);
 			assert.equal(result.contract.roots.lifecycle?.processTerminalPath.endsWith(path.join("run-123", "process-terminal.json")), true);
@@ -151,6 +168,285 @@ Project prompt.
 		} finally {
 			handle.dispose();
 		}
+	});
+
+	it("projects concurrent children under distinct run-id roots for an explicit sessionDir", async () => {
+		const cwd = path.join(tempDir, "repo-session-dir-keying");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: worker\ndescription: Project worker\n---\nWorker.\n`);
+		const sessionDir = path.join(tempDir, "caller-sessions");
+		const runIds = ["run-123", "run-456"];
+
+		const projected = await Promise.all(runIds.map((runId) => resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			task: "Inspect the repo",
+			runId,
+			sessionDir,
+		})));
+		assert.ok(projected.every((result) => result.ok));
+		for (const [index, result] of projected.entries()) {
+			if (!result.ok) continue;
+			const runId = runIds[index]!;
+			assert.equal(result.contract.roots.sessionFile, path.join(sessionDir, runId, "run-0", "session.jsonl"));
+			assert.equal(result.contract.roots.sessionDir, path.join(sessionDir, runId, "run-0"));
+			assert.equal(result.contract.roots.sessionRoot, path.join(sessionDir, runId));
+		}
+		assert.notEqual(projected[0]!.contract?.roots.sessionFile, projected[1]!.contract?.roots.sessionFile);
+
+		const withoutRunId = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			task: "Inspect the repo",
+			sessionDir,
+		});
+		assert.equal(withoutRunId.ok, true);
+		if (withoutRunId.ok) {
+			assert.equal(withoutRunId.contract.roots.sessionFile, path.join(sessionDir, "preflight", "run-0", "session.jsonl"));
+			assert.equal(withoutRunId.contract.roots.sessionDir, path.join(sessionDir, "preflight", "run-0"));
+		}
+	});
+
+	it("binds canonical extension metadata into public preflight provenance", async () => {
+		const cwd = path.join(tempDir, "bindings-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "binding-worker.md"), `---\nname: binding-worker\ndescription: Binding worker\n---\nWorker.\n`);
+		const omitted = await resolveSubagentLaunchContract({ agent: "binding-worker", cwd, task: "Inspect" });
+		const bound = await resolveSubagentLaunchContract({ agent: "binding-worker", cwd, task: "Inspect", extensionBindings: { "shepherd.dispatch/1": { writeScope: ["src/a.ts"], role: "coder" } } });
+		assert.equal(omitted.ok, true);
+		assert.equal(bound.ok, true);
+		if (omitted.ok && bound.ok) {
+			assert.notEqual(bound.contract.launchContractDigest, omitted.contract.launchContractDigest);
+		}
+		const invalid = await resolveSubagentLaunchContract({ agent: "binding-worker", cwd, extensionBindings: { invalid: true } });
+		assert.equal(invalid.ok, false);
+		if (!invalid.ok) assert.equal(invalid.code, "invalid_extension_bindings");
+	});
+
+	it("uses the parent provider for provider-scoped agent overrides", async () => {
+		const cwd = path.join(tempDir, "provider-overrides");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeJson(path.join(cwd, ".pi", "settings.json"), {
+			subagents: {
+				agentOverridesByProvider: {
+					"github-copilot": { worker: { model: "github-copilot/gpt-5-mini" } },
+					openrouter: { worker: { model: "openrouter/openai/gpt-5-mini" } },
+				},
+			},
+		});
+		const availableModels = [
+			{ provider: "github-copilot", id: "gpt-5-mini", fullId: "github-copilot/gpt-5-mini" },
+			{ provider: "openrouter", id: "openai/gpt-5-mini", fullId: "openrouter/openai/gpt-5-mini" },
+		];
+
+		const copilot = await resolveSubagentLaunchContract({
+			agent: "worker", cwd, parentModel: { provider: "github-copilot", id: "parent" }, availableModels,
+		});
+		const openrouter = await resolveSubagentLaunchContract({
+			agent: "worker", cwd, preferredProvider: "openrouter", parentModel: { provider: "github-copilot", id: "parent" }, availableModels,
+		});
+		assert.equal(copilot.ok, true);
+		assert.equal(openrouter.ok, true);
+		if (copilot.ok) assert.equal(copilot.contract.model, "github-copilot/gpt-5-mini:high");
+		if (openrouter.ok) assert.equal(openrouter.contract.model, "openrouter/openai/gpt-5-mini:high");
+	});
+
+	it("warns when workspace package work has package-only authority", async () => {
+		const cwd = path.join(tempDir, "workspace-scope-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: worker\ndescription: Project worker\n---\nWorker.\n`);
+
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			task: "Create a new workspace package, but only edit files under packages/widget and do not change root workspace metadata.",
+		});
+
+		assert.equal(result.ok, true);
+		if (result.ok) {
+			assert.equal(result.contract.diagnostics.some((diagnostic) => diagnostic.code === "workspace_scope_authority" && diagnostic.severity === "warning"), true);
+		}
+	});
+
+	it("binds fast mode runtime extension into public preflight provenance", async () => {
+		const cwd = path.join(tempDir, "fast-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "fast-worker.md"), `---
+name: fast-worker
+description: Fast worker
+model: openai-codex/gpt-5.6-luna
+fast: true
+---
+Worker.
+`);
+		const availableModels = [{ provider: "openai-codex", id: "gpt-5.6-luna", fullId: "openai-codex/gpt-5.6-luna" }];
+		const enabled = await resolveSubagentLaunchContract({ agent: "fast-worker", cwd, task: "Run", availableModels });
+		const disabled = await resolveSubagentLaunchContract({ agent: "fast-worker", cwd, task: "Run", availableModels, fast: false });
+
+		assert.equal(enabled.ok, true);
+		assert.equal(disabled.ok, true);
+		if (enabled.ok && disabled.ok) {
+			assert.ok(enabled.contract.tools.runtimeExtensions.some((entry) => entry.endsWith("fast-mode-extension.ts")));
+			assert.equal(disabled.contract.tools.runtimeExtensions.some((entry) => entry.endsWith("fast-mode-extension.ts")), false);
+			assert.notEqual(enabled.contract.launchContractDigest, disabled.contract.launchContractDigest);
+		}
+	});
+
+	it("enforces maxThinking before a child launch and accepts levels at the ceiling", async () => {
+		const cwd = path.join(tempDir, "thinking-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeJson(path.join(cwd, ".pi", "settings.json"), { subagents: { maxThinking: "xhigh" } });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: worker\ndescription: Project worker\nmodel: test/worker\nthinking: xhigh\n---\nWorker.\n`);
+		const accepted = await resolveSubagentLaunchContract({ agent: "worker", cwd, task: "Inspect", availableModels: [{ provider: "test", id: "worker", fullId: "test/worker" }] });
+		assert.equal(accepted.ok, true);
+		if (accepted.ok) assert.equal(accepted.contract.thinkingCeiling, "xhigh");
+		const rejected = await resolveSubagentLaunchContract({ agent: "worker", cwd, task: "Inspect", thinking: "max", availableModels: [{ provider: "test", id: "worker", fullId: "test/worker" }] });
+		assert.equal(rejected.ok, false);
+		if (!rejected.ok) {
+			assert.equal(rejected.code, "thinking_ceiling");
+			assert.match(rejected.message, /max.*xhigh.*worker/);
+		}
+	});
+
+	it("binds the resolved agent outputMode into the launch digest", async () => {
+		const cwd = path.join(tempDir, "repo-output-mode");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+output: report.md
+outputMode: file-only
+---
+Project prompt.
+`);
+
+		const defaultMode = await resolveSubagentLaunchContract({ agent: "worker", cwd });
+		const explicitDefault = await resolveSubagentLaunchContract({ agent: "worker", cwd, outputMode: "file-only" });
+		const override = await resolveSubagentLaunchContract({ agent: "worker", cwd, outputMode: "inline" });
+
+		assert.equal(defaultMode.ok, true);
+		assert.equal(explicitDefault.ok, true);
+		assert.equal(override.ok, true);
+		assert.equal(defaultMode.contract.launchContractDigest, explicitDefault.contract.launchContractDigest);
+		assert.notEqual(defaultMode.contract.launchContractDigest, override.contract.launchContractDigest);
+	});
+
+	it("rejects an unresolved configured model when the host registry is available", async () => {
+		const cwd = path.join(tempDir, "repo-unresolved-model");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+model: fast
+---
+Project prompt.
+`);
+
+		await assert.rejects(
+			resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
+			}),
+			/Unknown subagent model 'fast'/,
+		);
+	});
+
+	it("rejects an explicit per-call unknown model before launch", async () => {
+		const cwd = path.join(tempDir, "repo-explicit-unknown-model");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+model: test/primary
+---
+Project prompt.
+`);
+
+		await assert.rejects(
+			resolveSubagentLaunchContract({
+				agent: "worker",
+				cwd,
+				model: "test/unknown",
+				availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
+			}),
+			/Unknown subagent model 'test\/unknown'/,
+		);
+	});
+
+	it("trusts an inherited parent model outside the host registry", async () => {
+		const cwd = path.join(tempDir, "repo-parent-model");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+---
+Project prompt.
+`);
+
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentModel: { provider: "gateway", id: "parent-model" },
+			availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
+		});
+
+		assert.equal(result.ok, true);
+		assert.equal(result.contract.model, "gateway/parent-model");
+	});
+
+	it("uses subagents.defaultProvider when resolving launch model ids", async () => {
+		const cwd = path.join(tempDir, "repo-default-provider");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeJson(path.join(process.env.HOME!, ".pi", "agent", "settings.json"), {
+			subagents: { defaultProvider: "gpu-b" },
+		});
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+model: gpt-5-mini
+---
+Project prompt.
+`);
+
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentModel: { provider: "openai", id: "gpt-5-mini" },
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "gpu-b", id: "gpt-5-mini", fullId: "gpu-b/gpt-5-mini" },
+			],
+		});
+
+		assert.equal(result.ok, true);
+		assert.equal(result.contract.model, "gpu-b/gpt-5-mini");
+	});
+
+	it("bypasses native model validation for external CLI runners", async () => {
+		const cwd = path.join(tempDir, "repo-external-model");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeJson(path.join(process.env.HOME!, ".pi", "agent", "settings.json"), {
+			subagents: { defaultModel: "mock/default-model" },
+		});
+		writeAgent(path.join(cwd, ".pi", "agents", "external.md"), `---
+name: external
+description: External runner
+runner:
+  type: external-cli
+  command: ${JSON.stringify(process.execPath)}
+---
+Project prompt.
+`);
+
+		const result = await resolveSubagentLaunchContract({
+			agent: "external",
+			cwd,
+			availableModels: [{ provider: "other", id: "known", fullId: "other/known" }],
+		});
+
+		assert.equal(result.ok, true);
+		assert.equal(result.contract.model, undefined);
 	});
 
 	it("resolves agent aliases to the canonical launch contract agent", async () => {
@@ -267,7 +563,137 @@ Project prompt.
 `);
 
 		const missingAgent = await resolveSubagentLaunchContract({ agent: "missing", cwd });
-		assert.deepEqual(missingAgent, { ok: false, code: "missing_agent", message: "Unknown agent: missing", diagnostics: [] });
+		assert.equal(missingAgent.ok, false);
+		assert.equal(missingAgent.code, "missing_agent");
+		assert.deepEqual(missingAgent.diagnostics, []);
+		assert.match(missingAgent.message, /^Unknown agent: missing\nEffective cwd: /);
+		assert.match(missingAgent.message, /Consulted agent-definition directories:/);
+		assert.match(missingAgent.message, /project: .*\.pi[\\/]agents \(1 candidate\)/);
+		assert.match(missingAgent.message, /Discovered agents:\n[\s\S]*worker \(project\)/);
+		writeAgent(path.join(cwd, ".pi", "agents", "broken.md"), `---
+name: broken
+description: Broken worker
+runner:
+  type: unknown
+---
+Broken prompt.
+`);
+		const brokenAgent = await resolveSubagentLaunchContract({ agent: "broken", cwd });
+		assert.equal(brokenAgent.ok, false);
+		assert.equal(brokenAgent.code, "missing_agent");
+		assert.match(brokenAgent.message, /Agent 'broken' has invalid configuration: Agent 'broken' has invalid runner\.type/);
+		assert.deepEqual(brokenAgent.diagnostics, [{ code: "missing_agent", severity: "error", message: brokenAgent.message }]);
+		writeAgent(path.join(cwd, ".pi", "agents", "code-analysis.zeta-worker.md"), `---
+name: zeta-worker
+package: code-analysis
+description: Broken packaged worker
+runner:
+  type: unknown
+---
+Broken prompt.
+`);
+		const brokenPackagedAgent = await resolveSubagentLaunchContract({ agent: "code-analysis.zeta-worker", cwd, agentScope: "project" });
+		assert.equal(brokenPackagedAgent.ok, false);
+		assert.equal(brokenPackagedAgent.code, "missing_agent");
+		assert.match(brokenPackagedAgent.message, /Agent 'code-analysis\.zeta-worker' has invalid configuration: Agent 'zeta-worker' has invalid runner\.type/);
+		assert.deepEqual(brokenPackagedAgent.diagnostics, [{ code: "missing_agent", severity: "error", message: brokenPackagedAgent.message }]);
+		writeAgent(path.join(cwd, ".pi", "agents", "reviewer.md"), `---
+name: reviewer
+description: Broken reviewer
+runner:
+  type: unknown
+---
+Broken prompt.
+`);
+		const brokenReviewer = await resolveSubagentLaunchContract({ agent: "reviewer", cwd, agentScope: "both" });
+		assert.equal(brokenReviewer.ok, false);
+		assert.equal(brokenReviewer.code, "missing_agent");
+		assert.match(brokenReviewer.message, /Agent 'reviewer' has invalid configuration: Agent 'reviewer' has invalid runner\.type/);
+		const spacedBrokenReviewer = await resolveSubagentLaunchContract({ agent: " reviewer ", cwd, agentScope: "both" });
+		assert.equal(spacedBrokenReviewer.ok, false);
+		assert.equal(spacedBrokenReviewer.code, "missing_agent");
+		assert.match(spacedBrokenReviewer.message, /Agent ' reviewer ' has invalid configuration: Agent 'reviewer' has invalid runner\.type/);
+		writeAgent(path.join(process.env.PI_CODING_AGENT_DIR!, "agents", "foo.md"), `---
+name: foo
+description: User foo
+---
+User prompt.
+`);
+		writeAgent(path.join(cwd, ".pi", "agents", "acme.foo.md"), `---
+name: foo
+package: acme
+description: Broken packaged foo
+runner:
+  type: unknown
+---
+Broken prompt.
+`);
+		const localFoo = await resolveSubagentLaunchContract({ agent: "foo", cwd, agentScope: "both" });
+		assert.equal(localFoo.ok, true);
+		const brokenPackagedFoo = await resolveSubagentLaunchContract({ agent: "acme.foo", cwd, agentScope: "both" });
+		assert.equal(brokenPackagedFoo.ok, false);
+		assert.match(brokenPackagedFoo.message, /Agent 'acme\.foo' has invalid configuration: Agent 'foo' has invalid runner\.type/);
+		writeAgent(path.join(process.env.PI_CODING_AGENT_DIR!, "agents", "package-shadow.md"), `---
+name: package-shadow
+description: User package shadow
+---
+User prompt.
+`);
+		writeAgent(path.join(cwd, ".pi", "agents", "package-shadow.md"), `---
+name: package-shadow
+package: !!!
+description: Broken package shadow
+---
+Broken prompt.
+`);
+		const brokenPackageShadow = await resolveSubagentLaunchContract({ agent: "package-shadow", cwd, agentScope: "both" });
+		assert.equal(brokenPackageShadow.ok, false);
+		assert.match(brokenPackageShadow.message, /Agent 'package-shadow' has invalid configuration: Agent 'package-shadow' package is invalid after sanitization/);
+		writeAgent(path.join(cwd, ".agents", "shared.md"), `---
+name: shared
+description: Legacy shared
+---
+Legacy prompt.
+`);
+		writeAgent(path.join(cwd, ".pi", "agents", "shared.md"), `---
+name: shared
+description: Broken canonical shared
+runner:
+  type: unknown
+---
+Broken prompt.
+`);
+		const brokenCanonicalShared = await resolveSubagentLaunchContract({ agent: "shared", cwd, agentScope: "project" });
+		assert.equal(brokenCanonicalShared.ok, false);
+		assert.match(brokenCanonicalShared.message, /Agent 'shared' has invalid configuration: Agent 'shared' has invalid runner\.type/);
+		const packageRoot = path.join(cwd, "package");
+		writeAgent(path.join(packageRoot, "agents", "ambiguous.md"), `---
+name: ambiguous
+package: acme
+description: Package ambiguous
+---
+Package prompt.
+`);
+		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ "pi-subagents": { agents: ["agents"] } }));
+		fs.writeFileSync(path.join(cwd, ".pi", "settings.json"), JSON.stringify({ packages: [packageRoot] }));
+		writeAgent(path.join(process.env.PI_CODING_AGENT_DIR!, "agents", "ambiguous.md"), `---
+name: ambiguous
+description: User ambiguous
+---
+User prompt.
+`);
+		writeAgent(path.join(cwd, ".pi", "agents", "ambiguous.md"), `---
+name: ambiguous
+description: Broken project ambiguous
+runner:
+  type: unknown
+---
+Broken prompt.
+`);
+		const brokenBeforeAmbiguity = await resolveSubagentLaunchContract({ agent: "ambiguous", cwd, agentScope: "both" });
+		assert.equal(brokenBeforeAmbiguity.ok, false);
+		assert.equal(brokenBeforeAmbiguity.code, "missing_agent");
+		assert.match(brokenBeforeAmbiguity.message, /Agent 'ambiguous' has invalid configuration: Agent 'ambiguous' has invalid runner\.type/);
 
 		const missingSkill = await resolveSubagentLaunchContract({ agent: "worker", cwd });
 		assert.equal(missingSkill.ok, false);
@@ -319,15 +745,19 @@ defaultContext: fork
 Project prompt.
 `);
 
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
 		const result = await resolveSubagentLaunchContract({
 			agent: "fanout",
 			cwd,
 			outputSchema: { type: "object", additionalProperties: false },
+			parentSessionFile,
+			parentLeafId: "leaf-current",
 		});
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.context, "fork");
 		assert.ok(result.contract.diagnostics.some((diagnostic) => diagnostic.code === "host_required"));
-		assert.deepEqual(result.contract.tools.declaredBuiltin, ["read", "subagent"]);
+		assert.deepEqual(result.contract.tools.declaredBuiltin, ["read", "subagent", "contact_supervisor"]);
 		assert.equal(result.contract.tools.explicitAllowlist, true);
 		assert.equal(result.contract.tools.fanoutAuthorized, true);
 		assert.deepEqual(result.contract.tools.internalTools, ["structured_output"]);
@@ -339,6 +769,248 @@ Project prompt.
 		assert.ok(result.contract.tools.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("fanout-child.ts")));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/config-ext.ts"));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/subagent-only.ts"));
+	});
+
+	it("inherits agent structured output and honors false for native and external runners", async () => {
+		const cwd = path.join(tempDir, "schema-default-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "typed.md"), `---\nname: typed\ndescription: Typed\noutputSchema: {"type":"object","required":["ok"]}\n---\nPrompt.\n`);
+		const inherited = await resolveSubagentLaunchContract({ agent: "typed", cwd, task: "Inspect" });
+		assert.equal(inherited.ok, true);
+		if (!inherited.ok) return;
+		assert.deepEqual(inherited.contract.tools.internalTools, ["structured_output"]);
+		const disabled = await resolveSubagentLaunchContract({ agent: "typed", cwd, task: "Inspect", outputSchema: false });
+		assert.equal(disabled.ok, true);
+		if (!disabled.ok) return;
+		assert.deepEqual(disabled.contract.tools.internalTools, []);
+		assert.notEqual(inherited.contract.launchContractDigest, disabled.contract.launchContractDigest);
+
+		writeAgent(path.join(cwd, ".pi", "agents", "external.md"), `---\nname: external\ndescription: External\noutputSchema: {"type":"object"}\nrunner:\n  type: external-cli\n  command: ${JSON.stringify(process.execPath)}\n---\nPrompt.\n`);
+		const rejected = await resolveSubagentLaunchContract({ agent: "external", cwd });
+		assert.equal(rejected.ok, false);
+		assert.equal(rejected.code, "unsupported_mode");
+		assert.equal((await resolveSubagentLaunchContract({ agent: "external", cwd, outputSchema: false })).ok, true);
+	});
+
+	it("projects per-agent tool exclusions and binds them into launch identity", async () => {
+		const cwd = path.join(tempDir, "exclude-tools-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+tools: read, write
+excludeTools: write, unknown_tool
+---
+Project prompt.
+`);
+
+		const result = await resolveSubagentLaunchContract({ agent: "worker", cwd, task: "Inspect" });
+		assert.equal(result.ok, true);
+		if (!result.ok) return;
+		assert.deepEqual(result.contract.tools.excludeTools, ["write", "unknown_tool"]);
+		assert.deepEqual(result.contract.tools.effectiveAllowlist, ["read", "contact_supervisor"]);
+		assert.match(result.contract.launchContractDigest, /^[a-f0-9]{64}$/);
+	});
+
+	it("binds Intercom bridge activation into launch identity without touching definition identity", async () => {
+		const cwd = path.join(tempDir, "bridge-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+tools: read
+---
+Project prompt.
+`);
+		const input = { agent: "worker", cwd, task: "Inspect" };
+
+		const base = await resolveSubagentLaunchContract(input);
+		assert.equal(base.ok, true);
+		if (!base.ok) return;
+		assert.deepEqual(base.contract.intercomBridge, { mode: "always", active: true });
+		assert.ok(base.contract.tools.effectiveAllowlist.includes("contact_supervisor"));
+		assert.equal(base.contract.diagnostics.some((diagnostic) => /orchestratorTarget/.test(diagnostic.message)), false);
+
+		// The default template never names the parent session, so a host that
+		// supplies its real target gets the same digest as one that does not.
+		const withTarget = await resolveSubagentLaunchContract({ ...input, orchestratorTarget: "subagent-chat-1234" });
+		assert.equal(withTarget.ok, true);
+		if (!withTarget.ok) return;
+		assert.equal(withTarget.contract.launchContractDigest, base.contract.launchContractDigest);
+
+		const off = await resolveSubagentLaunchContract({ ...input, intercomBridge: { mode: "off" } });
+		assert.equal(off.ok, true);
+		if (!off.ok) return;
+		assert.deepEqual(off.contract.intercomBridge, { mode: "off", active: false });
+		assert.equal(off.contract.tools.effectiveAllowlist.includes("contact_supervisor"), false);
+		assert.notEqual(off.contract.launchContractDigest, base.contract.launchContractDigest);
+		assert.equal(off.contract.agent.definitionDigest, base.contract.agent.definitionDigest);
+
+		// Inactive fork-only for a fresh launch hashes exactly like off: activation, not the mode label, is bound.
+		const forkOnly = await resolveSubagentLaunchContract({ ...input, context: "fresh", intercomBridge: { mode: "fork-only" } });
+		assert.equal(forkOnly.ok, true);
+		if (!forkOnly.ok) return;
+		assert.deepEqual(forkOnly.contract.intercomBridge, { mode: "fork-only", active: false });
+		assert.equal(forkOnly.contract.launchContractDigest, off.contract.launchContractDigest);
+	});
+
+	it("requires a host target only when the bridge instruction file names the session", async () => {
+		const cwd = path.join(tempDir, "bridge-template-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+---
+Project prompt.
+`);
+		const instructionFile = path.join(tempDir, "bridge.md");
+		fs.writeFileSync(instructionFile, "Custom bridge for {orchestratorTarget}\nUse ask then send.\n", "utf-8");
+		const input = { agent: "worker", cwd, task: "Inspect", intercomBridge: { mode: "always" as const, instructionFile } };
+
+		const withoutTarget = await resolveSubagentLaunchContract(input);
+		assert.equal(withoutTarget.ok, true);
+		if (!withoutTarget.ok) return;
+		assert.ok(withoutTarget.contract.diagnostics.some((diagnostic) => diagnostic.code === "host_required" && /orchestratorTarget/.test(diagnostic.message)));
+
+		const withTarget = await resolveSubagentLaunchContract({ ...input, orchestratorTarget: "main" });
+		assert.equal(withTarget.ok, true);
+		if (!withTarget.ok) return;
+		assert.equal(withTarget.contract.diagnostics.some((diagnostic) => /orchestratorTarget/.test(diagnostic.message)), false);
+		assert.notEqual(withTarget.contract.launchContractDigest, withoutTarget.contract.launchContractDigest);
+	});
+
+	it("fails closed for an invalid intercomBridge override", async () => {
+		const cwd = path.join(tempDir, "bridge-invalid-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+---
+Project prompt.
+`);
+		for (const intercomBridge of [{ mode: "loud" }, { extra: true }, "always"]) {
+			const result = await resolveSubagentLaunchContract({ agent: "worker", cwd, intercomBridge: intercomBridge as never });
+			assert.equal(result.ok, false);
+			if (!result.ok) assert.equal(result.code, "invalid_intercom_bridge");
+		}
+		// Execution never has an empty target, so accepting one would silently
+		// deactivate the bridge in preflight only.
+		for (const orchestratorTarget of ["", "   ", 7]) {
+			const result = await resolveSubagentLaunchContract({ agent: "worker", cwd, orchestratorTarget: orchestratorTarget as never });
+			assert.equal(result.ok, false);
+			if (!result.ok) {
+				assert.equal(result.code, "invalid_intercom_bridge");
+				assert.match(result.message, /orchestratorTarget/);
+			}
+		}
+	});
+
+	it("falls back implicit default fork to fresh when the parent session is not forkable", async () => {
+		const cwd = path.join(tempDir, "repo-implicit-fork");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+defaultContext: fork
+---
+Project prompt.
+`);
+
+		const missingSession = await resolveSubagentLaunchContract({ agent: "worker", cwd });
+		assert.equal(missingSession.ok, true);
+		assert.equal(missingSession.contract.context, "fresh");
+
+		const missingFile = path.join(tempDir, "missing-parent.jsonl");
+		const unpersisted = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentSessionFile: missingFile,
+			parentLeafId: "leaf-current",
+		});
+		assert.equal(unpersisted.ok, true);
+		assert.equal(unpersisted.contract.context, "fresh");
+
+		const parentSessionFile = path.join(tempDir, "implicit-parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
+		const missingLeaf = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentSessionFile,
+		});
+		assert.equal(missingLeaf.ok, true);
+		assert.equal(missingLeaf.contract.context, "fresh");
+
+		const explicitFork = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			context: "fork",
+		});
+		assert.equal(explicitFork.ok, true);
+		assert.equal(explicitFork.contract.context, "fork");
+	});
+
+	it("applies defaultSubagentContext fork without overriding explicit fresh", async () => {
+		const cwd = path.join(tempDir, "repo-global-fork");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+defaultContext: fresh
+---
+Project prompt.
+`);
+		writeJson(path.join(process.env.PI_CODING_AGENT_DIR!, "extensions", "subagent", "config.json"), {
+			defaultSubagentContext: "fork",
+		});
+		const parentSessionFile = path.join(tempDir, "global-parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
+
+		const implicit = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentSessionFile,
+			parentLeafId: "leaf-current",
+		});
+		assert.equal(implicit.ok, true);
+		assert.equal(implicit.contract.context, "fork");
+
+		const explicitFresh = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			context: "fresh",
+			parentSessionFile,
+			parentLeafId: "leaf-current",
+		});
+		assert.equal(explicitFresh.ok, true);
+		assert.equal(explicitFresh.contract.context, "fresh");
+
+		const unavailableFork = await resolveSubagentLaunchContract({ agent: "worker", cwd });
+		assert.equal(unavailableFork.ok, true);
+		assert.equal(unavailableFork.contract.context, "fresh");
+	});
+
+	it("applies defaultSubagentContext fresh over an agent fork default", async () => {
+		const cwd = path.join(tempDir, "repo-global-fresh");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+defaultContext: fork
+---
+Project prompt.
+`);
+		writeJson(path.join(process.env.PI_CODING_AGENT_DIR!, "extensions", "subagent", "config.json"), {
+			defaultSubagentContext: "fresh",
+		});
+
+		const implicit = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			parentSessionFile: path.join(tempDir, "global-parent.jsonl"),
+			parentLeafId: "leaf-current",
+		});
+		assert.equal(implicit.ok, true);
+		assert.equal(implicit.contract.context, "fresh");
 	});
 
 	it("fails closed when a capability ceiling denies read required for child skills", async () => {
@@ -364,5 +1036,24 @@ Project prompt.
 		assert.equal(result.ok, false);
 		assert.equal(result.code, "denied_required_tool");
 		assert.match(result.message, /excludes required tool 'read'/);
+	});
+
+	it("reports unresolved runtime-style MCP selectors during preflight", async () => {
+		const cwd = path.join(tempDir, "repo-unresolved-runtime-mcp");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+tools:
+  - read
+  - mcp:rt__wiki/read_wiki_structure
+---
+Project prompt.
+`);
+
+		const result = await resolveSubagentLaunchContract({ agent: "worker", cwd, task: "Inspect" });
+		assert.equal(result.ok, false);
+		assert.equal(result.code, "denied_required_tool");
+		assert.match(result.message, /Unresolved MCP direct-tool selectors: rt__wiki\/read_wiki_structure\./);
 	});
 });

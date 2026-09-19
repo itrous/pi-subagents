@@ -216,7 +216,7 @@ export function watchdogWarningFromLspDiagnostics(result: WatchdogLspResult): Wa
 	return {
 		severity,
 		category: "correctness",
-		confidence: "high",
+		importance: "high",
 		source: "lsp",
 		summary: `LSP found ${count} ${kind}${count === 1 ? "" : "s"} in changed ${count === 1 ? "file" : "files"}.`,
 		evidence: evidence || formatDiagnostic(primary),
@@ -444,6 +444,7 @@ async function collectWithTypeScriptLanguageServer(input: {
 }): Promise<WatchdogLspResult> {
 	const started = Date.now();
 	const child = spawn(input.command.command, input.command.args, {
+		windowsHide: true,
 		cwd: input.root,
 		stdio: "pipe",
 		env: { ...process.env, NO_COLOR: "1" },

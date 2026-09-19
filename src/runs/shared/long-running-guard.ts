@@ -141,17 +141,17 @@ export function isMutatingBashCommand(command: string): boolean {
 		|| MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(command));
 }
 
-export function isMutatingTool(toolName: string | undefined, args: Record<string, unknown> | undefined): boolean {
+export function isMutatingTool(toolName: string | undefined, args: Record<string, unknown> | undefined, mutationTools?: readonly string[]): boolean {
 	if (!toolName) return false;
+	if (mutationTools?.includes(toolName)) return true;
 	if (toolName === "edit" || toolName === "write") return true;
 	if (toolName === "cursor") {
 		const activityTitle = typeof args?.activityTitle === "string" ? args.activityTitle : "";
 		return /^Cursor (?:edit|write)\b/i.test(activityTitle);
 	}
+	if (toolName !== "bash") return false;
 	const command = typeof args?.command === "string" ? args.command : "";
 	if (!command.trim()) return false;
-	if (toolName === "powershell") return true;
-	if (toolName !== "bash") return false;
 	return isMutatingBashCommand(command);
 }
 

@@ -1,14 +1,19 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, listAsyncRuns } from "./async-status.ts";
+import { safeTerminalText } from "../../shared/display-text.ts";
+import { getArtifactPaths, getArtifactsDir } from "../../shared/artifacts.ts";
+import { readFleetTranscript } from "../../tui/fleet-transcript.ts";
+import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, formatWorkflowStageLine, listAsyncRuns } from "./async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript, formatNestedRunTranscript, inspectSubagentFleet } from "./fleet-view.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { formatModelThinking } from "../../shared/formatters.ts";
 import { formatActivityLabel } from "../../shared/status-format.ts";
-import { DIRS, type AsyncStatus, type Details, type ForegroundResumeRun, type NestedRunSummary, type SteeringStatus, type SubagentState } from "../../shared/types.ts";
+import { DIRS, type AsyncStatus, type Details, type ForegroundRunControl, type ForegroundResumeRun, type NestedRunSummary, type SteeringStatus, type SubagentState } from "../../shared/types.ts";
+import { inspectActiveAsyncCapacityOwner, type ActiveAsyncCapacityInspection } from "./active-async-capacity.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts";
+import { normalizeExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { readProcessTerminal, sanitizeProcessTerminal } from "./process-terminal.ts";
 import { formatWaitSubscriptions } from "./wait-subscriptions.ts";
@@ -19,6 +24,15 @@ import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-
 import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedRegistryForRoot, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { readMissionBinding } from "../../missions/lifecycle.ts";
 import { formatWorkflowJsonPreview } from "../../workflows/scripted-workflow.ts";
+import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { formatWorkflowPreflightPlanSummary, formatWorkflowPreflightWarningSummary } from "../../workflows/workflow-preflight.ts";
+import { formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
+import { workflowGraphStageNodes } from "../shared/workflow-graph.ts";
+import { getExternalJobProvider } from "../../api/external-job-provider.ts";
+import { formatTimeoutRecoveryLines } from "../shared/mutation-evidence.ts";
+import { formatWorkflowChecklistText, projectWorkflowChecklist } from "../../workflows/workflow-checklist.ts";
+import { validHostStepNodes } from "../shared/host-step-status.ts";
+import { workflowAsyncChildSteeringGuidance } from "../shared/workflow-async-child-guidance.ts";
 
 interface RunStatusParams {
 	action?: string;
@@ -30,6 +44,69 @@ interface RunStatusParams {
 	lines?: number;
 }
 
+function formatProcessTerminal(value: AsyncStatus["processTerminal"] | undefined): string {
+	if (!value) return "missing";
+	return `${value.state}${value.reason ? ` (${value.reason})` : ""}${value.runnerProcessInstanceId ? ` · runner ${value.runnerProcessInstanceId}` : ""}`;
+}
+
+function debugProcessTerminal(asyncDir: string, status: AsyncStatus): { sidecar?: AsyncStatus["processTerminal"]; overlay?: AsyncStatus["processTerminal"] } {
+	const expected = { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId };
+	return {
+		sidecar: readProcessTerminal(asyncDir, expected),
+		overlay: sanitizeProcessTerminal(status.processTerminal, expected, path.join(asyncDir, "status.json")),
+	};
+}
+
+function formatCapacityOwner(inspect: ActiveAsyncCapacityInspection): string[] {
+	if (!inspect.owner) return [`Active capacity: ${inspect.release.state} — ${inspect.release.reason}`];
+	const owner = inspect.owner;
+	return [
+		`Active capacity: ${inspect.release.state} — ${inspect.release.reason}`,
+		`Capacity owner: ${inspect.relation} slot ${owner.slot}, ${owner.kind}, generation ${owner.generation}`,
+		`Capacity session: ${owner.ownerSessionId}`,
+		owner.sourceRunId ? `Capacity source run: ${owner.sourceRunId}` : undefined,
+		`Capacity async dir: ${owner.asyncDir}`,
+		owner.runnerProcessInstanceId ? `Capacity runner: ${owner.runnerProcessInstanceId}` : undefined,
+		owner.runnerStartedAt !== undefined ? `Capacity runner started: ${new Date(owner.runnerStartedAt).toISOString()}` : undefined,
+	].filter((line): line is string => line !== undefined);
+}
+
+function formatWorkflowDebug(status: AsyncStatus): string[] {
+	if (status.mode !== "workflow" && !status.parentWorkflowRunId && !status.workflowKey && !status.lane) return [];
+	const lines = [
+		status.parentWorkflowRunId ? `Workflow parent: ${status.parentWorkflowRunId}${status.workflowKey ? ` (${status.workflowKey})` : ""}` : undefined,
+		status.mode === "workflow" ? `Workflow children: ${(status.steps ?? []).length}` : undefined,
+		status.lane ? `Lane: ${status.lane.key}${status.lane.mode ? ` (${status.lane.mode})` : ""}` : undefined,
+	].filter((line): line is string => line !== undefined);
+	for (const [index, step] of (status.steps ?? []).entries()) {
+		lines.push(`  ${index + 1}. key ${step.workflowKey ?? "n/a"} · ${runStatusStepDisplayName(step)} · ${step.status} · async ${step.async === undefined ? "unknown" : step.async ? "yes" : "no"}${step.runId ? ` · run ${step.runId}` : ""}${step.lane ? ` · lane ${step.lane.key}` : ""}${step.worktreePath ? ` · worktree ${step.worktreePath} · branch ${step.branch ?? "unknown"}${step.provider ? ` · provider ${step.provider}` : ""}` : ""}`);
+	}
+	return lines;
+}
+
+function formatRunLifecycleDebug(input: { status: AsyncStatus; asyncDir: string; sidecarProcessTerminal: AsyncStatus["processTerminal"] | undefined; overlayProcessTerminal: AsyncStatus["processTerminal"] | undefined; capacity: ActiveAsyncCapacityInspection }): string {
+	const { status, asyncDir, sidecarProcessTerminal, overlayProcessTerminal, capacity } = input;
+	const lines = [
+		"Run lifecycle debug",
+		`Run: ${status.runId}`,
+		`Dir: ${asyncDir}`,
+		`Status file: ${path.join(asyncDir, "status.json")}`,
+		status.workflowReceiptPath ? `Workflow receipt: ${status.workflowReceiptPath}` : undefined,
+		`Process terminal file: ${path.join(asyncDir, "process-terminal.json")}`,
+		`Session: ${status.sessionId ?? "unknown"}`,
+		`State: ${status.state}`,
+		`Mode: ${status.mode}`,
+		status.parentWorkflowRunId ? `Workflow parent: ${status.parentWorkflowRunId}` : undefined,
+		status.workflowKey ? `Workflow key: ${status.workflowKey}` : undefined,
+		status.lane ? `Lane: ${status.lane.key}${status.lane.mode ? ` (${status.lane.mode})` : ""}` : undefined,
+		`Status process terminal: ${formatProcessTerminal(overlayProcessTerminal)}`,
+		`Sidecar process terminal: ${formatProcessTerminal(sidecarProcessTerminal)}`,
+		...formatCapacityOwner(capacity),
+		...formatWorkflowDebug(status),
+	].filter((line): line is string => line !== undefined);
+	return lines.join("\n");
+}
+
 interface RunStatusDeps {
 	asyncDirRoot?: string;
 	resultsDir?: string;
@@ -38,23 +115,29 @@ interface RunStatusDeps {
 	state?: SubagentState;
 	nested?: NestedRunResolutionScope;
 	sessionRoots?: string[];
+	activeCapacityRoot?: string;
+	abandonedSlotReleaseAfterMs?: number | false;
 }
 
 function hasExistingSessionFile(value: unknown): value is string {
 	return typeof value === "string" && fs.existsSync(value);
 }
 
-function formatCheckpointGuidance(runId: string | undefined, checkpoint: AsyncStatus["checkpoint"] | undefined): string | undefined {
-	if (!runId || !checkpoint || checkpoint.status !== "pending") return undefined;
-	return `Checkpoint: ${checkpoint.name}${checkpoint.message ? ` — ${checkpoint.message}` : ""}\nApprove: subagent({ action: "approve-checkpoint", id: "${runId}" })\nReject: subagent({ action: "reject-checkpoint", id: "${runId}" })`;
-}
-
-function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown }>, fallbackSessionFile?: unknown, options: { stopped?: boolean } = {}): string {
+function formatResumeGuidance(runId: string | undefined, children: Array<{ agent?: unknown; sessionFile?: unknown; runId?: unknown; workflowKey?: unknown; status?: unknown; activityState?: unknown }>, fallbackSessionFile?: unknown, options: { stopped?: boolean } = {}): string {
 	if (options.stopped) return "Resume: unavailable; stopped runs are not resumable. Start a new run instead.";
 	const knownChildren = children
 		.map((child, index) => ({ child, index }))
 		.filter(({ child }) => typeof child.agent === "string");
 	if (!runId || knownChildren.length === 0) return "Resume: unavailable; no child session file was persisted.";
+	const workflowChildren = knownChildren.filter(({ child }) => typeof child.runId === "string" && child.runId.trim() && hasExistingSessionFile(child.sessionFile));
+	const supervisorDetachedWorkflowChildren = workflowChildren.filter(({ child }) => child.status === "paused" && child.activityState === "needs_attention");
+	const resumableWorkflowChildren = workflowChildren.filter(({ child }) => !(child.status === "paused" && child.activityState === "needs_attention"));
+	if (workflowChildren.length > 0) {
+		return [
+			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then wait with bg_wait({ id: "${child.runId}" }). Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
+			...resumableWorkflowChildren.map(({ child }) => `Revive workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: subagent({ action: "resume", id: "${child.runId}", message: "..." })`),
+		].join("\n");
+	}
 	const singleSessionFile = knownChildren[0]?.child.sessionFile ?? fallbackSessionFile;
 	if (children.length === 1 && knownChildren.length === 1 && hasExistingSessionFile(singleSessionFile)) {
 		return `Revive: subagent({ action: "resume", id: "${runId}", message: "..." })`;
@@ -80,7 +163,12 @@ function stepLineLabel(status: AsyncStatus, index: number): string {
 	return `Step ${index + 1}`;
 }
 
+function runStatusStepDisplayName(step: { agent: string; sessionName?: string; label?: string }): string {
+	return step.sessionName?.trim() || (step.label ? `${step.label} (${step.agent})` : step.agent);
+}
+
 function nestedRunDisplayName(run: NestedRunSummary): string {
+	if (run.sessionName?.trim()) return run.sessionName.trim();
 	if (run.agent) return run.agent;
 	if (run.agents?.length) return run.agents.join(", ");
 	return run.id;
@@ -91,6 +179,14 @@ function formatSteeringSummary(input: { steering?: SteeringStatus }): string | u
 	if (!steering || steering.requested === 0) return undefined;
 	const lateAcknowledgments = steering.recent.reduce((count, request) => count + request.targets.filter((target) => target.lateDeliveredAt !== undefined).length, 0);
 	return `${steering.requested} requested, ${steering.scheduled} scheduled, ${steering.pending} pending, ${steering.delivered} delivered, ${steering.failed} failed, ${steering.recovered} recovered${lateAcknowledgments ? `, ${lateAcknowledgments} late acknowledged` : ""}`;
+}
+
+function externalJobFollowUpSupported(provider: string): boolean {
+	try {
+		return typeof getExternalJobProvider(provider)?.followUp === "function";
+	} catch {
+		return false;
+	}
 }
 
 function rememberedForegroundChildOutput(child: ForegroundResumeRun["children"][number]): string {
@@ -117,7 +213,7 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 	for (const child of run.children) {
 		const output = rememberedForegroundChildOutput(child).trim().split(/\r?\n/).find((line) => line.trim());
 		const parts = [
-			`${child.index + 1}. ${child.agent} ${child.status}`,
+			`${child.index + 1}. ${child.sessionName?.trim() || child.agent} ${child.status}`,
 			child.exitCode !== undefined ? `exit ${child.exitCode}` : undefined,
 			child.detachedReason ? `detached: ${child.detachedReason}` : undefined,
 			child.acceptance ? `acceptance: ${child.acceptance.status}` : undefined,
@@ -137,14 +233,8 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 	else lines.push(`Transcript: subagent({ action: "status", id: "${run.runId}", index: 0, view: "transcript" })`);
 	const detached = run.children.some((child) => child.status === "detached");
 	const resumable = run.children.find((child) => hasExistingSessionFile(child.sessionFile));
-	if (run.checkpoint?.status === "pending") {
-		lines.push(`Checkpoint: ${run.checkpoint.name}${run.checkpoint.message ? ` — ${run.checkpoint.message}` : ""}`);
-		lines.push(`Approve: subagent({ action: "approve-checkpoint", id: "${run.runId}" })`);
-		lines.push(`Reject: subagent({ action: "reject-checkpoint", id: "${run.runId}" })`);
-		return lines.join("\n");
-	}
 	if (detached) {
-		lines.push(`Recovery: reply to the supervisor request first, then wait with subagent_wait({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
+		lines.push(`Recovery: reply to the supervisor request first, then wait with bg_wait({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
 	} else if (resumable) {
 		lines.push(run.children.length === 1
 			? `Revive: subagent({ action: "resume", id: "${run.runId}", message: "..." })`
@@ -153,6 +243,54 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 		lines.push("Resume: unavailable; no child session file was persisted.");
 	}
 	return lines.join("\n");
+}
+
+/** Request-only snapshot of the same artifact used by Fleet; no session or output fallback. */
+function formatLiveForegroundTranscript(control: ForegroundRunControl, state: SubagentState, options: { index?: number; lines?: number }): string {
+	if (!state.currentSessionId || control.sessionId !== state.currentSessionId) {
+		throw new Error(`Foreground run '${control.runId}' is not owned by the current session.`);
+	}
+	if (options.index !== undefined && (!Number.isInteger(options.index) || options.index < 0)) {
+		throw new Error("Transcript index must be a non-negative integer.");
+	}
+	const children = control.activeChildren
+		? [...control.activeChildren.values()]
+		: control.currentAgent ? [{ index: control.currentIndex ?? 0, agent: control.currentAgent, sessionName: control.sessionName }] : [];
+	const header = [`Run: ${control.runId}`, "State: live foreground"];
+	if (children.length === 0) return `${header.map((line) => safeTerminalText(line)).join("\n")}\nTranscript unavailable: no active foreground child.`;
+	if (options.index === undefined && children.length > 1) {
+		throw new Error(`Transcript view requires index for foreground run '${control.runId}'. Active child indexes: ${children.map((child) => child.index).join(", ")}.`);
+	}
+	const child = options.index === undefined ? children[0]! : children.find((child) => child.index === options.index);
+	if (!child) throw new Error(`Transcript index ${options.index} is not an active foreground child of '${control.runId}'.`);
+	const root = getArtifactsDir(state.parentSessionFile ?? null, control.cwd ?? state.baseCwd, state.artifactDirPreference);
+	const transcriptPath = getArtifactPaths(root, control.runId, child.agent, child.index).transcriptPath;
+	const transcript = readFleetTranscript(transcriptPath, { trustedRoots: [root] });
+	const lineLimit = Number.isFinite(options.lines) ? Math.max(1, Math.min(500, Math.trunc(options.lines!))) : 80;
+	const allLines = transcript.events.flatMap((event) => {
+		const text = event.kind === "tool"
+			? [`Tool: ${event.name} (${event.status})`, event.argsPayload ?? event.args, event.output ?? event.error].filter(Boolean).join("\n")
+			: event.kind === "notice" ? event.text : `${event.kind === "assistant" ? "Assistant" : "Supervisor"}: ${event.text}`;
+		return text.split(/\r?\n/);
+	});
+	let body = allLines.slice(-lineLimit).join("\n");
+	let truncated = transcript.truncated || allLines.length > lineLimit
+		|| transcript.events.some((event) => event.kind === "tool" && event.outputTruncated)
+		|| body.includes("… message truncated");
+	const maxOutputBytes = 32 * 1024;
+	const bytes = Buffer.from(body);
+	if (bytes.length > maxOutputBytes) {
+		// Skip UTF-8 continuation bytes at the beginning of the bounded tail.
+		let start = bytes.length - maxOutputBytes;
+		while ((bytes[start]! & 0xc0) === 0x80) start++;
+		body = bytes.subarray(start).toString("utf-8");
+		truncated = true;
+	}
+	header.push(`Child: ${child.index} (${child.sessionName?.trim() || child.agent})`, `Transcript: ${transcriptPath}`);
+	if (transcript.warning) header.push(`Transcript warning: ${transcript.warning}`);
+	header.push(`Live transcript tail${truncated ? " (tail truncated)" : ""}:`);
+	if (!body) header.push("Transcript unavailable: no readable activity in the bounded artifact tail yet.");
+	return [...header.map((line) => safeTerminalText(line)), body].filter(Boolean).join("\n");
 }
 
 function formatRememberedForegroundTranscript(run: ForegroundResumeRun, options: { index?: number; lines?: number }): string {
@@ -167,7 +305,7 @@ function formatRememberedForegroundTranscript(run: ForegroundResumeRun, options:
 	const lines = [
 		`Run: ${run.runId}`,
 		`State: ${child.status}`,
-		`Child: ${index} (${child.agent})`,
+		`Child: ${index} (${child.sessionName?.trim() || child.agent})`,
 		child.sessionFile ? `Session: ${child.sessionFile}` : undefined,
 		child.transcriptPath ? `Transcript: ${child.transcriptPath}` : undefined,
 		child.artifactPaths?.outputPath ? `Output: ${child.artifactPaths.outputPath}` : undefined,
@@ -177,7 +315,7 @@ function formatRememberedForegroundTranscript(run: ForegroundResumeRun, options:
 	lines.push("Result transcript tail:");
 	if (outputLines.length === 0) lines.push("  (no recovered final output available yet)");
 	else for (const line of outputLines) lines.push(`  ${line}`);
-	return lines.join("\n");
+	return lines.map((line) => safeTerminalText(line)).join("\n");
 }
 
 function formatNestedExactStatus(rootRunId: string, run: NestedRunSummary): string {
@@ -203,7 +341,7 @@ function formatNestedExactStatus(rootRunId: string, run: NestedRunSummary): stri
 		for (const [index, step] of run.steps.entries()) {
 			const activity = step.status === "running" ? formatActivityLabel(step.lastActivityAt, step.activityState) : undefined;
 			const budget = step.turnBudget ? `, turn budget: ${step.turnBudget.turnCount}/${step.turnBudget.maxTurns}+${step.turnBudget.graceTurns} (${step.turnBudget.outcome})` : "";
-			lines.push(`  ${index + 1}. ${step.agent} ${step.status}${activity ? `, ${activity}` : ""}${budget}${step.error ? `, error: ${step.error}` : ""}`);
+			lines.push(`  ${index + 1}. ${step.sessionName?.trim() || step.agent} ${step.status}${activity ? `, ${activity}` : ""}${budget}${step.error ? `, error: ${step.error}` : ""}`);
 			lines.push(...formatNestedRunStatusLines(step.children, { indent: "    ", commandHints: true }));
 		}
 	}
@@ -227,6 +365,12 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		return inspectSubagentFleet(params, { asyncDirRoot, resultsDir, kill: deps.kill, now: deps.now, state: deps.state, childSafe: Boolean(deps.nested) });
 	}
 	if (!params.id && !params.runId && !params.dir) {
+		if (params.view === "transcript" && deps.state?.currentSessionId) {
+			const controls = [...deps.state.foregroundControls.values()].filter((control) => control.sessionId === currentSessionId);
+			const foreground = controls.find((control) => control.runId === deps.state?.lastForegroundControlId)
+				?? controls.sort((left, right) => right.updatedAt - left.updatedAt)[0];
+			if (foreground) return inspectSubagentStatus({ ...params, id: foreground.runId }, deps);
+		}
 		if (deps.nested) {
 			return {
 				content: [{ type: "text", text: "Child-safe subagent status requires an id when no foreground run is active." }],
@@ -262,9 +406,18 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 	let location;
 	try {
 		const requestedId = params.id ?? params.runId;
-		if (!params.dir && requestedId) {
+		if (params.action === "debug.run") {
+			location = resolveAsyncRunLocation(params, asyncDirRoot, resultsDir);
+		} else if (!params.dir && requestedId) {
 			const resolved = resolveSubagentRunId(requestedId, { asyncDirRoot, resultsDir, state: deps.state, nested: deps.nested });
 			if (resolved?.kind === "foreground") {
+				const control = deps.state?.foregroundControls.get(resolved.id);
+				if (control && deps.state && params.view === "transcript") {
+					return {
+						content: [{ type: "text", text: formatLiveForegroundTranscript(control, deps.state, params) }],
+						details: { mode: "management", results: [] },
+					};
+				}
 				const run = deps.state?.foregroundRuns?.get(resolved.id);
 				if (run) {
 					try {
@@ -330,6 +483,14 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		}
 		const status = reconciliation.status;
 		if (!status && diskStatus?.displayDismissedAt !== undefined) {
+			if (params.action === "debug.run") {
+				const { sidecar, overlay } = debugProcessTerminal(asyncDir, diskStatus);
+				const capacity = inspectActiveAsyncCapacityOwner({ runId: diskStatus.runId, sessionId: diskStatus.sessionId, asyncDir }, { rootDir: deps.activeCapacityRoot, liveWorkflowRunIds: new Set(deps.state?.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: deps.abandonedSlotReleaseAfterMs });
+				return {
+					content: [{ type: "text", text: formatRunLifecycleDebug({ status: diskStatus, asyncDir, sidecarProcessTerminal: sidecar, overlayProcessTerminal: overlay, capacity }) }],
+					details: { mode: "single", results: [], ...(diskStatus.workflowReceiptPath ? { workflowReceiptPath: diskStatus.workflowReceiptPath } : {}), ...((sidecar ?? overlay) ? { lifecycleStatus: { processTerminal: sidecar ?? overlay } } : {}) },
+				};
+			}
 			if (params.view === "transcript") {
 				if (currentSessionId && diskStatus.sessionId !== currentSessionId) {
 					return {
@@ -349,6 +510,14 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		const logPath = path.join(asyncDir, `subagent-log-${effectiveRunId}.md`);
 		const eventsPath = path.join(asyncDir, "events.jsonl");
 		if (status) {
+			if (params.action === "debug.run") {
+				const { sidecar, overlay } = debugProcessTerminal(asyncDir, status);
+				const capacity = inspectActiveAsyncCapacityOwner({ runId: status.runId, sessionId: status.sessionId, asyncDir }, { rootDir: deps.activeCapacityRoot, liveWorkflowRunIds: new Set(deps.state?.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: deps.abandonedSlotReleaseAfterMs });
+				return {
+					content: [{ type: "text", text: formatRunLifecycleDebug({ status, asyncDir, sidecarProcessTerminal: sidecar, overlayProcessTerminal: overlay, capacity }) }],
+					details: { mode: "single", results: [], ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...((sidecar ?? overlay) ? { lifecycleStatus: { processTerminal: sidecar ?? overlay } } : {}) },
+				};
+			}
 			if (params.view === "transcript") {
 				if (currentSessionId && status.sessionId !== currentSessionId) {
 					return {
@@ -381,6 +550,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				currentStep: status.currentStep,
 				chainStepCount: status.chainStepCount,
 				parallelGroups: status.parallelGroups,
+				workflowGraph: status.workflowGraph,
 				steps: (status.steps ?? []).map((step, index) => ({ index, agent: step.agent, status: step.status })),
 			});
 			const started = new Date(status.startedAt).toISOString();
@@ -389,6 +559,8 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			const steeringText = formatSteeringSummary(status);
 			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId })
 				?? sanitizeProcessTerminal(status.processTerminal, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId }, path.join(asyncDir, "status.json"));
+			const runFanoutBudgetDescriptor = readRunFanoutBudgetDescriptor(asyncDir);
+			const runFanoutBudget = runFanoutBudgetDescriptor ? getRunFanoutBudgetSnapshot(runFanoutBudgetDescriptor) : status.runFanoutBudget;
 			let missionId: string | undefined;
 			try {
 				missionId = readMissionBinding(asyncDir)?.missionId;
@@ -410,10 +582,21 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				statusActivityText ? `Activity: ${statusActivityText}` : undefined,
 				steeringText ? `Steering: ${steeringText}` : undefined,
 				`Mode: ${status.mode}`,
+				...(status.preflight ? [formatWorkflowPreflightPlanSummary(status.preflight)] : []),
+				...(status.workflow?.preflightWarnings?.length ? [formatWorkflowPreflightWarningSummary(status.workflow.preflightWarnings)] : []),
+				runFanoutBudget ? formatRunFanoutBudget(runFanoutBudget) : undefined,
 				status.parentWorkflowRunId ? `Workflow parent: ${status.parentWorkflowRunId}${status.workflowKey ? ` (${status.workflowKey})` : ""}` : undefined,
 				status.mode === "workflow" && workflowReturnPreview !== undefined ? `Return: ${workflowReturnPreview}` : undefined,
 				status.mode === "workflow" && workflowEmitPreview !== undefined ? `Latest emit: ${workflowEmitPreview}` : undefined,
 				`Progress: ${progressLabel}`,
+				...(status.mode === "workflow" ? formatWorkflowChecklistText(projectWorkflowChecklist({
+					graph: status.workflowGraph,
+					steps: status.steps,
+					hostSteps: validHostStepNodes(status.workflowGraph),
+					preflight: status.preflight,
+					trace: status.workflow?.trace,
+					now: status.lastUpdate ?? status.endedAt ?? Date.now(),
+				}), "", { includeItems: false }) : []),
 				status.pendingAppends ? `Pending appends: ${status.pendingAppends}` : undefined,
 				`Started: ${started}`,
 				`Updated: ${updated}`,
@@ -424,6 +607,12 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				reconciliation.message ? `Diagnosis: ${reconciliation.message}` : undefined,
 				reconciliation.resultPath && fs.existsSync(reconciliation.resultPath) ? `Result: ${reconciliation.resultPath}` : undefined,
 			].filter((line): line is string => Boolean(line));
+			const liveWorkflowControls = status.mode === "workflow" && deps.state?.currentSessionId === status.sessionId && deps.state?.workflowControllers?.has(status.runId)
+				? [...(deps.state?.foregroundControls.values() ?? [])].filter((control) => control.parentWorkflowRunId === status.runId
+					&& control.sessionId === status.sessionId
+					&& (control.activeChildren?.size ?? 0) > 0)
+				: [];
+			let hasExternalJobFollowUpHint = false;
 			for (const [index, step] of (status.steps ?? []).entries()) {
 				const stepActivityText = step.status === "running" ? formatActivityLabel(step.lastActivityAt, step.activityState) : undefined;
 				const modelThinking = formatModelThinking(step.model, step.thinking);
@@ -433,47 +622,106 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				const errorText = step.error ? `, error: ${step.error}` : "";
 				const acceptanceText = step.acceptance?.status ? `, acceptance: ${step.acceptance.status}` : "";
 				const budgetText = step.turnBudget ? `, turn budget: ${step.turnBudget.turnCount}/${step.turnBudget.maxTurns}+${step.turnBudget.graceTurns} (${step.turnBudget.outcome})` : "";
-				const display = step.label ? `${step.label} (${step.agent})` : step.agent;
+				const display = runStatusStepDisplayName(step);
 				const phase = step.phase ? `[${step.phase}] ` : "";
 				lines.push(`${stepLineLabel(status, index)}: ${phase}${display} ${step.status}${modelText}${stepActivityText ? `, ${stepActivityText}` : ""}${steeringSuffix}${acceptanceText}${budgetText}${errorText}`);
+				if (status.mode === "workflow" && step.runId) lines.push(`  Child run: ${step.runId}`);
+				const structuredOutputPreview = step.structuredOutput === undefined ? undefined : formatWorkflowJsonPreview(step.structuredOutput, 4_000);
+				if (structuredOutputPreview !== undefined) lines.push(`  Structured output: ${structuredOutputPreview}`);
+				if (step.structuredOutputPath) lines.push(`  Structured output path: ${step.structuredOutputPath}`);
+				lines.push(...formatTimeoutRecoveryLines(step.timeoutRecovery, "  "));
 				if (step.runner?.type === "external-cli") {
-					lines.push(`  Runner: external-cli (${step.runner.command}${step.runner.args.length ? ` ${step.runner.args.join(" ")}` : ""})`);
+					const runner = normalizeExternalCliRunnerStatus(step.runner);
+					if (runner) {
+						lines.push(`  Runner: external-cli (${runner.command}${runner.args.length ? ` ${runner.args.join(" ")}` : ""})`);
+						lines.push(`  Adapter: ${runner.adapter.id} v${runner.adapter.version} (${runner.adapter.executionMode})`);
+						if (runner.safety) {
+							if ("approvalPolicy" in runner.safety) lines.push(`  Safety: ${"access" in runner.safety ? `access=${runner.safety.access}, ` : ""}sandbox=${runner.safety.sandbox}, approval=${runner.safety.approvalPolicy}, ephemeral=${runner.safety.ephemeral}`);
+							else if ("mode" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, mode=${runner.safety.mode}, sandbox=${runner.safety.sandbox}, workspaceTrust=${runner.safety.workspaceTrust}, sessionReuse=${runner.safety.sessionReuse}`);
+							else if ("authentication" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, settingsTrust=${runner.safety.userSettingsTrust}, persistence=${runner.safety.sessionPersistence}`);
+							else lines.push(`  Safety: access=read-only, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, persistence=${runner.safety.sessionPersistence}`);
+						}
+						lines.push(`  Capabilities: stop=${runner.capabilities.stop}, steer=false, resume=false, structuredOutput=false, toolEvents=false, supervisor=unsupported, forkContext=false, extensionBindings=false`);
+						lines.push(`  Unsupported steer: ${runner.unsupportedReasons.steer}`);
+						lines.push(`  Unsupported resume: ${runner.nonResumableReason}`);
+						lines.push(`  Unsupported supervisor: ${runner.unsupportedReasons.supervisor}`);
+						lines.push(`  Context handoff: fresh only (${runner.unsupportedReasons.forkContext})`);
+					} else {
+						lines.push("  Runner: external-cli (invalid persisted runner metadata)");
+					}
 					if (step.externalProcess?.pid !== undefined) lines.push(`  Process: ${step.externalProcess.pid}`);
-					if (step.externalProcess) lines.push(`  Stdout: ${step.externalProcess.stdoutPath}`, `  Stderr: ${step.externalProcess.stderrPath}`);
+					if (step.externalProcess) {
+						lines.push(`  Stdout: ${step.externalProcess.stdoutPath}`, `  Stderr: ${step.externalProcess.stderrPath}`);
+						if (step.externalProcess.finalOutputPath) lines.push(`  Final output: ${step.externalProcess.finalOutputPath}`);
+					}
+				} else if (step.runner?.type === "external-job") {
+					lines.push(`  Runner: external-job (${step.runner.provider})`);
+					if (step.externalJob?.providerJobId) lines.push(`  Provider job: ${step.externalJob.providerJobId}`);
+					if (step.externalJob?.state) lines.push(`  Provider state: ${step.externalJob.state}`);
+					if (step.externalJob?.conversationUrl) lines.push(`  Conversation: ${step.externalJob.conversationUrl}`);
+					if (step.externalJob?.resultArtifactPath) lines.push(`  Result artifact: ${step.externalJob.resultArtifactPath}`);
+					if ((step.status === "complete" || step.status === "completed") && step.externalJob?.state === "completed" && step.externalJob.providerJobId && externalJobFollowUpSupported(step.runner.provider)) {
+						hasExternalJobFollowUpHint = true;
+						lines.push(`  Follow-up: subagent({ action: "resume", id: "${status.runId}", index: ${index}, message: "..." })`);
+					}
 				}
 				lines.push(...formatNestedRunStatusLines(step.children, { indent: "  ", commandHints: true, maxLines: 20 }));
 				const stepOutputPath = path.join(asyncDir, `output-${index}.log`);
 				if (stepOutputPath !== outputPath && fs.existsSync(stepOutputPath)) lines.push(`  Output: ${stepOutputPath}`);
-				if (step.status === "running" && step.runner?.type !== "external-cli") {
+				if (step.status === "running" && step.runner?.type !== "external-cli" && step.runner?.type !== "external-job" && status.mode !== "workflow") {
 					lines.push(`  Intercom target: ${resolveSubagentIntercomTarget(status.runId, step.agent, index)} (if registered)`);
 					lines.push(`  Steer: subagent({ action: "steer", id: "${status.runId}", index: ${index}, message: "..." })`);
-				} else if (step.status === "running" && step.runner?.type === "external-cli") {
-					lines.push("  Steer: unavailable; one-shot external CLI runners do not accept live messages.");
+				} else if (step.status === "running" && (step.runner?.type === "external-cli" || step.runner?.type === "external-job")) {
+					lines.push("  Steer: unavailable; external runners do not accept live messages.");
 				}
+			}
+			const loadedWorkflowKeys = new Set((status.steps ?? []).flatMap((step) => step.workflowKey ? [step.workflowKey] : []));
+			const graphStages = status.mode === "workflow" ? workflowGraphStageNodes(status.workflowGraph) : [];
+			for (const [index, node] of graphStages.entries()) {
+				if (!loadedWorkflowKeys.has(node.id)) lines.push(`  ${formatWorkflowStageLine(node, index, graphStages.length)}`);
 			}
 			const attached = new Set((status.steps ?? []).flatMap((step) => step.children?.map((child) => child.id) ?? []));
 			const unattached = nestedChildren.filter((child) => !attached.has(child.id));
 			lines.push(...formatNestedRunStatusLines(unattached, { indent: "", commandHints: true, maxLines: 20 }));
+			if (status.mode === "workflow" && status.state === "running") {
+				if (liveWorkflowControls.length === 0) lines.push("Steer: unavailable; no live foreground route is registered in the active session.");
+				else for (const control of liveWorkflowControls) {
+					for (const index of [...control.activeChildren!.keys()].sort((left, right) => left - right)) {
+						lines.push(`Steer live foreground child: subagent({ action: "steer", id: "${control.runId}", index: ${index}, message: "..." })`);
+					}
+				}
+				lines.push(...workflowAsyncChildSteeringGuidance(status, deps.state));
+			}
 			if (nestedWarning) lines.push(`Warning: ${nestedWarning}`);
+			if (status.workflowReceiptPath) lines.push(`Workflow receipt: ${status.workflowReceiptPath}`);
 			if (status.sessionFile) lines.push(`Session: ${status.sessionFile}`);
-			const allExternal = (status.steps?.length ?? 0) > 0 && status.steps!.every((step) => step.runner?.type === "external-cli");
-			if (status.state === "running" && !allExternal) lines.push(`Steer running child: subagent({ action: "steer", id: "${status.runId}", message: "..." })`);
+			const allExternal = (status.steps?.length ?? 0) > 0 && status.steps!.every((step) => step.runner?.type === "external-cli" || step.runner?.type === "external-job");
+			if (status.state === "running" && !allExternal && status.mode !== "workflow") lines.push(`Steer running child: subagent({ action: "steer", id: "${status.runId}", message: "..." })`);
 			if (status.state !== "running") {
 				lines.push(allExternal
-					? "Resume: unavailable; one-shot external CLI runners do not persist sessions."
-					: formatCheckpointGuidance(status.runId, status.checkpoint) ?? formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile, { stopped: status.state === "stopped" || status.stopped === true }));
+					? hasExternalJobFollowUpHint ? "Resume: use the external-job follow-up hint above." : "Resume: unavailable; external runners do not persist Pi sessions."
+					: formatResumeGuidance(status.runId, status.steps ?? [], status.sessionFile, { stopped: status.state === "stopped" || status.stopped === true }));
 			}
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);
 			if (fs.existsSync(eventsPath)) lines.push(`Events: ${eventsPath}`);
 
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
+			const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
+			if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
 		}
 	}
 
 	if (resultPath) {
+		if (params.action === "debug.run") {
+			return {
+				content: [{ type: "text", text: "Run lifecycle debug needs an async run directory with status.json." }],
+				isError: true,
+				details: { mode: "single", results: [] },
+			};
+		}
 		try {
 			const raw = fs.readFileSync(resultPath, "utf-8");
-			const data = JSON.parse(raw) as { id?: string; runId?: string; toolCallId?: string; agent?: string; success?: boolean; summary?: string; output?: string; exitCode?: number; state?: string; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; processSignal?: string | null; sessionFile?: string; parallelHandoff?: { path?: string }; results?: Array<{ agent?: string; output?: string; summary?: string; sessionFile?: string; state?: string; success?: boolean; exitCode?: number | null; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; interrupted?: boolean; processSignal?: string | null }> };
+			const data = JSON.parse(raw) as { id?: string; runId?: string; toolCallId?: string; agent?: string; success?: boolean; summary?: string; output?: string; exitCode?: number; state?: string; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; processSignal?: string | null; sessionFile?: string; timeoutRecovery?: unknown; parallelHandoff?: { path?: string }; results?: Array<{ agent?: string; sessionName?: string; runId?: string; workflowKey?: string; output?: string; summary?: string; sessionFile?: string; state?: string; success?: boolean; exitCode?: number | null; stopped?: boolean; timedOut?: boolean; turnBudgetExceeded?: boolean; interrupted?: boolean; processSignal?: string | null; timeoutRecovery?: unknown }> };
 			if (params.view === "transcript") {
 				try {
 					return { content: [{ type: "text", text: formatAsyncResultTranscript(data, resultPath, { index: params.index, lines: params.lines }) }], details: { mode: "single", results: [] } };
@@ -500,10 +748,26 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			const runId = data.runId ?? data.id ?? resolvedId;
 			const lines = [`Run: ${runId}`, data.toolCallId ? `Tool call: ${data.toolCallId}` : undefined, `State: ${status}`, `Result: ${resultPath}`].filter((line): line is string => Boolean(line));
 			if (data.parallelHandoff?.path) lines.push(`Parallel handoff: ${data.parallelHandoff.path}`);
+			const receipt = (data as Record<string, unknown>).workflowReceipt;
+			const receiptPath = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+				? (receipt as Record<string, unknown>).path : undefined;
+			const workflowReceiptPath = typeof receiptPath === "string" && receiptPath ? receiptPath : undefined;
+			if (workflowReceiptPath) lines.push(`Workflow receipt: ${workflowReceiptPath}`);
 			const children = Array.isArray(data.results) ? data.results : data.agent ? [{ agent: data.agent, sessionFile: data.sessionFile }] : [];
+			lines.push(...formatTimeoutRecoveryLines(data.timeoutRecovery, "  "));
+			for (const [index, child] of children.entries()) {
+				const structuredOutput = (child as { structuredOutput?: unknown }).structuredOutput;
+				const structuredOutputPreview = structuredOutput === undefined ? undefined : formatWorkflowJsonPreview(structuredOutput, 4_000);
+				if (structuredOutputPreview !== undefined) lines.push(`  Structured output${children.length > 1 ? ` (${index + 1})` : ""}: ${structuredOutputPreview}`);
+				const structuredOutputPath = (child as { structuredOutputPath?: unknown }).structuredOutputPath;
+				if (typeof structuredOutputPath === "string" && structuredOutputPath.trim()) lines.push(`  Structured output path${children.length > 1 ? ` (${index + 1})` : ""}: ${structuredOutputPath}`);
+				lines.push(...formatTimeoutRecoveryLines(child.timeoutRecovery, "  "));
+			}
 			lines.push(formatResumeGuidance(runId, children, data.sessionFile, { stopped: status === "stopped" }));
 			if (data.summary) lines.push("", data.summary);
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [] } };
+			const workflowChildren = parseWorkflowChildSummary((data as unknown as Record<string, unknown>).workflowChildren);
+			if (workflowChildren && workflowChildren.workflowRunId !== runId) throw new Error("workflowChildren.workflowRunId does not match the result run id.");
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(workflowReceiptPath ? { workflowReceiptPath } : {}), ...(workflowChildren ? { workflowChildren } : {}) } };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return {

@@ -8,7 +8,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
-import { findNearestStandardProjectRoot } from "./agents.ts";
 
 export type SkillSource =
 	| "project"
@@ -21,7 +20,7 @@ export type SkillSource =
 	| "builtin"
 	| "unknown";
 
-export interface ResolvedSkill {
+interface ResolvedSkill {
 	name: string;
 	path: string;
 	content: string;
@@ -143,7 +142,7 @@ function getGlobalNpmRoot(): string | null {
 	}
 
 	try {
-		cachedGlobalNpmRoot = fs.realpathSync(execSync("npm root -g", { encoding: "utf-8", timeout: 5000 }).trim());
+		cachedGlobalNpmRoot = fs.realpathSync(execSync("npm root -g", { encoding: "utf-8", timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }).trim());
 		return cachedGlobalNpmRoot;
 	} catch {
 		// Global npm root is optional in constrained environments.
@@ -588,11 +587,10 @@ function readSkill(
 	skillName: string,
 	skillPath: string,
 	source: SkillSource,
-	useCache = true,
 ): ResolvedSkill | undefined {
 	try {
 		const stat = fs.statSync(skillPath);
-		const cached = useCache ? skillCache.get(skillPath) : undefined;
+		const cached = skillCache.get(skillPath);
 		if (cached && cached.mtime === stat.mtimeMs) {
 			return cached.skill;
 		}
@@ -608,12 +606,10 @@ function readSkill(
 			source,
 		};
 
-		if (useCache) {
-			skillCache.set(skillPath, { mtime: stat.mtimeMs, skill });
-			if (skillCache.size > MAX_CACHE_SIZE) {
-				const firstKey = skillCache.keys().next().value;
-				if (firstKey) skillCache.delete(firstKey);
-			}
+		skillCache.set(skillPath, { mtime: stat.mtimeMs, skill });
+		if (skillCache.size > MAX_CACHE_SIZE) {
+			const firstKey = skillCache.keys().next().value;
+			if (firstKey) skillCache.delete(firstKey);
 		}
 
 		return skill;
@@ -664,80 +660,6 @@ export function resolveSkills(
 	return { resolved, missing };
 }
 
-/**
- * Resolve only conventional project-owned skills, rereading discovery metadata and
- * bytes on every call. Active-bound launch uses this to avoid settings/package refs
- * and both process-global skill caches.
- */
-export function resolveProjectSkillsUncached(
-	skillNames: string[],
-	cwd: string,
-): { resolved: ResolvedSkill[]; missing: string[] } {
-	const projectRoot = findNearestStandardProjectRoot(cwd) ?? cwd;
-	const projectRoots = [path.join(projectRoot, ".pi", "skills"), path.join(projectRoot, ".agents", "skills")]
-		.flatMap((root) => {
-			try {
-				if (fs.lstatSync(root).isSymbolicLink()) return [];
-				const realRoot = fs.realpathSync(root);
-				return path.resolve(root) === realRoot ? [realRoot] : [];
-			} catch { return []; }
-		});
-	const byName = new Map<string, CachedSkillEntry>();
-	let order = 0;
-	const visit = (root: string, directory: string): void => {
-		let children: fs.Dirent[];
-		try { children = fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0); }
-		catch { return; }
-		const skillEntry = children.find((entry) => entry.name === "SKILL.md");
-		if (skillEntry) {
-			if (!skillEntry.isFile()) return;
-			const filePath = path.join(directory, skillEntry.name);
-			try {
-				if (fs.lstatSync(filePath).isSymbolicLink() || !fs.lstatSync(filePath).isFile()) return;
-				const realFile = fs.realpathSync(filePath);
-				if (!isWithinPath(realFile, root)) return;
-			} catch { return; }
-			const entry: CachedSkillEntry = { name: path.basename(directory), filePath, source: "project", order: order++ };
-			const current = byName.get(entry.name);
-			byName.set(entry.name, chooseHigherPrioritySkill(current, entry));
-			return;
-		}
-		for (const child of children) {
-			if (child.name.startsWith(".") || child.name === "node_modules") continue;
-			const childPath = path.join(directory, child.name);
-			if (child.isDirectory()) {
-				visit(root, childPath);
-				continue;
-			}
-			if (!child.isFile() || !child.name.toLowerCase().endsWith(".md")) continue;
-			try {
-				const stat = fs.lstatSync(childPath);
-				if (!stat.isFile() || stat.isSymbolicLink() || !isWithinPath(fs.realpathSync(childPath), root)) continue;
-			} catch { continue; }
-			const entry: CachedSkillEntry = {
-				name: path.basename(child.name, path.extname(child.name)), filePath: childPath, source: "project", order: order++,
-			};
-			const current = byName.get(entry.name);
-			byName.set(entry.name, chooseHigherPrioritySkill(current, entry));
-		}
-	};
-	for (const root of projectRoots) visit(root, root);
-	const resolved: ResolvedSkill[] = [];
-	const missing: string[] = [];
-	for (const name of skillNames) {
-		const trimmed = name.trim();
-		if (!trimmed || trimmed === SUBAGENT_ORCHESTRATION_SKILL) {
-			if (trimmed) missing.push(trimmed);
-			continue;
-		}
-		const entry = byName.get(trimmed);
-		const skill = entry ? readSkill(trimmed, entry.filePath, entry.source, false) : undefined;
-		if (skill) resolved.push(skill);
-		else missing.push(trimmed);
-	}
-	return { resolved, missing };
-}
-
 export function resolveSkillsWithFallback(
 	skillNames: string[],
 	primaryCwd: string,
@@ -754,21 +676,6 @@ export function resolveSkillsWithFallback(
 		resolved: [...primary.resolved, ...fallback.resolved],
 		missing: fallback.missing,
 	};
-}
-
-export function buildBoundSkillInjection(skills: ResolvedSkill[]): string {
-	if (skills.length === 0) return "";
-	const lines = ["The following project skills are materialized for this bound launch.", "<bound_skills>"];
-	for (const skill of skills) {
-		lines.push("  <skill>");
-		lines.push(`    <name>${escapeXmlText(skill.name)}</name>`);
-		lines.push(`    <description>${escapeXmlText(skill.description ?? "")}</description>`);
-		lines.push(`    <location>${escapeXmlText(skill.path)}</location>`);
-		lines.push(`    <content>${escapeXmlText(skill.content)}</content>`);
-		lines.push("  </skill>");
-	}
-	lines.push("</bound_skills>");
-	return lines.join("\n");
 }
 
 export function buildSkillInjection(skills: ResolvedSkill[]): string {

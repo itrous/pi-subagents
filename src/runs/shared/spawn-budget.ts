@@ -82,52 +82,6 @@ export function reserveSpawnBudget(
 	return { snapshot: getSpawnBudgetSnapshot(state, config, sessionId) };
 }
 
-/** Roll back only an immediately preceding bound reservation, before spawn commit. */
-export function rollbackSpawnBudget(
-	state: SubagentState,
-	config: ExtensionConfig,
-	sessionId: string | null,
-	requested: number,
-): SpawnBudgetSnapshot {
-	const counters = state.subagentSpawns;
-	if (requested > 0 && counters?.sessionId === sessionId && counters.count >= requested) counters.count -= requested;
-	return getSpawnBudgetSnapshot(state, config, sessionId);
-}
-
-export interface TransactionalSpawnBudgetReservation {
-	snapshot: SpawnBudgetSnapshot;
-	commit(): void;
-	rollback(): SpawnBudgetSnapshot;
-	committed(): boolean;
-}
-
-export function reserveTransactionalSpawnBudget(
-	state: SubagentState,
-	config: ExtensionConfig,
-	sessionId: string | null,
-	requested: number,
-): { reservation?: TransactionalSpawnBudgetReservation; snapshot: SpawnBudgetSnapshot; error?: string } {
-	const reserved = reserveSpawnBudget(state, config, sessionId, requested);
-	if (reserved.error) return reserved;
-	let committed = false;
-	let rolledBack = false;
-	let snapshot = reserved.snapshot;
-	const reservedCounters = state.subagentSpawns;
-	const counterReserved = requested > 0 && reserved.snapshot.limit !== null;
-	const reservation: TransactionalSpawnBudgetReservation = {
-		snapshot: reserved.snapshot,
-		commit: () => { if (!rolledBack) committed = true; },
-		rollback: () => {
-			if (committed || rolledBack) return snapshot;
-			rolledBack = true;
-			if (counterReserved && state.subagentSpawns === reservedCounters) snapshot = rollbackSpawnBudget(state, config, sessionId, requested);
-			return snapshot;
-		},
-		committed: () => committed,
-	};
-	return { snapshot: reserved.snapshot, reservation };
-}
-
 export function preflightSpawnBudgetGrant(
 	state: SubagentState,
 	config: ExtensionConfig,

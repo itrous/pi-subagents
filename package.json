@@ -1,6 +1,7 @@
 {
   "name": "pi-subagents",
-  "version": "0.47.1",
+  "version": "0.69.0",
+  "private": true,
   "description": "Pi extension for single-agent delegation and scripted multi-agent workflows",
   "author": "Nico Bailon",
   "license": "MIT",
@@ -8,23 +9,27 @@
   "exports": {
     ".": "./index.ts",
     "./background-work": "./src/api/background-work.ts",
+    "./external-job-provider": "./src/api/external-job-provider.ts",
     "./external-runs": "./src/api/external-runs.ts",
+    "./agents": "./src/api/agents.ts",
     "./delegation": "./src/api/delegation.ts",
     "./capability-ceiling": "./src/api/capability-ceiling.ts",
+    "./workflow-resources": "./src/api/workflow-resources.ts",
+    "./required-child-extensions": "./src/api/required-child-extensions.ts",
     "./preflight": "./src/api/preflight.ts",
     "./control-channel": "./src/api/control-channel.ts",
     "./intercom-bridge": "./src/api/intercom-bridge.ts",
-    "./pi-args": "./src/api/pi-args.ts",
+    "./child-tool-plan": "./src/api/child-tool-plan.ts",
     "./shared-types": "./src/api/shared-types.ts",
     "./project-panes": "./src/api/project-panes.ts"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/itrous/pi-subagents.git"
+    "url": "git+https://github.com/nicobailon/pi-subagents.git"
   },
-  "homepage": "https://github.com/itrous/pi-subagents#readme",
+  "homepage": "https://github.com/nicobailon/pi-subagents#readme",
   "bugs": {
-    "url": "https://github.com/itrous/pi-subagents/issues"
+    "url": "https://github.com/nicobailon/pi-subagents/issues"
   },
   "keywords": [
     "pi-package",
@@ -41,25 +46,22 @@
   "files": [
     "index.ts",
     "src/**/*.ts",
-    "src/**/*.cjs",
     "*.mjs",
     "agents/",
     "skills/**/*",
     "prompts/**/*",
     "docs/**/*",
     "README.md",
-    "FORK.md",
-    "banner.png",
     "CHANGELOG.md"
   ],
   "scripts": {
+    "build:pkg": "node scripts/build-package.mjs",
+    "pack:pkg": "npm run build:pkg && npm pack ./dist-pkg",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:unit",
-    "test:unit": "node --experimental-strip-types --test test/unit/*.test.ts",
+    "test:unit": "node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/*.test.ts",
     "test:integration": "node --experimental-strip-types --import ./test/support/register-loader.mjs --test test/integration/*.test.ts",
-    "test:e2e": "node --experimental-strip-types --import ./test/support/register-loader.mjs --test test/e2e/*.test.ts",
-    "test:probe:active-runtime": "node test/probes/active-runtime-git-installed.mjs",
-    "test:all": "npm run test:unit && npm run test:integration && npm run test:e2e"
+    "test:all": "npm run test:unit && npm run test:integration"
   },
   "pi": {
     "extensions": [
@@ -93,15 +95,19 @@
     }
   },
   "dependencies": {
+    "acorn": "8.18.0",
     "jiti": "2.7.0",
     "typebox": "1.1.38",
+    "undici": "8.10.0",
     "yaml": "2.8.3"
   },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "0.81.0",
     "@earendil-works/pi-ai": "0.81.0",
     "@earendil-works/pi-tui": "0.81.0",
+    "@oxlint/plugins": "1.80.0",
     "@types/node": "24.13.3",
+    "oxlint": "1.80.0",
     "typescript": "5.9.3",
     "@earendil-works/pi-coding-agent": "file:./test/fixtures/pi-coding-agent-shim"
   }

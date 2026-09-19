@@ -1,4 +1,4 @@
-import { isCheckpointStep, isDynamicParallelStep, isParallelStep, type ChainStep, type SequentialStep } from "../../shared/settings.ts";
+import { isDynamicParallelStep, isParallelStep, type ChainStep, type SequentialStep } from "../../shared/settings.ts";
 import type { SingleResult, SubagentRunMode, WorkflowGraphNode, WorkflowGraphSnapshot, WorkflowNodeStatus } from "../../shared/types.ts";
 
 export interface WorkflowGraphBuildInput {
@@ -11,6 +11,22 @@ export interface WorkflowGraphBuildInput {
 	stepStatuses?: Array<{ status?: string; error?: string }>;
 	dynamicChildren?: Record<number, Array<{ agent: string; label?: string; flatIndex: number; itemKey: string; outputName?: string; structured?: boolean; error?: string }>>;
 	dynamicGroupStatuses?: Record<number, { status: WorkflowNodeStatus; error?: string; acceptance?: SingleResult["acceptance"] }>;
+}
+
+/** Return displayable workflow stages while hiding structural parallel groups and host monitors. */
+export function workflowGraphStageNodes(graph: WorkflowGraphSnapshot | undefined): WorkflowGraphNode[] {
+	const nodes = graph?.nodes;
+	if (!nodes?.length) return [];
+	const stages: WorkflowGraphNode[] = [];
+	const visit = (node: WorkflowGraphNode): void => {
+		if (node.kind === "parallel-group" || node.kind === "dynamic-parallel-group") {
+			for (const child of node.children ?? []) visit(child);
+			return;
+		}
+		if (node.kind !== "host-step") stages.push(node);
+	};
+	for (const node of nodes) visit(node);
+	return stages;
 }
 
 function normalizeStatus(status: string | undefined): WorkflowNodeStatus | undefined {
@@ -81,28 +97,6 @@ export function buildWorkflowGraphSnapshot(input: WorkflowGraphBuildInput): Work
 
 	for (let stepIndex = 0; stepIndex < input.steps.length; stepIndex++) {
 		const step = input.steps[stepIndex]!;
-		if (isCheckpointStep(step)) {
-			const status = normalizeStatus(input.stepStatuses?.[flatIndex]?.status)
-				?? (input.currentStepIndex === stepIndex ? "paused" : "pending");
-			const checkpoint = { name: step.checkpoint, ...(step.message ? { message: step.message } : {}), status: status === "rejected" ? "rejected" as const : status === "completed" ? "approved" as const : "pending" as const, stepIndex };
-			const id = `step-${stepIndex}`;
-			nodes.push({
-				id,
-				kind: "checkpoint",
-				phase: step.phase,
-				label: step.label?.trim() || step.checkpoint,
-				status,
-				flatIndex,
-				stepIndex,
-				checkpoint,
-				error: input.stepStatuses?.[flatIndex]?.error,
-			});
-			pushPhase(phases, step.phase, id);
-			if (status === "paused" || input.currentStepIndex === stepIndex) currentNodeId = id;
-			flatIndex++;
-			continue;
-		}
-
 		if (isParallelStep(step)) {
 			const groupId = `step-${stepIndex}`;
 			const children: WorkflowGraphNode[] = [];

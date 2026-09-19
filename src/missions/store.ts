@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getProjectSubagentsDir } from "../shared/artifacts.ts";
 import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
 import { getAgentDir } from "../shared/utils.ts";
 import {
@@ -76,11 +75,6 @@ function positiveTokenCount(value: unknown, label: string): number {
 function nonNegativeTokenCount(value: unknown, label: string): number {
 	if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`${label} must be a non-negative integer`);
 	return value as number;
-}
-
-function parseStoredGoal(value: unknown, label: string): { goal?: MissionGoal; legacyObjective?: string } {
-	if (typeof value === "string") return { legacyObjective: requiredString(value, label).trim() };
-	return { goal: parseGoal(value, label) };
 }
 
 function parseGoal(value: unknown, label: string): MissionGoal {
@@ -224,18 +218,18 @@ export function parseMissionRecord(value: unknown, source = "mission record"): M
 	const decisions = input.decisions as unknown[];
 	const artifacts = input.artifacts as unknown[];
 	const receipts = (input.receipts ?? []) as unknown[];
-	const parsedGoal = input.goal !== undefined ? parseStoredGoal(input.goal, `${source}.goal`) : {};
+	const goal = input.goal !== undefined ? parseGoal(input.goal, `${source}.goal`) : undefined;
 	const budget = input.budget !== undefined ? parseBudget(input.budget, `${source}.budget`) : undefined;
 	const usage = input.usage !== undefined ? parseUsage(input.usage, `${source}.usage`) : undefined;
-	const objective = optionalString(input.objective, `${source}.objective`)?.trim() ?? parsedGoal.legacyObjective;
+	const objective = optionalString(input.objective, `${source}.objective`)?.trim();
 	if (!objective) throw new Error(`${source}.objective must be a non-empty string`);
-	if (parsedGoal.goal && !budget) throw new Error(`${source}.budget is required for a goal mission`);
+	if (goal && !budget) throw new Error(`${source}.budget is required for a goal mission`);
 	return {
 		schemaVersion: 1,
 		id: validateMissionId(input.id, `${source}.id`),
 		title: requiredString(input.title, `${source}.title`),
 		objective,
-		...(parsedGoal.goal ? { goal: parsedGoal.goal } : {}),
+		...(goal ? { goal } : {}),
 		...(budget ? { budget } : {}),
 		...(usage ? { usage } : {}),
 		status: missionStatus(input.status, `${source}.status`),
@@ -257,6 +251,11 @@ export function parseMissionRecord(value: unknown, source = "mission record"): M
 function expandConfiguredPath(value: string, projectRoot: string): string {
 	const expanded = value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value;
 	return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(projectRoot, expanded);
+}
+
+function projectMissionDirectory(agentDir: string, projectRoot: string): string {
+	const projectKey = createHash("sha256").update(projectRoot).digest("hex");
+	return path.join(agentDir, "missions", "projects", projectKey);
 }
 
 export function validateMissionStoreConfig(value: unknown, label = "config.missions"): MissionStoreConfig | undefined {
@@ -289,12 +288,13 @@ export function resolveMissionStoreLocation(input: {
 	agentDir?: string;
 }): MissionStoreLocation {
 	const projectRoot = path.resolve(input.projectRoot);
+	const agentDir = input.agentDir ?? getAgentDir();
 	const missionDir = input.config?.directory
 		? expandConfiguredPath(input.config.directory, projectRoot)
-		: path.join(getProjectSubagentsDir(projectRoot), "missions");
+		: projectMissionDirectory(agentDir, projectRoot);
 	const globalIndexDir = input.config?.globalIndexDir
 		? expandConfiguredPath(input.config.globalIndexDir, projectRoot)
-		: path.join(input.agentDir ?? getAgentDir(), "missions", "index");
+		: path.join(agentDir, "missions", "index");
 	return {
 		projectRoot,
 		missionDir,
@@ -396,11 +396,11 @@ export class MissionNotFoundError extends Error {
 	readonly missionId: string;
 	readonly missionDir: string;
 
-	constructor(missionId: string, missionDir: string) {
-		super(`Mission '${missionId}' was not found in ${missionDir}`);
+	constructor(missionId: string, location: MissionStoreLocation) {
+		super(`Mission '${missionId}' was not found in mission directory '${location.missionDir}' for project root '${location.projectRoot}'. If it was created in another worktree, run the request from that worktree.`);
 		this.name = "MissionNotFoundError";
 		this.missionId = missionId;
-		this.missionDir = missionDir;
+		this.missionDir = location.missionDir;
 	}
 }
 
@@ -410,7 +410,7 @@ export function readMission(location: MissionStoreLocation, missionId: string): 
 	try {
 		raw = fs.readFileSync(filePath, "utf-8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new MissionNotFoundError(missionId, location.missionDir);
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new MissionNotFoundError(missionId, location);
 		throw error;
 	}
 	try {

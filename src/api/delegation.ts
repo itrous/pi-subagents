@@ -1,3 +1,5 @@
+import type { IntercomBridgeConfig } from "../shared/types.ts";
+
 // This is the established extension-to-extension transport. The structured
 // delegation API intentionally reuses it instead of adding a second event
 // protocol. Unstructured legacy direct payloads are rejected.
@@ -6,11 +8,6 @@ export const SUBAGENT_DELEGATION_STARTED_EVENT = "prompt-template:subagent:start
 export const SUBAGENT_DELEGATION_UPDATE_EVENT = "prompt-template:subagent:update";
 export const SUBAGENT_DELEGATION_RESPONSE_EVENT = "prompt-template:subagent:response";
 export const SUBAGENT_DELEGATION_CANCEL_EVENT = "prompt-template:subagent:cancel";
-
-export interface SubagentDelegationTurnBudget {
-	maxTurns: number;
-	graceTurns?: number;
-}
 
 export interface SubagentDelegationToolBudget {
 	soft?: number;
@@ -26,18 +23,6 @@ export type SubagentDelegationResultRequest =
 	| { kind: "text" }
 	| { kind: "structured"; schema: SubagentDelegationJsonSchemaObject };
 
-export interface SubagentDelegationBindingV1 {
-	version: 1;
-	targetServerInstanceId: string;
-	prospectiveRunId: string;
-	expectedSourceIdentityDigest: string;
-	expectedActiveSessionDigest: string;
-	requestDigest: string;
-	expectedLaunchContractDigest: string;
-	receipt: import("./launch-receipt.ts").LaunchReceiptV1;
-	cancellationToken: import("./launch-receipt.ts").LaunchCancellationTokenV1;
-}
-
 export interface SubagentDelegationRequest {
 	requestId: string;
 	ownerRunId: string;
@@ -49,16 +34,12 @@ export interface SubagentDelegationRequest {
 	model?: string;
 	thinking?: SubagentDelegationThinking;
 	timeoutMs?: number;
-	turnBudget?: SubagentDelegationTurnBudget;
 	toolBudget?: SubagentDelegationToolBudget;
 	skill?: string | string[] | boolean;
-	/** Bound-only per-request environment. Public unbound delegation rejects it. */
-	environment?: import("./active-bound-environment.ts").ActiveBoundEnvironmentV1;
 	artifacts?: boolean;
-	/** Bound-only artifact placement. */
-	artifactDir?: "session";
+	/** Per-launch bridge config; replaces the global `intercomBridge` config. Pass the same value to preflight to compare digests. */
+	intercomBridge?: IntercomBridgeConfig;
 	result: SubagentDelegationResultRequest;
-	binding?: SubagentDelegationBindingV1;
 }
 
 export interface SubagentDelegationStarted {
@@ -80,27 +61,18 @@ export interface SubagentDelegationUpdate extends SubagentDelegationStarted {
 	tokens?: number;
 }
 
-export interface SubagentDelegationTargetedCancel extends SubagentDelegationStarted {
-	targetServerInstanceId: string;
-	binding: SubagentDelegationBindingV1;
-}
-
 export type SubagentDelegationStatus =
 	| "completed"
 	| "failed"
 	| "timed_out"
 	| "cancelled"
 	| "interrupted"
-	| "turn_budget_exhausted"
 	| "tool_budget_exhausted"
 	| "structured_output_failed"
 	| "acceptance_failed"
 	| "invalid_request"
 	| "unavailable_context"
-	| "duplicate_node"
-	| "native_tool_registry_mismatch"
-	| "native_tool_registry_protocol_error"
-	| "native_denied_tools_protocol_error";
+	| "duplicate_node";
 
 export type SubagentDelegationValue =
 	| { kind: "text"; text: string }
@@ -126,14 +98,6 @@ export interface SubagentDelegationTerminalResponse extends SubagentDelegationSt
 	thinking?: string;
 	exitCode?: number;
 	launchContractDigest?: string;
-	toolRegistry?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProjectionV1;
-	toolsMissing?: string[];
-	toolsExtra?: string[];
-	toolRegistryError?: import("../runs/shared/tool-registry-proof.ts").ToolRegistryProtocolErrorCode;
-	deniedToolCalls?: import("../runs/shared/denied-tool-proof.ts").DeniedToolCallV1[];
-	deniedToolCallsOverflow?: true;
-	deniedToolCallsError?: import("../runs/shared/denied-tool-proof.ts").DeniedToolProofErrorCode;
-	transportIncomplete?: boolean;
 	result?: SubagentDelegationValue;
 	usage?: SubagentDelegationUsage;
 }

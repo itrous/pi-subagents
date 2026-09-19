@@ -9,13 +9,14 @@ import {
 	SUBAGENT_DELEGATION_UPDATE_EVENT,
 	type SubagentDelegationRequest,
 	type SubagentDelegationResponse,
+	type SubagentDelegationUpdate,
 } from "../../src/api/delegation.ts";
+import { toSubagentDelegationExecutionParams } from "../../src/slash/delegation-adapters.ts";
 import { parseSubagentDelegationRequest } from "../../src/slash/delegation-request.ts";
 import {
 	registerPromptTemplateDelegationBridge,
 	type PromptTemplateBridgeEvents,
 } from "../../src/slash/prompt-template-bridge.ts";
-import { StructuredAttemptCoordinator } from "../../src/slash/structured-attempt-coordinator.ts";
 
 class FakeEvents implements PromptTemplateBridgeEvents {
 	private handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -45,25 +46,6 @@ function tick(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
 }
 
-type BridgeOptions = Parameters<typeof registerPromptTemplateDelegationBridge<{ cwd: string }>>[0];
-
-function registerActiveBridge(options: BridgeOptions) {
-	const bridge = registerPromptTemplateDelegationBridge({
-		...options,
-		coordinator: new StructuredAttemptCoordinator(),
-	});
-	bridge.activate();
-	bridge.activateTerminalSink();
-	return bridge;
-}
-
-const boundBinding = {
-	version: 1 as const, targetServerInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000",
-	expectedSourceIdentityDigest: "a".repeat(64), expectedActiveSessionDigest: "b".repeat(64), requestDigest: "c".repeat(64), expectedLaunchContractDigest: "d".repeat(64),
-	receipt: { version: 1 as const, algorithm: "HMAC-SHA256" as const, payload: { version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 2 }, mac: "e".repeat(64) },
-	cancellationToken: { version: 1 as const, algorithm: "HMAC-SHA256" as const, payload: { version: 1 as const, serverInstanceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceIdentityDigest: "a".repeat(64), activeSessionDigest: "b".repeat(64), prospectiveRunId: "123e4567-e89b-12d3-a456-426614174000", requestDigest: "c".repeat(64), launchContractDigest: "d".repeat(64), issuedAt: 1, expiresAt: 2, requestId: "attempt-1", ownerRunId: "owner-1", nodeId: "node-1" }, mac: "f".repeat(64) },
-};
-
 const request: SubagentDelegationRequest = {
 	requestId: "attempt-1",
 	ownerRunId: "owner-1",
@@ -75,7 +57,6 @@ const request: SubagentDelegationRequest = {
 	model: "openai/gpt-5",
 	thinking: "high",
 	timeoutMs: 1_000,
-	turnBudget: { maxTurns: 4, graceTurns: 1 },
 	toolBudget: { soft: 3, hard: 5, block: "*" },
 	skill: ["review"],
 	artifacts: true,
@@ -101,7 +82,7 @@ describe("public subagent delegation contract", () => {
 			[{ ...request, output: false }, /Unsupported delegation field: output/],
 			[{ ...request, acceptance: false }, /Unsupported delegation field: acceptance/],
 			[{ ...request, agentContract: { version: 1 } }, /Unsupported delegation field: agentContract/],
-			[{ ...request, environment: { ONECPI_REVIEW_ROOT: "/root" } }, /environment is supported only for bound delegation/],
+			[{ ...request, turnBudget: { maxTurns: 5 } }, /Unsupported delegation field: turnBudget/],
 			[{ ...request, result: { kind: "text", schema: {} } }, /result.schema is not supported/],
 			[{ ...request, result: { kind: "structured" } }, /result.schema must be a JSON Schema object/],
 			[{ ...request, task: "é".repeat(524_289) }, /task exceeds 1 MiB/],
@@ -121,14 +102,6 @@ describe("public subagent delegation contract", () => {
 		}
 	});
 
-	it("accepts environment only on a bound request and normalizes it", () => {
-		const parsed = parseSubagentDelegationRequest({ ...request, artifacts: false, environment: { ONECPI_REVIEW_SUBJECT_PATH: "/subject", ONECPI_REVIEW_ROOT: "/root" }, binding: boundBinding });
-		assert.equal(parsed.ok, true, parsed.ok ? undefined : parsed.error);
-		if (parsed.ok) { assert.deepEqual({ ...parsed.request.environment }, { ONECPI_REVIEW_ROOT: "/root", ONECPI_REVIEW_SUBJECT_PATH: "/subject" }); assert.equal(Object.getPrototypeOf(parsed.request.environment!), null); }
-		const sessionArtifacts = parseSubagentDelegationRequest({ ...request, artifacts: true, artifactDir: "session", binding: boundBinding }); assert.equal(sessionArtifacts.ok, true, sessionArtifacts.ok ? undefined : sessionArtifacts.error);
-		assert.equal(parseSubagentDelegationRequest({ ...request, artifactDir: "session" }).ok, false);
-	});
-
 	it("accepts exact zero tool budgets for structured delegated leaves", () => {
 		const zeroBudget = { hard: 0, block: "*" as const };
 		const parsed = parseSubagentDelegationRequest({ ...request, toolBudget: zeroBudget });
@@ -139,9 +112,27 @@ describe("public subagent delegation contract", () => {
 		}
 	});
 
-	it("treats explicit undefined optional fields as absent", () => {
-		const parsed = parseSubagentDelegationRequest({ requestId: "r", ownerRunId: "o", nodeId: "n", agent: "worker", task: "task", context: "fresh", cwd: "/repo", model: undefined, result: { kind: "text" } });
-		assert.equal(parsed.ok, true, parsed.ok ? undefined : parsed.error);
+	it("accepts a per-launch intercomBridge override and forwards it to execution", () => {
+		const intercomBridge = { mode: "off" as const };
+		const parsed = parseSubagentDelegationRequest({ ...request, intercomBridge });
+		assert.equal(parsed.ok, true);
+		if (parsed.ok) {
+			assert.deepEqual(parsed.request.intercomBridge, intercomBridge);
+			assert.notEqual(parsed.request.intercomBridge, intercomBridge, "parsed request must not alias the caller's object");
+			assert.deepEqual(toSubagentDelegationExecutionParams(parsed.request).intercomBridge, intercomBridge);
+		}
+		assert.equal("intercomBridge" in toSubagentDelegationExecutionParams(request), false);
+		const malformed = [
+			[{ ...request, intercomBridge: { mode: "loud" } }, /intercomBridge\.mode is invalid/],
+			[{ ...request, intercomBridge: { extra: true } }, /intercomBridge\.extra is not supported/],
+			[{ ...request, intercomBridge: "off" }, /intercomBridge must be an object/],
+			[{ ...request, intercomBridge: { instructionFile: "x".repeat(1025) } }, /intercomBridge\.instructionFile exceeds 1 KiB/],
+		] as const;
+		for (const [input, expected] of malformed) {
+			const rejected = parseSubagentDelegationRequest(input);
+			assert.equal(rejected.ok, false);
+			if (!rejected.ok) assert.match(rejected.error, expected);
+		}
 	});
 
 	it("rejects non-JSON schemas without executing toJSON hooks", () => {
@@ -154,7 +145,7 @@ describe("public subagent delegation contract", () => {
 			},
 		});
 		assert.equal(parsed.ok, false);
-		if (!parsed.ok) assert.equal(parsed.error, "Delegation request must be closed plain data.");
+		if (!parsed.ok) assert.match(parsed.error, /result.schema must be plain JSON data/);
 		assert.equal(calls, 0);
 	});
 
@@ -162,7 +153,7 @@ describe("public subagent delegation contract", () => {
 		const events = new FakeEvents();
 		let ordinaryCalls = 0;
 		let observedParams: Record<string, unknown> | undefined;
-		const bridge = registerActiveBridge({
+		const bridge = registerPromptTemplateDelegationBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => {
@@ -219,11 +210,8 @@ describe("public subagent delegation contract", () => {
 			cwd: "/repo",
 			model: "openai/gpt-5",
 			timeoutMs: 1_000,
-			turnBudget: { maxTurns: 4, graceTurns: 1 },
-			enforceHardTurnLimit: true,
 			toolBudget: { soft: 3, hard: 5, block: "*" },
 			skill: ["review"],
-			output: false,
 			acceptance: false,
 			artifacts: true,
 			delegatedThinkingOverride: "high",
@@ -235,6 +223,156 @@ describe("public subagent delegation contract", () => {
 		bridge.dispose();
 	});
 
+	it("reports a blocked foreground tool attempt as tool_budget_exhausted", async () => {
+		const events = new FakeEvents();
+		const responses: SubagentDelegationResponse[] = [];
+		events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { throw new Error("legacy executor must remain separate"); },
+			executeStructured: async () => ({
+				details: {
+					mode: "single",
+					results: [{
+						agent: "reviewer",
+						exitCode: 0,
+						toolBudgetBlocked: true,
+						finalOutput: "The required tool was blocked.",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+					}],
+				},
+			}),
+		});
+		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, result: { kind: "text" as const } });
+		while (responses.length === 0) await tick();
+		assert.deepEqual(responses, [{
+			requestId: "attempt-1",
+			ownerRunId: "owner-1",
+			nodeId: "node-1",
+			status: "tool_budget_exhausted",
+			agent: "reviewer",
+			exitCode: 0,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1, toolCalls: 0, durationMs: 0 },
+		} satisfies SubagentDelegationResponse]);
+		bridge.dispose();
+	});
+
+	it("suppresses unchanged structured delegation heartbeat snapshots", async () => {
+		const events = new FakeEvents();
+		const updates: SubagentDelegationUpdate[] = [];
+		events.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (payload) => updates.push(payload as SubagentDelegationUpdate));
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { throw new Error("legacy executor must remain separate"); },
+			executeStructured: async (_id, _params, _signal, _ctx, onUpdate) => {
+				const progress = {
+					index: 0,
+					agent: "reviewer",
+					currentTool: "read",
+					currentToolArgs: "{\"path\":\"evidence.md\"}",
+					recentOutput: ["Reading evidence"],
+					recentTools: [{ tool: "read", args: "evidence.md" }],
+					model: "openai/gpt-5",
+					toolCount: 1,
+					durationMs: 1_000,
+					tokens: 8,
+				};
+				onUpdate({ details: { mode: "single", runId: "run-heartbeat", results: [{ agent: "reviewer", model: "openai/gpt-5" }], progress: [progress] } });
+				onUpdate({ details: { mode: "single", runId: "run-heartbeat", results: [{ agent: "reviewer", model: "openai/gpt-5" }], progress: [{ ...progress, durationMs: 2_000 }] } });
+				return {
+					details: {
+						mode: "single",
+						runId: "run-heartbeat",
+						results: [{ agent: "reviewer", exitCode: 0, model: "openai/gpt-5", finalOutput: "done", usage: { input: 4, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 } }],
+					},
+				};
+			},
+		});
+		const responsePromise = once(events, SUBAGENT_DELEGATION_RESPONSE_EVENT);
+		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, result: { kind: "text" as const } });
+		const response = await responsePromise as SubagentDelegationResponse;
+		assert.equal(updates.length, 1);
+		assert.equal(updates[0]?.durationMs, 1_000);
+		assert.equal(response.status, "completed");
+		bridge.dispose();
+	});
+
+	it("delivers structured delegation updates when progress or bounded output changes", async () => {
+		const events = new FakeEvents();
+		const updates: SubagentDelegationUpdate[] = [];
+		events.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (payload) => updates.push(payload as SubagentDelegationUpdate));
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { throw new Error("legacy executor must remain separate"); },
+			executeStructured: async (_id, _params, _signal, _ctx, onUpdate) => {
+				const common = {
+					index: 0,
+					agent: "reviewer",
+					model: "openai/gpt-5",
+					toolCount: 1,
+					tokens: 8,
+				};
+				onUpdate({ details: { mode: "single", runId: "run-progress", results: [{ agent: "reviewer", model: "openai/gpt-5" }], progress: [{ ...common, currentTool: "read", recentOutput: ["Reading evidence"], recentTools: [{ tool: "read", args: "evidence.md" }], durationMs: 1_000 }] } });
+				onUpdate({ details: { mode: "single", runId: "run-progress", results: [{ agent: "reviewer", model: "openai/gpt-5" }], progress: [{ ...common, currentTool: "read", recentOutput: ["Reading evidence"], recentTools: [{ tool: "read", args: "evidence.md" }], durationMs: 2_000 }] } });
+				onUpdate({ details: { mode: "single", runId: "run-progress", results: [{ agent: "reviewer", model: "openai/gpt-5" }], progress: [{ ...common, currentTool: "write", currentToolArgs: "{\"path\":\"report.md\"}", recentOutput: ["Wrote report"], recentOutputLines: ["Wrote report"], recentTools: [{ tool: "read", args: "evidence.md" }, { tool: "write", args: "report.md" }], toolCount: 2, tokens: 16, durationMs: 3_000 }] } });
+				return { details: { mode: "single", runId: "run-progress", results: [{ agent: "reviewer", exitCode: 0, model: "openai/gpt-5", finalOutput: "done", usage: { input: 8, output: 8, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 } }] } };
+			},
+		});
+		const responsePromise = once(events, SUBAGENT_DELEGATION_RESPONSE_EVENT);
+		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, result: { kind: "text" as const } });
+		assert.equal((await responsePromise as SubagentDelegationResponse).status, "completed");
+		assert.equal(updates.length, 2);
+		assert.equal(updates[1]?.currentTool, "write");
+		assert.equal(updates[1]?.recentOutput, "Wrote report");
+		assert.deepEqual(updates[1]?.recentTools, [{ tool: "read", args: "evidence.md" }, { tool: "write", args: "report.md" }]);
+		bridge.dispose();
+	});
+
+	it("always delivers the complete structured terminal error after quiet heartbeats", async () => {
+		const events = new FakeEvents();
+		const updates: SubagentDelegationUpdate[] = [];
+		events.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (payload) => updates.push(payload as SubagentDelegationUpdate));
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { throw new Error("legacy executor must remain separate"); },
+			executeStructured: async (_id, _params, _signal, _ctx, onUpdate) => {
+				const progress = { index: 0, agent: "reviewer", currentTool: "read", recentOutput: ["Reading evidence"], toolCount: 1, tokens: 8, durationMs: 1_000 };
+				onUpdate({ details: { mode: "single", runId: "run-error", results: [{ agent: "reviewer", model: "openai/gpt-5" }], progress: [progress] } });
+				onUpdate({ details: { mode: "single", runId: "run-error", results: [{ agent: "reviewer", model: "openai/gpt-5" }], progress: [{ ...progress, durationMs: 2_000 }] } });
+				return {
+					isError: true,
+					content: [{ type: "text", text: "full provider error" }],
+					details: {
+						mode: "single",
+						runId: "run-error",
+						results: [{ agent: "reviewer", exitCode: 1, error: "full provider error", model: "openai/gpt-5", usage: { input: 4, output: 2, cacheRead: 1, cacheWrite: 0, cost: 0.01, turns: 1 } }],
+					},
+				};
+			},
+		});
+		const responsePromise = once(events, SUBAGENT_DELEGATION_RESPONSE_EVENT);
+		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, result: { kind: "text" as const } });
+		const response = await responsePromise as SubagentDelegationResponse;
+		assert.equal(updates.length, 1);
+		assert.deepEqual(response, {
+			requestId: "attempt-1",
+			ownerRunId: "owner-1",
+			nodeId: "node-1",
+			status: "failed",
+			runId: "run-error",
+			agent: "reviewer",
+			model: "openai/gpt-5",
+			exitCode: 1,
+			error: "full provider error",
+			usage: { input: 4, output: 2, cacheRead: 1, cacheWrite: 0, cost: 0.01, turns: 1, toolCalls: 0, durationMs: 0 },
+		} satisfies SubagentDelegationResponse);
+		bridge.dispose();
+	});
+
 	it("projects structured values and fails missing or oversized captures", async () => {
 		const cases = [
 			[{ ok: true }, "completed", { kind: "structured", value: { ok: true } }],
@@ -243,7 +381,7 @@ describe("public subagent delegation contract", () => {
 		] as const;
 		for (const [structuredOutput, expectedStatus, expectedResult] of cases) {
 			const events = new FakeEvents();
-			const bridge = registerActiveBridge({
+			const bridge = registerPromptTemplateDelegationBridge({
 				events,
 				getContext: () => ({ cwd: "/repo" }),
 				execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -269,12 +407,12 @@ describe("public subagent delegation contract", () => {
 		}
 	});
 
-	it("isolates logical-node ownership, exact cancellation, unknown cancel, and reuse", async () => {
+	it("isolates logical-node ownership, exact cancellation, pre-cancellation, and reuse", async () => {
 		const events = new FakeEvents();
 		const releases = new Map<string, () => void>();
 		const responses: SubagentDelegationResponse[] = [];
 		events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
-		const bridge = registerActiveBridge({
+		const bridge = registerPromptTemplateDelegationBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -305,7 +443,6 @@ describe("public subagent delegation contract", () => {
 		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, requestId: "pre", result: { kind: "text" } });
 		while (!responses.some((entry) => entry.requestId === "pre")) await tick();
 		assert.equal(responses.find((entry) => entry.requestId === "pre")?.status, "cancelled");
-		assert.equal(releases.has("pre"), false);
 
 		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, { ...request, requestId: "reuse", result: { kind: "text" } });
 		while (!releases.has("reuse")) await tick();
@@ -321,7 +458,7 @@ describe("public subagent delegation contract", () => {
 		const responses: SubagentDelegationResponse[] = [];
 		let executeCalls = 0;
 		events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
-		const bridge = registerActiveBridge({
+		const bridge = registerPromptTemplateDelegationBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -366,11 +503,65 @@ describe("public subagent delegation contract", () => {
 	});
 
 	it("fails closed instead of evicting structured identity state", async () => {
+		const events = new FakeEvents();
+		const responses: SubagentDelegationResponse[] = [];
+		let executeCalls = 0;
+		events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => responses.push(payload as SubagentDelegationResponse));
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { throw new Error("legacy executor must remain separate"); },
+			executeStructured: async (requestId) => {
+				executeCalls++;
+				return {
+					details: {
+						mode: "single",
+						results: [{
+							agent: "reviewer",
+							exitCode: 0,
+							finalOutput: requestId,
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+						}],
+					},
+				};
+			},
+		});
+
+		for (let index = 0; index < 8_192; index++) {
+			events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, {
+				requestId: `cancelled-${index}`,
+				ownerRunId: "saturated-owner",
+				nodeId: `cancelled-node-${index}`,
+			});
+		}
+		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, {
+			...request,
+			requestId: "cancelled-0",
+			ownerRunId: "saturated-owner",
+			nodeId: "cancelled-node-0",
+			result: { kind: "text" },
+		});
+		while (!responses.some((entry) => entry.requestId === "cancelled-0")) await tick();
+		assert.equal(responses.at(-1)?.status, "cancelled");
+
+		events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, {
+			...request,
+			requestId: "cancel-overflow",
+			ownerRunId: "saturated-owner",
+			nodeId: "cancel-overflow-node",
+			result: { kind: "text" },
+		});
+		while (!responses.some((entry) => entry.requestId === "cancel-overflow")) await tick();
+		assert.equal(responses.at(-1)?.status, "unavailable_context");
+		assert.match(responses.at(-1)?.error ?? "", /identity capacity/i);
+		assert.equal(executeCalls, 0);
+		bridge.dispose();
+
 		const settledEvents = new FakeEvents();
 		const settledResponses: SubagentDelegationResponse[] = [];
 		let settledExecuteCalls = 0;
 		settledEvents.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (payload) => settledResponses.push(payload as SubagentDelegationResponse));
-		const settledBridge = registerActiveBridge({
+		const settledBridge = registerPromptTemplateDelegationBridge({
 			events: settledEvents,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => { throw new Error("legacy executor must remain separate"); },
@@ -429,7 +620,7 @@ describe("public subagent delegation contract", () => {
 	it("rejects the unversioned prompt-template direct delegation fallback", async () => {
 		const events = new FakeEvents();
 		let executeCalls = 0;
-		const bridge = registerActiveBridge({
+		const bridge = registerPromptTemplateDelegationBridge({
 			events,
 			getContext: () => ({ cwd: "/repo" }),
 			execute: async () => {

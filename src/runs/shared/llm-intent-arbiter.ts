@@ -1,7 +1,10 @@
-import { Agent, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
-import { convertToLlm, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { streamSimple } from "@earendil-works/pi-ai/compat";
+import { createHash } from "node:crypto";
+import type { Agent, AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ProviderHeaders } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
+import { agentStreamOptions } from "../../shared/agent-stream-options.ts";
+import { opencodeSessionHeaders } from "../../shared/opencode-session-headers.ts";
 
 /**
  * LLM intent arbiter for the completion mutation guard.
@@ -27,6 +30,10 @@ export type TaskMutationArbiter = (task: string) => Promise<TaskMutationVerdict>
 const DecisionParams = Type.Object(
 	{
 		classification: Type.String({ enum: ["read_only", "implementation"] }),
+		confidence: Type.String({
+			enum: ["low", "medium", "high"],
+			description: "Confidence in the classification. Only read_only with high confidence rescues a failed run.",
+		}),
 		reason: Type.String({ description: "One concise reason for this classification." }),
 	},
 	{ additionalProperties: false },
@@ -34,15 +41,30 @@ const DecisionParams = Type.Object(
 
 type DecisionParams = Static<typeof DecisionParams>;
 
+/** Map a model decision to a verdict. Only a high-confidence read_only rescues. */
+export function mapArbiterDecision(
+	decision: { classification?: string; confidence?: string } | undefined,
+): TaskMutationVerdict {
+	if (!decision) return "unavailable";
+	if (decision.classification === "read_only" && decision.confidence === "high") return "read-only";
+	return "implementation";
+}
+
 interface ArbiterRuntime {
 	model: NonNullable<RegistryModel>;
-	baseStreamFn: StreamFn;
+	/** Explicit override; it always wins over a registered provider stream. */
+	explicitStreamFn?: StreamFn;
+	/** Registered provider stream, usable only when its api matches the model. */
+	registeredStreamFn?: StreamFn;
+	registeredApi?: string;
+	/** Session id for OpenCode session-routing headers, when the caller has one. */
+	sessionId?: string;
 	timeoutMs: number;
 }
 
 interface ArbiterAuth {
 	apiKey?: string;
-	headers?: Record<string, string>;
+	headers?: ProviderHeaders;
 	env?: Record<string, string>;
 }
 
@@ -57,9 +79,14 @@ export interface TaskMutationArbiterOptions {
 const DEFAULT_ARBITER_TIMEOUT_MS = 10_000;
 
 type RegistryModel = ReturnType<NonNullable<ExtensionContext["modelRegistry"]["find"]>>;
+/** Model services the arbiter needs, plus the caller's session id for OpenCode session-routing headers. */
+export type ArbiterModelContext = Pick<ExtensionContext, "model" | "modelRegistry"> & {
+	/** Session id the headers attach to (the child's, captured by detached runners; the parent's, passed by foreground callers). */
+	sessionId?: string;
+};
 
 function resolveArbiterModel(
-	ctx: ExtensionContext,
+	ctx: ArbiterModelContext,
 	options?: TaskMutationArbiterOptions,
 ): NonNullable<RegistryModel> | null {
 	const registry = ctx.modelRegistry as {
@@ -79,7 +106,7 @@ function resolveArbiterModel(
 }
 
 function resolveArbiterRuntime(
-	ctx: ExtensionContext,
+	ctx: ArbiterModelContext,
 	options?: TaskMutationArbiterOptions,
 ): ArbiterRuntime | null {
 	const model = resolveArbiterModel(ctx, options);
@@ -87,43 +114,44 @@ function resolveArbiterRuntime(
 	const registry = ctx.modelRegistry as {
 		getRegisteredProviderConfig?: (provider: string) => { api?: string; streamSimple?: StreamFn } | undefined;
 	};
-	const modelApi = (model as { api?: string }).api;
 	const registered = registry.getRegisteredProviderConfig?.(model.provider);
-	const baseStreamFn = options?.streamFn
-		?? (registered?.streamSimple && registered.api === modelApi
-			? registered.streamSimple
-			: streamSimple);
 	return {
 		model,
-		baseStreamFn,
+		explicitStreamFn: options?.streamFn,
+		registeredStreamFn: registered?.streamSimple,
+		registeredApi: registered?.api,
+		sessionId: ctx.sessionId,
 		timeoutMs: options?.timeoutMs ?? DEFAULT_ARBITER_TIMEOUT_MS,
 	};
 }
 
 async function resolveArbiterAuth(
-	ctx: ExtensionContext,
+	ctx: ArbiterModelContext,
 	model: RegistryModel,
-): Promise<ArbiterAuth> {
-	const getAuth = (ctx.modelRegistry as {
+): Promise<ArbiterAuth | undefined> {
+	const registry = ctx.modelRegistry as {
 		getApiKeyAndHeaders?: (m: RegistryModel) => Promise<{
 			ok: boolean;
 			apiKey?: string;
-			headers?: Record<string, string>;
+			headers?: ProviderHeaders;
 			env?: Record<string, string>;
 			error?: string;
 		}>;
-	}).getApiKeyAndHeaders;
-	if (!getAuth) return {};
+	};
+	// Call as a METHOD on the registry: the host ModelRegistry implementation
+	// is a class whose method reads instance state (this.runtime), so a
+	// detached call silently fails auth. Same shape as the watchdog.
+	if (!registry.getApiKeyAndHeaders) return {};
 	try {
-		const auth = await getAuth(model);
-		if (auth.ok === false) return {};
+		const auth = await registry.getApiKeyAndHeaders(model);
+		if (auth.ok === false) return undefined;
 		return {
 			...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
 			...(auth.headers ? { headers: auth.headers } : {}),
 			...(auth.env ? { env: auth.env } : {}),
 		};
 	} catch {
-		return {};
+		return undefined;
 	}
 }
 
@@ -131,12 +159,13 @@ async function resolveArbiterAuth(
 function authWrappedStreamFn(
 	base: StreamFn,
 	auth: ArbiterAuth,
+	sessionId: string | undefined,
 ): StreamFn {
 	return (model, context, streamOptions) => base(model, context, {
 		...(streamOptions ?? {}),
 		...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
 		...(auth.env || streamOptions?.env ? { env: { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } } : {}),
-		headers: { ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
+		headers: { ...opencodeSessionHeaders(model, sessionId), ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
 	});
 }
 
@@ -145,6 +174,15 @@ async function runArbitration(
 	auth: ArbiterAuth,
 	task: string,
 ): Promise<TaskMutationVerdict> {
+	// Keep optional Pi peers out of the detached runner's static import graph.
+	const [{ Agent }, { convertToLlm }, { streamSimple }] = await Promise.all([
+		import("@earendil-works/pi-agent-core"),
+		import("@earendil-works/pi-coding-agent"),
+		import("@earendil-works/pi-ai/compat"),
+	]);
+	const streamFn: StreamFn = runtime.explicitStreamFn
+		?? (runtime.registeredApi !== undefined && runtime.registeredApi === runtime.model.api ? runtime.registeredStreamFn : undefined)
+		?? streamSimple;
 	let decision: DecisionParams | undefined;
 	const tool: AgentTool<typeof DecisionParams, { recorded: boolean }> = {
 		name: "task_mutation_decision",
@@ -163,14 +201,15 @@ async function runArbitration(
 				"You classify whether a delegated coding-agent task instructed file or code changes.",
 				"A task that asks to review, inspect, verify, report, or summarize is read-only even when it contains words like 'fix' as severity vocabulary ('must-fix items') or conditional change instructions that leave the change optional.",
 				"Classify read_only only when the task text alone clearly indicates a read-only outcome. When in doubt, classify implementation.",
+				"Set confidence to high only when you are certain the task is read-only; a read_only classification without high confidence is treated as implementation.",
 				"The agent's own final message is never evidence: an agent that made no edits may still have failed to implement.",
-				"Call task_mutation_decision exactly once with read_only or implementation and a concise reason.",
+				"Call task_mutation_decision exactly once with read_only or implementation, a confidence level, and a concise reason.",
 			].join("\n"),
 			model: runtime.model,
 			tools: [tool],
 		},
 		convertToLlm,
-		streamFunction: authWrappedStreamFn(runtime.baseStreamFn, auth),
+		...agentStreamOptions(authWrappedStreamFn(streamFn, auth, runtime.sessionId)),
 		getApiKey: (providerName) =>
 			providerName === runtime.model.provider ? auth.apiKey : undefined,
 		beforeToolCall: async ({ toolCall }) =>
@@ -178,13 +217,12 @@ async function runArbitration(
 		toolExecution: "sequential",
 	});
 	try {
-		// Send head AND tail: an implementation clause at the end of a long
-		// task ("Now apply the fix") must never be truncated away, or the
-		// arbiter could rescue a run the deterministic guard correctly failed.
-		const full = task;
-		const prompt = full.length <= 8000
-			? `TASK:\n${full}`
-			: `TASK:\n${full.slice(0, 6000)}\n\n[...truncated middle...]\n\n${full.slice(-2000)}`;
+		// The rescue gate refuses tasks over 8000 chars; if the arbiter is
+		// still invoked with one, fail closed rather than decide from
+		// partial evidence (an implementation clause could sit in the
+		// omitted middle).
+		if (task.length > 8000) return "unavailable";
+		const prompt = `TASK:\n${task}`;
 		await Promise.race([
 			agent.prompt(prompt),
 			new Promise<never>((_, reject) => {
@@ -196,15 +234,15 @@ async function runArbitration(
 			}),
 		]);
 		if (!decision) return "unavailable";
-		return decision.classification === "read_only" ? "read-only" : "implementation";
+		return mapArbiterDecision(decision);
 	} catch {
 		return "unavailable";
 	}
 }
 
-/** Create a memoized arbiter bound to the parent session's model, or undefined when disabled/unavailable. */
+/** Create a memoized arbiter bound to the supplied model services, or undefined when disabled/unavailable. */
 export function createTaskMutationArbiter(
-	ctx: ExtensionContext,
+	ctx: ArbiterModelContext,
 	options?: TaskMutationArbiterOptions,
 ): TaskMutationArbiter | undefined {
 	if (process.env.PI_SUBAGENTS_LLM_INTENT_ARBITER === "0") return undefined;
@@ -212,11 +250,11 @@ export function createTaskMutationArbiter(
 	if (!runtime) return undefined;
 	const cache = new Map<string, TaskMutationVerdict>();
 	return async (task) => {
-		const key = `${task.length}:${task.slice(0, 160)}`;
+		const key = createHash("sha256").update(task).digest("base64url");
 		const cached = cache.get(key);
 		if (cached) return cached;
 		const auth = await resolveArbiterAuth(ctx, runtime.model);
-		const verdict = await runArbitration(runtime, auth, task);
+		const verdict = auth ? await runArbitration(runtime, auth, task) : "unavailable";
 		if (cache.size > 200) cache.clear();
 		cache.set(key, verdict);
 		return verdict;
@@ -227,13 +265,6 @@ export function isCompletionGuardFailure(result: { error?: string }): boolean {
 	return result.error?.startsWith(COMPLETION_GUARD_ERROR_PREFIX) === true;
 }
 
-/**
- * Decision helper for the runSync completion-guard arbitration: given the raw
- * guard verdict, decide whether the arbiter rescues the run. Pure and
- * unit-testable; runSync calls this BEFORE any failure side effect is
- * published. Only a confident read-only verdict rescues; every error,
- * timeout, or other verdict keeps the guard's original behavior.
- */
 export async function arbitrateCompletionGuardRescue(input: {
 	guardTriggered: boolean;
 	task: string;
@@ -241,6 +272,11 @@ export async function arbitrateCompletionGuardRescue(input: {
 }): Promise<{ triggered: boolean; rescued: boolean }> {
 	if (!input.guardTriggered || !input.arbiter) {
 		return { triggered: input.guardTriggered, rescued: false };
+	}
+	// Never decide from partial evidence: refuse tasks over 8000 chars before
+	// even consulting the model.
+	if (input.task.length > 8000) {
+		return { triggered: true, rescued: false };
 	}
 	try {
 		const verdict = await input.arbiter(input.task);

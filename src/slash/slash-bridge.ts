@@ -50,16 +50,12 @@ interface SlashBridgeOptions {
 }
 
 export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
-	activate: () => void;
-	stop: () => void;
 	cancelAll: () => void;
 	dispose: () => void;
 } {
 	const controllers = new Map<string, AbortController>();
 	const pendingCancels = new Set<string>();
 	const subscriptions: Array<() => void> = [];
-	let active = false;
-	let stopped = false;
 
 	const subscribe = (event: string, handler: (data: unknown) => void): void => {
 		const unsubscribe = options.events.on(event, handler);
@@ -67,7 +63,7 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 	};
 
 	subscribe(SLASH_SUBAGENT_CANCEL_EVENT, (data) => {
-		if (!active || stopped || !data || typeof data !== "object") return;
+		if (!data || typeof data !== "object") return;
 		const requestId = (data as { requestId?: unknown }).requestId;
 		if (typeof requestId !== "string") return;
 		const controller = controllers.get(requestId);
@@ -79,11 +75,10 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 	});
 
 	subscribe(SLASH_SUBAGENT_REQUEST_EVENT, async (data) => {
-		if (!active || stopped || !data || typeof data !== "object") return;
+		if (!data || typeof data !== "object") return;
 		const request = data as Partial<SlashSubagentRequest>;
 		if (typeof request.requestId !== "string" || !request.params) return;
 		const { requestId } = request as SlashSubagentRequest;
-		if (controllers.has(requestId)) return;
 		const normalized = normalizePublicSubagentExecution((request as SlashSubagentRequest).params);
 		if (!normalized.ok) {
 			options.events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, {
@@ -134,15 +129,14 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 			return;
 		}
 
+		options.events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId });
+
 		try {
-			options.events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId });
-			if (!active || stopped || controller.signal.aborted || controllers.get(requestId) !== controller) return;
 			const result = await options.execute(
 				requestId,
 				params,
 				controller.signal,
 				(update) => {
-					if (!active || stopped || controllers.get(requestId) !== controller) return;
 					const progress = update.details?.progress;
 					const first = progress?.[0];
 					const payload: SlashSubagentUpdate = {
@@ -156,7 +150,6 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 				ctx,
 			);
 
-			if (!active || stopped || controllers.get(requestId) !== controller) return;
 			const response: SlashSubagentResponse = {
 				requestId,
 				result,
@@ -167,7 +160,6 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 			};
 			options.events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, response);
 		} catch (error) {
-			if (!active || stopped || controllers.get(requestId) !== controller) return;
 			const response: SlashSubagentResponse = {
 				requestId,
 				result: {
@@ -179,26 +171,22 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 			};
 			options.events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, response);
 		} finally {
-			if (controllers.get(requestId) === controller) controllers.delete(requestId);
+			controllers.delete(requestId);
 		}
 	});
 
-	const stop = (): void => {
-		if (stopped) return;
-		stopped = true;
-		active = false;
-		for (const controller of controllers.values()) controller.abort();
-		controllers.clear();
-		pendingCancels.clear();
-	};
 	return {
-		activate: () => { if (!stopped) active = true; },
-		stop,
-		cancelAll: stop,
+		cancelAll: () => {
+			for (const controller of controllers.values()) {
+				controller.abort();
+			}
+			controllers.clear();
+			pendingCancels.clear();
+		},
 		dispose: () => {
-			stop();
 			for (const unsubscribe of subscriptions) unsubscribe();
 			subscriptions.length = 0;
+			pendingCancels.clear();
 		},
 	};
 }

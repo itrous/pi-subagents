@@ -4,7 +4,6 @@ import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import type {
 	AsyncStatus,
 	ResolvedToolBudget,
-	ResolvedTurnBudget,
 	SteerActionResult,
 	SteeringRecoveryDescriptor,
 	SteeringRequestStatus,
@@ -13,9 +12,38 @@ import type {
 	SteeringTargetStatus,
 } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
+import { previewDisplayText } from "../../shared/display-text.ts";
+import { redactSecretValues } from "../shared/permissions.ts";
+import type { SteerDeliveryMode } from "./control-channel.ts";
 
 export const MAX_STEERING_REQUESTS = 20;
 export const STEERING_MESSAGE_PREVIEW_LIMIT = 160;
+
+export function steeringMessagePreview(message: string): string {
+	return previewDisplayText(redactSecretValues(message), STEERING_MESSAGE_PREVIEW_LIMIT);
+}
+
+/** FIFO match of one accepted steer to an emitted user message; equal text claims the oldest entry. */
+export function takeMatchingAcceptedSteer<T extends { text: string }>(accepted: T[], messageText: string): T | undefined {
+	const index = accepted.findIndex((entry) => entry.text === messageText);
+	if (index < 0) return undefined;
+	const [entry] = accepted.splice(index, 1);
+	return entry;
+}
+
+/** Settlement reason for one accepted request that never got a matching user `message_end`. */
+export function unconsumedSteerReason(mode?: SteerDeliveryMode): string {
+	return mode === "follow_up"
+		? "child completed before consuming follow-up"
+		: "child completed before consuming steering";
+}
+
+export function steeringReceipt(message: string, receipt: string): string {
+	const preview = steeringMessagePreview(message);
+	const longestFence = Math.max(2, ...[...preview.matchAll(/`{3,}/g)].map((match) => match[0]!.length));
+	const fence = "`".repeat(longestFence + 1);
+	return `${receipt}\n\nMessage sent:\n${fence}text\n${preview}\n${fence}`;
+}
 
 export function createSteeringStatus(): SteeringStatus {
 	return { requested: 0, scheduled: 0, pending: 0, delivered: 0, failed: 0, recovered: 0, recent: [] };
@@ -35,7 +63,7 @@ export function recordSteeringRequest(
 		id: input.id,
 		requestedAt: input.requestedAt,
 		...(input.source ? { source: input.source } : {}),
-		messagePreview: input.message.slice(0, STEERING_MESSAGE_PREVIEW_LIMIT),
+		messagePreview: steeringMessagePreview(input.message),
 		targets: input.targets.map((target) => ({ index: target.index, state: target.state, ...(target.reason ? { reason: target.reason } : {}) })),
 	};
 	status.requested++;
@@ -81,7 +109,9 @@ export function updateSteeringTarget(
 		if (fields.replacementRunId) target.replacementRunId = fields.replacementRunId;
 		return target;
 	}
-	if ((target.state === "routed" || target.state === "queued") && state !== "routed" && state !== "queued") status.pending = Math.max(0, status.pending - 1);
+	const wasPending = target.state === "routed" || target.state === "queued";
+	const nowPending = state === "routed" || state === "queued";
+	if (wasPending && !nowPending) status.pending = Math.max(0, status.pending - 1);
 	target.state = state;
 	if (state === "routed") target.routedAt = now;
 	if (state === "delivered") {
@@ -96,7 +126,7 @@ export function updateSteeringTarget(
 	if (state === "recovered") target.recoveredAt = now;
 	if (fields.reason) target.reason = fields.reason;
 	if (fields.replacementRunId) target.replacementRunId = fields.replacementRunId;
-	incrementStateCount(status, state);
+	if (!wasPending || !nowPending) incrementStateCount(status, state);
 	return target;
 }
 
@@ -185,25 +215,16 @@ export function readSteeringStatus(asyncDir: string): SteeringStatus | undefined
 }
 
 export function remainingSteeringRecoveryLimits(
-	descriptor: Pick<SteeringRecoveryDescriptor, "absoluteDeadlineAt" | "initialTurnBudget" | "initialToolBudget">,
-	status: Pick<AsyncStatus, "turnBudget" | "turnCount" | "toolBudget" | "toolCount">,
+	descriptor: Pick<SteeringRecoveryDescriptor, "absoluteDeadlineAt" | "initialToolBudget">,
+	status: Pick<AsyncStatus, "toolBudget" | "toolCount">,
 	now = Date.now(),
-): { timeoutMs?: number; absoluteDeadlineAt?: number; turnBudget?: ResolvedTurnBudget; toolBudget?: ResolvedToolBudget } {
-	const limits: { timeoutMs?: number; absoluteDeadlineAt?: number; turnBudget?: ResolvedTurnBudget; toolBudget?: ResolvedToolBudget } = {};
+): { timeoutMs?: number; absoluteDeadlineAt?: number; toolBudget?: ResolvedToolBudget } {
+	const limits: { timeoutMs?: number; absoluteDeadlineAt?: number; toolBudget?: ResolvedToolBudget } = {};
 	if (descriptor.absoluteDeadlineAt !== undefined) {
 		const timeoutMs = descriptor.absoluteDeadlineAt - now;
 		if (timeoutMs <= 0) throw new Error("Source run has no remaining deadline budget; it remains paused.");
 		limits.timeoutMs = timeoutMs;
 		limits.absoluteDeadlineAt = descriptor.absoluteDeadlineAt;
-	}
-	if (descriptor.initialTurnBudget) {
-		const consumed = status.turnBudget?.turnCount ?? status.turnCount ?? 0;
-		const totalRemaining = descriptor.initialTurnBudget.maxTurns + descriptor.initialTurnBudget.graceTurns - consumed;
-		if (totalRemaining <= 0) throw new Error("Source run has no remaining turn budget; it remains paused.");
-		const softRemaining = Math.max(0, descriptor.initialTurnBudget.maxTurns - consumed);
-		limits.turnBudget = softRemaining > 0
-			? { maxTurns: softRemaining, graceTurns: totalRemaining - softRemaining }
-			: { maxTurns: 1, graceTurns: totalRemaining - 1 };
 	}
 	if (descriptor.initialToolBudget) {
 		const consumed = status.toolBudget?.toolCount ?? status.toolCount ?? 0;

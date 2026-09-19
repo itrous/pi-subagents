@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import type { AgentConfig } from "../agents/agents.ts";
+import type { PiLaunchToolPlan } from "../runs/shared/child-tool-plan.ts";
+import type { ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 
-export const AGENT_DEFINITION_PROJECTION_VERSION = 1 as const;
-export const LAUNCH_BINDING_PROJECTION_VERSION = 1 as const;
+export const AGENT_DEFINITION_PROJECTION_VERSION = 2 as const;
+// v2: the Intercom bridge prompt and tools are part of the binding on every
+// path, and the bridge text no longer names the parent session.
+export const LAUNCH_BINDING_PROJECTION_VERSION = 2 as const;
 
 function stableJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -17,7 +21,7 @@ function stableJson(value: unknown): string {
 	return JSON.stringify(value);
 }
 
-function sha256(value: unknown): string {
+export function stableJsonDigest(value: unknown): string {
 	return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
@@ -42,23 +46,29 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 		systemPrompt: agent.systemPrompt,
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
+		inheritGlobalContext: agent.inheritGlobalContext,
 		inheritSkills: agent.inheritSkills,
 		model: agent.model,
-		fallbackModels: agent.fallbackModels,
+		modelProvider: agent.modelProvider,
+		fast: agent.fast,
 		thinking: agent.thinking,
 		tools: agent.tools,
+		excludeTools: agent.excludeTools,
+		allowNestedSubagents: agent.allowNestedSubagents,
+		allowedAgents: agent.allowedAgents,
 		mcpDirectTools: agent.mcpDirectTools,
 		extensions: agent.extensions,
 		subagentOnlyExtensions: agent.subagentOnlyExtensions,
+		mutationTools: agent.mutationTools,
 		skills: agent.skills,
 		skillPath: agent.skillPath,
 		output: agent.output,
+		outputSchema: agent.outputSchema,
 		defaultReads: agent.defaultReads,
 		defaultProgress: agent.defaultProgress,
 		defaultContext: agent.defaultContext,
 		defaultAsync: agent.defaultAsync,
 		defaultTimeoutMs: agent.defaultTimeoutMs,
-		defaultTurnBudget: agent.defaultTurnBudget,
 		defaultAcceptance: agent.defaultAcceptance,
 		acceptanceRole: agent.acceptanceRole,
 		interactive: agent.interactive,
@@ -66,45 +76,36 @@ export function projectAgentDefinition(agent: AgentConfig): Record<string, unkno
 		completionGuard: agent.completionGuard,
 		toolBudget: agent.toolBudget,
 		memory: agent.memory,
-		activeBoundPackageOwner: agent.activeBoundPackageOwner ? {
-			name: agent.activeBoundPackageOwner.name,
-			version: agent.activeBoundPackageOwner.version,
-			manifestDigest: agent.activeBoundPackageOwner.manifestDigest,
-		} : undefined,
-		activeBoundExtensionProjection: agent.activeBoundExtensionProjection,
 	};
 }
 
+/** Digest of the parsed definition; a runtime overlay that already captured it wins over re-hashing the overlaid copy. */
 export function agentDefinitionDigest(agent: AgentConfig): string {
-	return sha256(projectAgentDefinition(agent));
+	return agent.definitionDigest ?? stableJsonDigest(projectAgentDefinition(agent));
 }
 
 export interface LaunchBindingInput {
 	definitionDigest: string;
-	canonicalCwd?: string;
 	/** Caller task; runtime acceptance/output task annotations are explicitly outside the preflight-known subset. */
 	task?: string;
 	model?: string;
-	modelCandidates?: string[];
+	fast?: boolean;
 	thinking?: string;
 	systemPrompt?: string | null;
 	systemPromptMode?: AgentConfig["systemPromptMode"];
 	inheritProjectContext: boolean;
+	inheritGlobalContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
-	environment?: unknown;
-	packageExtensions?: unknown;
-	piCommandEvidence?: unknown;
-	toolRegistry?: unknown;
-	artifactPolicy?: unknown;
 	tools?: string[];
+	excludeTools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
-	permissionRules?: unknown;
 	outputPath?: string;
 	outputMode?: string;
 	structuredOutputSchema?: unknown;
+	extensionBindings?: ExtensionBindings;
 }
 
 /** Canonical projection of the resolved inputs handed to the child. */
@@ -112,32 +113,87 @@ export function projectLaunchBinding(input: LaunchBindingInput): Record<string, 
 	return {
 		version: LAUNCH_BINDING_PROJECTION_VERSION,
 		definitionDigest: input.definitionDigest,
-		canonicalCwd: input.canonicalCwd,
-		taskDigest: input.task === undefined ? undefined : sha256(input.task),
+		taskDigest: input.task === undefined ? undefined : stableJsonDigest(input.task),
 		model: input.model,
-		modelCandidates: input.modelCandidates,
+		fast: input.fast,
 		thinking: input.thinking,
-		systemPromptDigest: input.systemPrompt === undefined || input.systemPrompt === null ? undefined : sha256(input.systemPrompt),
+		systemPromptDigest: input.systemPrompt === undefined || input.systemPrompt === null ? undefined : stableJsonDigest(input.systemPrompt),
 		systemPromptMode: input.systemPromptMode,
 		inheritProjectContext: input.inheritProjectContext,
+		inheritGlobalContext: input.inheritGlobalContext,
 		inheritSkills: input.inheritSkills,
 		skills: input.skills,
-		environment: input.environment,
-		packageExtensions: input.packageExtensions,
-		piCommandEvidence: input.piCommandEvidence,
-		toolRegistry: input.toolRegistry,
-		artifactPolicy: input.artifactPolicy,
 		tools: input.tools,
+		excludeTools: input.excludeTools,
 		extensions: input.extensions,
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		mcpDirectTools: input.mcpDirectTools,
-		permissionRules: input.permissionRules,
 		outputPath: input.outputPath,
 		outputMode: input.outputMode,
 		structuredOutputSchema: input.structuredOutputSchema,
+		extensionBindings: input.extensionBindings,
 	};
 }
 
 export function launchBindingDigest(input: LaunchBindingInput): string {
-	return sha256(projectLaunchBinding(input));
+	return stableJsonDigest(projectLaunchBinding(input));
+}
+
+type LaunchBindingPromptMode = Pick<LaunchBindingInput, "systemPromptMode" | "inheritProjectContext" | "inheritGlobalContext" | "inheritSkills">;
+
+/**
+ * Who the child is: the launched agent, or the identity a persisted step
+ * already captured when a runner recomputes the binding per model attempt.
+ */
+export type LaunchBindingIdentity =
+	| { agent: AgentConfig }
+	| ({ definitionDigest: string } & LaunchBindingPromptMode);
+
+export type LaunchBindingSource = LaunchBindingIdentity
+	& Pick<LaunchBindingInput, "fast" | "thinking" | "skills" | "outputPath" | "outputMode" | "structuredOutputSchema" | "extensionBindings">
+	& {
+		task: string;
+		model?: string;
+		/** Effective child system prompt before runtime acceptance prose. */
+		systemPrompt: string;
+		toolPlan: Pick<PiLaunchToolPlan, "effectiveToolAllowlist" | "excludeTools" | "extensionArgs" | "effectiveMcpTools">;
+	};
+
+export interface LaunchBinding {
+	definitionDigest: string;
+	launchContractDigest: string;
+}
+
+/**
+ * Assemble launch identity from resolved preflight or execution inputs.
+ * The stable projection omits undefined optional fields.
+ */
+export function resolveLaunchBinding(source: LaunchBindingSource): LaunchBinding {
+	const identity = "agent" in source ? {
+		definitionDigest: agentDefinitionDigest(source.agent),
+		systemPromptMode: source.agent.systemPromptMode,
+		inheritProjectContext: source.agent.inheritProjectContext,
+		inheritGlobalContext: source.agent.inheritGlobalContext,
+		inheritSkills: source.agent.inheritSkills,
+	} : source;
+	return {
+		definitionDigest: identity.definitionDigest,
+		launchContractDigest: launchBindingDigest({
+			...identity,
+			task: source.task,
+			model: source.model,
+			fast: source.fast,
+			thinking: source.thinking || undefined,
+			systemPrompt: source.systemPrompt,
+			skills: source.skills,
+			tools: source.toolPlan.effectiveToolAllowlist,
+			excludeTools: source.toolPlan.excludeTools.length > 0 ? source.toolPlan.excludeTools : undefined,
+			extensions: source.toolPlan.extensionArgs,
+			mcpDirectTools: source.toolPlan.effectiveMcpTools,
+			outputPath: source.outputPath || undefined,
+			outputMode: source.outputMode,
+			structuredOutputSchema: source.structuredOutputSchema,
+			extensionBindings: source.extensionBindings || undefined,
+		}),
+	};
 }

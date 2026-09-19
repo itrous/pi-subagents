@@ -34,6 +34,20 @@ async function waitForFile(filePath: string, timeoutMs = 10_000): Promise<void> 
 }
 
 describe("mission store", () => {
+	it("stores default missions outside the project and preserves configured project storage", () => {
+		const test = fixture();
+		try {
+			assert.equal(path.relative(test.projectRoot, test.location.missionDir).startsWith(".."), true);
+			assert.equal(test.location.missionDir.startsWith(path.join(test.agentDir, "missions", "projects")), true);
+			assert.equal(
+				resolveMissionStoreLocation({ projectRoot: test.projectRoot, agentDir: test.agentDir, config: { directory: ".pi/subagents/missions" } }).missionDir,
+				path.join(test.projectRoot, ".pi/subagents", "missions"),
+			);
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
 	it("creates, reads, updates, lists, and globally indexes project missions", () => {
 		const test = fixture();
 		try {
@@ -284,6 +298,36 @@ describe("mission store", () => {
 		}
 	});
 
+	it("does not reclaim a live replacement owner after observing a reused pid identity", () => {
+		const test = fixture();
+		try {
+			const mission = createMission(test.location, { title: "Replacement owner", objective: "Keep a reused pid lock safe" });
+			const statePath = missionStatePath(test.location, mission.id);
+			const lockPath = `${statePath}.lock`;
+			const ownerPath = path.join(lockPath, "owner.json");
+			const reusedPid = process.pid + 100_000;
+			const replacementOwner = { pid: reusedPid, token: "replacement", createdAt: Date.now(), processKey: "replacement-process" };
+			fs.mkdirSync(lockPath, { recursive: true });
+			fs.writeFileSync(ownerPath, JSON.stringify({ pid: reusedPid, token: "old", createdAt: Date.now(), processKey: "old-process" }), "utf-8");
+
+			let currentIdentity = "old-process";
+			const state = createMissionWorkflowState(test.location, mission.id, {
+				isProcessAlive: (pid) => pid === reusedPid,
+				getProcessStartKey: (pid) => pid === reusedPid ? currentIdentity : "current-process",
+				retryDelaysMs: [],
+			});
+
+			assert.throws(() => state.set("reviewer", "ready"), /Timed out acquiring mission state lock/);
+			fs.writeFileSync(ownerPath, JSON.stringify(replacementOwner), "utf-8");
+			currentIdentity = "replacement-process";
+			assert.throws(() => state.set("reviewer", "ready"), /Timed out acquiring mission state lock/);
+			assert.deepEqual(JSON.parse(fs.readFileSync(ownerPath, "utf-8")), replacementOwner);
+			assert.equal(fs.existsSync(statePath), false);
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
 	it("serializes competing abandoned-lock recovery", async () => {
 		const test = fixture();
 		try {
@@ -330,15 +374,13 @@ describe("mission store", () => {
 		}
 	});
 
-	it("loads older records that do not have receipts or objective", () => {
+	it("loads older records that do not have receipts", () => {
 		const test = fixture();
 		try {
 			const created = createMission(test.location, { title: "Older record", objective: "Stay readable" });
 			const recordPath = path.join(test.location.missionDir, `${created.id}.json`);
 			const raw = JSON.parse(fs.readFileSync(recordPath, "utf-8")) as Record<string, unknown>;
 			delete raw.receipts;
-			delete raw.objective;
-			raw.goal = "Stay readable";
 			fs.writeFileSync(recordPath, JSON.stringify(raw), "utf-8");
 
 			const mission = readMission(test.location, created.id);

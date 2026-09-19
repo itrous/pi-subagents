@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { Type } from "typebox";
+import { WATCHDOG_GUIDANCE_MAX_CHARS } from "../../src/watchdog/guidance.ts";
 import {
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
@@ -12,7 +17,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { DEFAULT_WATCHDOG_CONFIG } from "../../src/watchdog/settings.ts";
 import { createMainWatchdogReview, resolveWatchdogReviewModel } from "../../src/watchdog/review.ts";
-import type { WatchdogReviewRequest } from "../../src/watchdog/runtime.ts";
+import { MainWatchdogRuntime, type WatchdogReviewRequest } from "../../src/watchdog/runtime.ts";
+import { buildWatchdogStatus } from "../../src/watchdog/register-main.ts";
 import type { ResolvedWatchdogConfig, WatchdogWarning } from "../../src/watchdog/types.ts";
 
 function model(provider: string, id: string, overrides: Partial<Model<any>> = {}): Model<any> {
@@ -35,14 +41,11 @@ function cloneConfig(): ResolvedWatchdogConfig {
 	return {
 		...DEFAULT_WATCHDOG_CONFIG,
 		guidance: { ...DEFAULT_WATCHDOG_CONFIG.guidance },
-		autoFollow: { ...DEFAULT_WATCHDOG_CONFIG.autoFollow },
 		main: { ...DEFAULT_WATCHDOG_CONFIG.main },
 		children: {
 			...DEFAULT_WATCHDOG_CONFIG.children,
-			autoFollow: { ...DEFAULT_WATCHDOG_CONFIG.children.autoFollow },
 			overrides: { ...DEFAULT_WATCHDOG_CONFIG.children.overrides },
 		},
-		asyncCompletion: { ...DEFAULT_WATCHDOG_CONFIG.asyncCompletion },
 		lsp: { ...DEFAULT_WATCHDOG_CONFIG.lsp },
 	};
 }
@@ -68,6 +71,7 @@ function createCtx(input: {
 		model: input.current,
 		...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
 		signal: undefined,
+		sessionManager: { getSessionId: () => "watchdog-review-session" },
 		getSystemPrompt: () => "Parent system prompt",
 		modelRegistry: {
 			getAvailable: () => allModels.filter((entry) => authenticated.has(`${entry.provider}/${entry.id}`)),
@@ -116,6 +120,33 @@ function request(config: ResolvedWatchdogConfig, warnings: WatchdogWarning[]): W
 }
 
 describe("main watchdog review adapter", () => {
+	it("returns a provider failure after one model launch", async () => {
+		const a = model("mock", "a");
+		const b = model("mock", "b");
+		const { streamFn, calls } = createStreamFn([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "rate limit" }),
+			fauxAssistantMessage("unexpected second launch", { stopReason: "stop" }),
+		]);
+		const result = await createMainWatchdogReview(createCtx({ current: a, models: [a, b] }), { streamFn })(request(enabledConfig(), []));
+		assert.equal(result.stopReason, "error");
+		assert.equal(result.errorMessage, "rate limit");
+		assert.equal(calls.length, 1);
+	});
+	it("yields an ask from a mixed batch without another model call or warning", async () => {
+		const { streamFn, calls } = createStreamFn([fauxAssistantMessage([
+			fauxToolCall("watchdog_ask", { question: "Which constraint applies?", evidence: "Two scope statements differ." }),
+			fauxToolCall("watchdog_warn", { severity: "concern", summary: "Must not emit", evidence: "x", recommendedAction: "x" }),
+			fauxToolCall("ls", { path: "." }),
+		], { stopReason: "toolUse" })]);
+		const warnings: WatchdogWarning[] = [];
+		const current = model("mock", "review");
+		const review = createMainWatchdogReview(createCtx({ current, models: [current, model("mock", "fallback")] }), { streamFn });
+		const result = await review({ ...request(enabledConfig(), warnings), allowClarification: true });
+		assert.deepEqual(result, { clarification: { question: "Which constraint applies?", evidence: "Two scope statements differ." } });
+		assert.equal(calls.length, 1);
+		assert.deepEqual(warnings, []);
+	});
+
 	it("ignores clean freeform review text and emits no warnings", async () => {
 		const current = model("openai", "gpt-clean");
 		const ctx = createCtx({ current });
@@ -135,7 +166,7 @@ describe("main watchdog review adapter", () => {
 			fauxAssistantMessage(fauxToolCall("watchdog_warn", {
 				severity: "blocker",
 				category: "correctness",
-				confidence: "high",
+				importance: "high",
 				summary: "The test claim is unverified",
 				evidence: "The delta says tests passed but no test command appears.",
 				recommendedAction: "Run the focused test before accepting the result.",
@@ -150,7 +181,7 @@ describe("main watchdog review adapter", () => {
 		assert.deepEqual(warnings[0], {
 			severity: "blocker",
 			category: "correctness",
-			confidence: "high",
+			importance: "high",
 			source: "main",
 			summary: "The test claim is unverified",
 			evidence: "The delta says tests passed but no test command appears.",
@@ -230,7 +261,7 @@ describe("main watchdog review adapter", () => {
 		const warnings: WatchdogWarning[] = [];
 
 		const review = createMainWatchdogReview(ctx, { streamFn })(
-			{ ...request(enabledConfig(), warnings), signal: controller.signal },
+			{ ...request(enabledConfig(), warnings), allowClarification: true, signal: controller.signal },
 		);
 		await started;
 		controller.abort();
@@ -238,6 +269,55 @@ describe("main watchdog review adapter", () => {
 
 		assert.equal(streamAborted, true);
 		assert.equal(result?.stopReason, "aborted");
+	});
+
+	it("includes WATCHDOG.md guidance in the system prompt", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watchdog-review-guidance-"));
+		const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+		try {
+			process.env.PI_CODING_AGENT_DIR = path.join(dir, "agent");
+			fs.mkdirSync(path.join(dir, "project", ".pi"), { recursive: true });
+			fs.writeFileSync(path.join(dir, "project", ".pi", "WATCHDOG.md"), "Never accept skipped tests.\n", "utf-8");
+			fs.mkdirSync(path.join(dir, "agent"), { recursive: true });
+			fs.writeFileSync(path.join(dir, "agent", "WATCHDOG.md"), "u".repeat(WATCHDOG_GUIDANCE_MAX_CHARS), "utf-8");
+			const current = model("openai", "gpt-guidance");
+			const ctx = { ...(createCtx({ current }) as object), cwd: path.join(dir, "project") } as never;
+			const { streamFn, calls } = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
+
+			await createMainWatchdogReview(ctx, { streamFn })(request(enabledConfig(), []));
+			const prompt = String(calls[0]?.context.systemPrompt ?? "");
+			assert.match(prompt, /Standing instructions from WATCHDOG\.md \(project first, then user\):\nNever accept skipped tests\.\n\nu+$/);
+			assert.equal(prompt.split("(project first, then user):\n")[1]?.length, WATCHDOG_GUIDANCE_MAX_CHARS, "combined guidance is capped from the head");
+
+			const disabled = enabledConfig();
+			disabled.guidance = { watchdogMd: false };
+			const second = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
+			await createMainWatchdogReview(ctx, { streamFn: second.streamFn })(request(disabled, []));
+			assert.doesNotMatch(String(second.calls[0]?.context.systemPrompt ?? ""), /Standing instructions/);
+		} finally {
+			if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("offers watchdog_diff only when a repo baseline is available", async () => {
+		const current = model("openai", "gpt-diff");
+		const ctx = createCtx({ current });
+		const withBaseline = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
+		await createMainWatchdogReview(ctx, { streamFn: withBaseline.streamFn, diffBaseline: () => ({ root: "/tmp/watchdog-review", ref: "abc123" }) })(request(enabledConfig(), []));
+		assert.deepEqual(withBaseline.calls[0]?.context.tools?.map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_diff", "watchdog_warn"]);
+		assert.match(String(withBaseline.calls[0]?.context.systemPrompt ?? ""), /watchdog_diff/);
+
+		const without = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
+		await createMainWatchdogReview(ctx, { streamFn: without.streamFn, diffBaseline: () => undefined })(request(enabledConfig(), []));
+		assert.deepEqual(without.calls[0]?.context.tools?.map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_warn"]);
+		assert.doesNotMatch(String(without.calls[0]?.context.systemPrompt ?? ""), /watchdog_diff/);
+		const schema = without.calls[0]?.context.tools?.find((tool) => tool.name === "watchdog_warn")?.parameters as any;
+		assert.deepEqual(schema.required?.includes("importance"), true);
+		assert.deepEqual(schema.properties.importance.enum, ["low", "medium", "high"]);
+		assert.equal(schema.properties.confidence, undefined);
+		assert.equal(schema.additionalProperties, false);
 	});
 
 	it("does not expose mutating tools to the watchdog agent", async () => {

@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
-import { createEventBus, createMockPi, createTempDir, events, removeTempDir, tryImport } from "../support/helpers.ts";
+import { createEventBus, createMockPi, createTempDir, events, removeTempDir, resolveMockPiCallArgs, tryImport } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
+import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
 import { DEFAULT_FORK_PREAMBLE, INTERCOM_DETACH_REQUEST_EVENT, SUBAGENT_ASYNC_STARTED_EVENT } from "../../src/shared/types.ts";
 
 interface ExecutorModule {
@@ -157,23 +158,23 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			.sort()
 			.at(-1);
 		assert.ok(callFile, "expected a recorded mock pi call");
-		return readRecordedArgs(callFile);
+		return readRecordedArgs(callFile, true);
 	}
 
 	function readAllCallArgs(): string[][] {
 		return fs.readdirSync(mockPi.dir)
 			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
 			.sort()
-			.map(readRecordedArgs);
+			.map((name) => readRecordedArgs(name));
 	}
 
-	function readRecordedArgs(callFile: string): string[] {
-		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8"));
+	function readRecordedArgs(callFile: string, effective = false): string[] {
+		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[]; effectiveArgs?: string[] };
 		assert.equal(typeof payload, "object", "expected recorded args payload");
 		assert.notEqual(payload, null, "expected recorded args payload");
 		assert.ok("args" in payload, "expected recorded args payload");
 		assert.ok(Array.isArray(payload.args), "expected recorded args");
-		return payload.args;
+		return effective ? resolveMockPiCallArgs(payload) : payload.args;
 	}
 
 	function readSessionArgsFromCalls(): string[] {
@@ -186,16 +187,6 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 				return sessionFile;
 			})
 			.filter((sessionFile): sessionFile is string => Boolean(sessionFile));
-	}
-
-	function readCallArgsForTask(taskText: string): string[] {
-		const args = readAllCallArgs().find((callArgs) => {
-			const prompt = callArgs.at(-1) ?? "";
-			return prompt.startsWith(`Task: ${taskText}\n`)
-				|| prompt.includes(`\n\nTask:\n${taskText}\n`);
-		});
-		assert.ok(args, `expected a recorded mock pi call for task '${taskText}'`);
-		return args;
 	}
 
 	function readSessionArg(args: string[]): string {
@@ -309,26 +300,62 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		);
 
 		assert.equal(result.isError, undefined);
-		const args = readCallArgs();
-		assert.ok((args.at(-1) ?? "").startsWith("Task: \n\n## Acceptance Contract"));
+		const args = readAllCallArgs()[0] ?? [];
+		const taskArg = args.at(-1) ?? "";
+		assert.equal(taskArg, "Task: ");
+		const systemIndex = args.findIndex((arg) => arg === "--system-prompt" || arg === "--append-system-prompt");
+		assert.notEqual(systemIndex, -1);
+		assert.match(args[systemIndex + 1] ?? "", /## Acceptance Contract/);
 	});
 
-	it("does not treat top-level agent as single mode when tasks are present", async () => {
-		const { manager } = makeSessionManagerRecorder();
-		const executor = makeExecutor();
+	it("fails pruned fork model auth before child spawn", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		const { manager } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
+		const executor = makeExecutorWithConfig({ forkContext: { mode: "pruned", model: "test/pruner" } });
+		const model = { provider: "test", id: "pruner", api: "test-api", maxTokens: 1024 };
+		const ctx = {
+			...makeCtx(manager),
+			modelRegistry: {
+				getAvailable: () => [model],
+				find: () => model,
+				getApiKeyAndHeaders: async () => ({ ok: false as const, error: "credentials unavailable" }),
+			},
+		};
+
+		const result = await executor.execute("id", { agent: "echo", task: "test", context: "fork" }, new AbortController().signal, undefined, ctx);
+		assert.equal(result.isError, true);
+		assert.match(result.content.map((block) => block.text).join("\n"), /Pruned fork model auth failed.*credentials unavailable/);
+		assert.equal(fs.readdirSync(mockPi.dir).some((name) => name.startsWith("call-") && name.endsWith(".json")), false);
+	});
+
+
+
+	it("falls back to fresh when an implicit default fork has no persisted parent session", async () => {
+		const { manager } = makeSessionManagerRecorder({ sessionFile: undefined, leafId: "leaf-current" });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fork" },
+			],
+			projectAgentsDir: null,
+		}));
 
 		const result = await executor.execute(
 			"id",
-			{ agent: "echo", tasks: [{ agent: "second", task: "parallel task" }] },
+			{ agent: "worker", task: "test" },
 			new AbortController().signal,
 			undefined,
 			makeCtx(manager),
 		);
 
 		assert.equal(result.isError, undefined);
-		const args = readCallArgs();
-		assert.ok((args.at(-1) ?? "").startsWith("Task: parallel task\n\n## Acceptance Contract"));
+		assert.equal(result.details?.context, "fresh");
+		assert.equal(result.details?.results?.[0]?.context, "fresh");
+		assert.doesNotMatch(readCallArgs().at(-1) ?? "", /delegated subagent running from a fork/);
 	});
+
+
+
+
 
 	it("uses agent defaultContext fork when launch context is omitted", async () => {
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
@@ -355,7 +382,100 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.deepEqual(readSessionArgsFromCalls(), [path.join(tempDir, "fork-1.jsonl")]);
 	});
 
-	it("sanitizes inherited signed thinking and forces child thinking off", async () => {
+	it("uses global defaultSubagentContext fork for a fresh-default agent", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fresh" },
+			],
+			projectAgentsDir: null,
+		}), { defaultSubagentContext: "fork" });
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.context, "fork");
+		assert.equal(result.details?.results?.[0]?.context, "fork");
+		assert.deepEqual(openedPaths, [parentSessionFile]);
+		assert.deepEqual(branchedLeafIds, ["leaf-current"]);
+		assert.deepEqual(readSessionArgsFromCalls(), [path.join(tempDir, "fork-1.jsonl")]);
+	});
+
+	it("uses global defaultSubagentContext fresh for a fork-default agent", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		const { manager, openedPaths } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fork" },
+			],
+			projectAgentsDir: null,
+		}), { defaultSubagentContext: "fresh" });
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.context, "fresh");
+		assert.equal(result.details?.results?.[0]?.context, "fresh");
+		assert.deepEqual(openedPaths, []);
+	});
+
+	it("uses profile context over global defaultSubagentContext", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fork" },
+			],
+			projectAgentsDir: null,
+		}), { defaultSubagentContext: "fresh" });
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test", context: "profile" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.context, "fork");
+		assert.equal(result.details?.results?.[0]?.context, "fork");
+		assert.deepEqual(openedPaths, [parentSessionFile]);
+		assert.deepEqual(branchedLeafIds, ["leaf-current"]);
+	});
+
+	it("fails profile context when the selected agent has no defaultContext", async () => {
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [{ name: "worker", description: "Worker" }],
+			projectAgentsDir: null,
+		}), { defaultSubagentContext: "fork" });
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test", context: "profile" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(makeSessionManagerRecorder().manager),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /context: "profile" requires agent 'worker' to declare defaultContext/);
+	});
+
+	it("sanitizes inherited signed thinking and keeps child thinking", async () => {
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
 		const childSessionFile = path.join(tempDir, "fork-with-thinking.jsonl");
 		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
@@ -391,31 +511,16 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:off");
+		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
 		const entries = fs.readFileSync(childSessionFile, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
 		assert.deepEqual(entries[2].message.content, [{ type: "text", text: "answer" }]);
-		assert.equal(entries[3].type, "thinking_level_change");
-		assert.equal(entries[3].thinkingLevel, "off");
+		assert.equal(entries.length, 3);
+		assert.ok(!entries.some((entry) => entry.type === "thinking_level_change"));
 	});
 
-	it("forces every foreground fallback attempt off after sanitizing inherited signed thinking", async () => {
-		mockPi.reset();
-		mockPi.onCall({
-			jsonl: [{
-				type: "message_end",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: "temporary provider failure" }],
-					model: "openai/gpt-5-mini",
-					errorMessage: "rate limit exceeded",
-					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
-				},
-			}],
-			exitCode: 1,
-		});
-		mockPi.onCall({ output: "Recovered on fallback" });
+	it("keeps thinking for an explicit Anthropic model on a forked child", async () => {
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
-		const childSessionFile = path.join(tempDir, "fork-with-thinking.jsonl");
+		const childSessionFile = path.join(tempDir, "fork-explicit-anthropic.jsonl");
 		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
 		const manager = {
 			getSessionId: () => "session-123",
@@ -433,34 +538,37 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		};
 		const executor = makeExecutorWithDiscoverAgents(() => ({
 			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork", model: "openai/gpt-5-mini:high", fallbackModels: ["anthropic/claude-sonnet-4:low"], thinking: "high" },
+				{ name: "worker", description: "Worker", defaultContext: "fork", model: "openai/gpt-5-mini:high", thinking: "high" },
 			],
 			projectAgentsDir: null,
 		}));
-
 		const ctx = {
 			...makeCtx(manager),
 			modelRegistry: {
 				getAvailable: () => [
 					{ provider: "openai", id: "gpt-5-mini", api: "openai-responses", reasoning: true },
-					{ provider: "anthropic", id: "claude-sonnet-4", api: "anthropic-messages", reasoning: true },
+					{ provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages", reasoning: true },
 				],
 			},
 		};
+
 		const result = await executor.execute(
 			"id",
-			{ agent: "worker", task: "test" },
+			{ agent: "worker", task: "test", model: "anthropic/claude-sonnet-4-5:high" },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
 
 		assert.equal(result.isError, undefined);
-		const modelArgs = readAllCallArgs().map((args) => args[args.indexOf("--model") + 1]);
-		assert.deepEqual(modelArgs, ["openai/gpt-5-mini:off", "anthropic/claude-sonnet-4:off"]);
+		const args = readCallArgs();
+		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
+		const entries = fs.readFileSync(childSessionFile, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.deepEqual(entries[1].message.content, [{ type: "text", text: "answer" }]);
+		assert.equal(entries.length, 2);
+		assert.ok(!entries.some((entry) => entry.type === "thinking_level_change"));
 	});
-
-	it("keeps requested thinking for non-Anthropic forked children without Anthropic fallbacks", async () => {
+	it("keeps requested thinking for non-Anthropic forked children", async () => {
 		mockPi.reset();
 		mockPi.onCall({ output: "done" });
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
@@ -590,7 +698,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		}
 	});
 
-	it("notes the forced thinking downgrade in the result for Anthropic forked children", async () => {
+	it("reports no thinking downgrade for Anthropic forked children", async () => {
 		mockPi.reset();
 		mockPi.onCall({ output: "done" });
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
@@ -633,10 +741,12 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const text = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-		assert.equal(text.includes("fork context forced thinking off for worker (child 0)"), true);
+		assert.equal(text.includes("forced thinking off"), false);
+		const noteArgs = readCallArgs();
+		assert.equal(noteArgs[noteArgs.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
 	});
 
-	it("resolves inherit before classifying a forked child", async () => {
+	it("resolves inherit for a forked child without downgrading thinking", async () => {
 		const childSessionFile = path.join(tempDir, "fork-inherit-thinking.jsonl");
 		const manager = makeSignedThinkingSessionManager(childSessionFile);
 		const executor = makeExecutorWithDiscoverAgents(() => ({
@@ -663,120 +773,53 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:off");
+		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
 	});
 
-	it("classifies empty parallel model overrides as parent inheritance", async () => {
-		const childSessionFile = path.join(tempDir, "fork-empty-parallel-model.jsonl");
-		const manager = makeSignedThinkingSessionManager(childSessionFile);
+	it("keeps inherited parent models outside the registry during foreground fork preparation", async () => {
+		const { manager } = makeForkingSessionManagerRecorder({
+			sessionFile: path.join(tempDir, "parent.jsonl"),
+			leafId: "leaf-123",
+		});
 		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork", model: "anthropic/claude-sonnet-4-5", thinking: "high" },
-			],
+			agents: [{ name: "worker", description: "Worker", defaultContext: "fork" }],
 			projectAgentsDir: null,
 		}));
 		const ctx = {
 			...makeCtx(manager),
-			model: { provider: "openai", id: "gpt-5-mini" },
-			modelRegistry: {
-				getAvailable: () => [
-					{ provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages", reasoning: true },
-					{ provider: "openai", id: "gpt-5-mini", api: "openai-responses", reasoning: true },
-				],
-			},
+			model: { provider: "gateway", id: "parent-model" },
+			modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] },
 		};
 
-		const result = await executor.execute(
-			"id",
-			{ tasks: [{ agent: "worker", task: "test", model: "" }] },
+		const inherited = await executor.execute(
+			"inherited-parent-model",
+			{ agent: "worker", task: "test", context: "fork" },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
-
-		assert.equal(result.isError, undefined);
+		assert.equal(inherited.isError, undefined);
 		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-5-mini:high");
-		const text = result.content.filter((block) => block.text).map((block) => block.text).join("\n");
-		assert.equal(text.includes("fork context forced thinking off"), false);
-	});
+		assert.equal(args[args.indexOf("--model") + 1], "gateway/parent-model");
 
-	it("classifies the agent model when empty inheritance has no parent model", async () => {
-		const childSessionFile = path.join(tempDir, "fork-empty-model-without-parent.jsonl");
-		const manager = makeSignedThinkingSessionManager(childSessionFile);
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork", model: "openai/gpt-5-mini", thinking: "high" },
-			],
-			projectAgentsDir: null,
-		}));
-		const ctx = {
-			...makeCtx(manager),
-			modelRegistry: {
-				getAvailable: () => [{ provider: "openai", id: "gpt-5-mini", api: "openai-responses", reasoning: true }],
-			},
-		};
-
-		const result = await executor.execute(
-			"id",
-			{ tasks: [{ agent: "worker", task: "test", model: "" }] },
+		const explicit = await executor.execute(
+			"explicit-unknown-model",
+			{ agent: "worker", task: "test", context: "fork", model: "gateway/unknown" },
 			new AbortController().signal,
 			undefined,
 			ctx,
 		);
-
-		assert.equal(result.isError, undefined);
-		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-5-mini:high");
-		const text = result.content.filter((block) => block.text).map((block) => block.text).join("\n");
-		assert.equal(text.includes("fork context forced thinking off"), false);
+		assert.equal(explicit.isError, true);
+		assert.match(explicit.content[0]?.text ?? "", /Unknown subagent model 'gateway\/unknown'/);
 	});
 
-	it("classifies the effective model selected in Clarify", async () => {
-		const childSessionFile = path.join(tempDir, "fork-clarify-thinking.jsonl");
-		const manager = makeSignedThinkingSessionManager(childSessionFile);
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork", model: "anthropic/claude-sonnet-4-5:high", thinking: "high" },
-			],
-			projectAgentsDir: null,
-		}));
-		const ctx = {
-			...makeCtx(manager),
-			hasUI: true,
-			ui: {
-				custom: async () => ({
-					confirmed: true,
-					runInBackground: false,
-					templates: ["test"],
-					behaviorOverrides: [{ model: "openai-codex/gpt-5.6-sol:high" }],
-				}),
-			},
-			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
-			modelRegistry: {
-				getAvailable: () => [
-					{ provider: "anthropic", id: "claude-sonnet-4-5", api: "anthropic-messages", reasoning: true },
-					{ provider: "openai-codex", id: "gpt-5.6-sol", api: "openai-responses", reasoning: true },
-				],
-			},
-		};
 
-		const result = await executor.execute(
-			"id",
-			{ agent: "worker", task: "test", clarify: true },
-			new AbortController().signal,
-			undefined,
-			ctx,
-		);
 
-		assert.equal(result.isError, undefined);
-		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.6-sol:high");
-		const text = result.content.filter((block) => block.text).map((block) => block.text).join("\n");
-		assert.equal(text.includes("fork context forced thinking off"), false);
-	});
 
-	it("includes the fork-thinking downgrade note on failed results", async () => {
+
+
+
+	it("adds no fork-thinking downgrade note to failed results", async () => {
 		mockPi.reset();
 		mockPi.onCall({ stderr: "task failed", exitCode: 1 });
 		const childSessionFile = path.join(tempDir, "fork-failed-thinking.jsonl");
@@ -804,7 +847,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, true);
 		const text = result.content.filter((block) => block.text).map((block) => block.text).join("\n");
-		assert.equal(text.includes("fork context forced thinking off for worker (child 0)"), true);
+		assert.equal(text.includes("forced thinking off"), false);
 	});
 
 	it("keeps default-fork context on run-path errors", async () => {
@@ -861,94 +904,11 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.notEqual(readSessionArgsFromCalls()[0], path.join(tempDir, "fork-1.jsonl"));
 	});
 
-	it("uses each agent defaultContext for top-level parallel when launch context is omitted", async () => {
-		const parentSessionFile = path.join(tempDir, "parent.jsonl");
-		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork" },
-				{ name: "second", description: "Second" },
-			],
-			projectAgentsDir: null,
-		}));
 
-		const result = await executor.execute(
-			"id",
-			{ tasks: [{ agent: "worker", task: "one" }, { agent: "second", task: "two" }] },
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
 
-		assert.equal(result.isError, undefined);
-		assert.equal(result.details?.context, "mixed");
-		assert.deepEqual(result.details?.results?.map((entry) => entry.context), ["fork", "fresh"]);
-		assert.deepEqual(openedPaths, [parentSessionFile]);
-		assert.deepEqual(branchedLeafIds, ["leaf-current"]);
-		const workerArgs = readCallArgsForTask("one");
-		const freshArgs = readCallArgsForTask("two");
-		assert.match(workerArgs.at(-1) ?? "", /delegated subagent running from a fork/);
-		assert.doesNotMatch(freshArgs.at(-1) ?? "", /delegated subagent running from a fork/);
-		assert.equal(readSessionArg(workerArgs), path.join(tempDir, "fork-1.jsonl"));
-		assert.notEqual(readSessionArg(freshArgs), path.join(tempDir, "fork-1.jsonl"));
-	});
 
-	it("keeps explicit fresh context over top-level parallel agent defaultContext fork", async () => {
-		const parentSessionFile = path.join(tempDir, "parent.jsonl");
-		const { manager, openedPaths } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork" },
-				{ name: "second", description: "Second" },
-			],
-			projectAgentsDir: null,
-		}));
 
-		const result = await executor.execute(
-			"id",
-			{ tasks: [{ agent: "worker", task: "one" }, { agent: "second", task: "two" }], context: "fresh" },
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
 
-		assert.equal(result.isError, undefined);
-		assert.equal(result.details?.context, "fresh");
-		assert.deepEqual(result.details?.results?.map((entry) => entry.context), ["fresh", "fresh"]);
-		assert.deepEqual(openedPaths, []);
-	});
-
-	it("uses each agent defaultContext for chain runs when launch context is omitted", async () => {
-		const parentSessionFile = path.join(tempDir, "parent.jsonl");
-		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "echo", description: "Echo" },
-				{ name: "worker", description: "Worker", defaultContext: "fork" },
-			],
-			projectAgentsDir: null,
-		}));
-
-		const result = await executor.execute(
-			"id",
-			{ chain: [{ agent: "echo", task: "scan" }, { agent: "worker", task: "write" }], clarify: false },
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
-
-		assert.equal(result.isError, undefined);
-		assert.equal(result.details?.context, "mixed");
-		assert.deepEqual(result.details?.results?.map((entry) => entry.context), ["fresh", "fork"]);
-		assert.deepEqual(openedPaths, [parentSessionFile]);
-		assert.deepEqual(branchedLeafIds, ["leaf-current"]);
-		const scanArgs = readCallArgsForTask("scan");
-		const writeArgs = readCallArgsForTask("write");
-		assert.doesNotMatch(scanArgs.at(-1) ?? "", /delegated subagent running from a fork/);
-		assert.match(writeArgs.at(-1) ?? "", /delegated subagent running from a fork/);
-		const forkSessionArgs = readSessionArgsFromCalls().filter((sessionFile) => path.basename(sessionFile).startsWith("fork-"));
-		assert.deepEqual(forkSessionArgs, [path.join(tempDir, "fork-1.jsonl")]);
-	});
 
 	it("fails before launching mixed parallel children when a default-fork session cannot branch", async () => {
 		const parentSessionFile = path.join(tempDir, "parent-mixed-fail.jsonl");
@@ -1031,45 +991,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(mockPi.callCount(), 0);
 	});
 
-	it("keeps later foreground forked chain steps aligned after short dynamic fanout", async () => {
-		mockPi.reset();
-		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ id: "one" }] } });
-		mockPi.onCall({ output: "inspected one" });
-		mockPi.onCall({ output: "final done" });
-		const parentSessionFile = path.join(tempDir, "parent-dynamic-chain.jsonl");
-		const { manager } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "producer", description: "Producer", defaultContext: "fresh" },
-				{ name: "worker", description: "Worker", defaultContext: "fork" },
-			],
-			projectAgentsDir: null,
-		}));
 
-		const result = await executor.execute(
-			"id",
-			{
-				chain: [
-					{ agent: "producer", task: "produce", as: "items", outputSchema: { type: "object" } },
-					{
-						expand: { from: { output: "items", path: "/items" }, item: "item", key: "/id", maxItems: 3 },
-						parallel: { agent: "worker", task: "inspect {item.id}" },
-						collect: { as: "inspections" },
-					},
-					{ agent: "worker", task: "final" },
-				],
-				clarify: false,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
-
-		assert.equal(result.isError, undefined);
-		assert.equal(mockPi.callCount(), 3);
-		assert.equal(readSessionArg(readCallArgsForTask("inspect one")), path.join(tempDir, "fork-1.jsonl"));
-		assert.equal(readSessionArg(readCallArgsForTask("final")), path.join(tempDir, "fork-4.jsonl"));
-	});
 
 	it("reports unknown top-level parallel agents before default-fork preconditions", async () => {
 		const { manager } = makeSessionManagerRecorder({ sessionFile: undefined, leafId: "leaf-current" });
@@ -1105,6 +1027,77 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /persisted parent session/);
+	});
+
+	it("falls back to fresh when an implicit default fork has a session path that is not persisted yet", async () => {
+		const parentSessionFile = path.join(tempDir, "unpersisted-parent.jsonl");
+		const { manager } = makeSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fork" },
+			],
+			projectAgentsDir: null,
+		}));
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.context, "fresh");
+		assert.equal(result.details?.results?.[0]?.context, "fresh");
+		assert.doesNotMatch(readCallArgs().at(-1) ?? "", /delegated subagent running from a fork/);
+	});
+
+	it("falls back to fresh when an implicit default fork has no current leaf", async () => {
+		const parentSessionFile = path.join(tempDir, "parent-no-leaf.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
+		const { manager } = makeSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: null });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fork" },
+			],
+			projectAgentsDir: null,
+		}));
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.context, "fresh");
+		assert.equal(result.details?.results?.[0]?.context, "fresh");
+		assert.doesNotMatch(readCallArgs().at(-1) ?? "", /delegated subagent running from a fork/);
+	});
+
+	it("keeps explicit fork fail-fast even when the agent defaults to fork", async () => {
+		const { manager } = makeSessionManagerRecorder({ sessionFile: undefined, leafId: "leaf-current" });
+		const executor = makeExecutorWithDiscoverAgents(() => ({
+			agents: [
+				{ name: "worker", description: "Worker", defaultContext: "fork" },
+			],
+			projectAgentsDir: null,
+		}));
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "worker", task: "test", context: "fork" },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /persisted parent session/);
+		assert.equal(mockPi.callCount(), 0);
 	});
 
 	it("fails fast when context=fork and leaf is missing", async () => {
@@ -1177,617 +1170,41 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(fs.existsSync(args[sessionIndex + 1]!), true);
 	});
 
-	it("creates isolated forked sessions per parallel task", async () => {
-		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({
-			sessionFile: path.join(tempDir, "parent-parallel.jsonl"),
-			leafId: "leaf-777",
-		});
-		const executor = makeExecutor();
 
-		const result = await executor.execute(
-			"id",
-			{
-				tasks: [
-					{ agent: "echo", task: "task one" },
-					{ agent: "second", task: "task two" },
-				],
-				context: "fork",
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
 
-		assert.equal(result.isError, undefined);
-		assert.deepEqual(openedPaths, [path.join(tempDir, "parent-parallel.jsonl"), path.join(tempDir, "parent-parallel.jsonl")]);
-		assert.deepEqual(branchedLeafIds, ["leaf-777", "leaf-777"]);
-		const sessionArgs = readSessionArgsFromCalls();
-		assert.equal(sessionArgs.length, 2);
-		assert.equal(new Set(sessionArgs).size, 2);
-		for (const childSessionFile of sessionArgs) {
-			assert.notEqual(childSessionFile, path.join(tempDir, "parent-parallel.jsonl"));
-			assert.equal(fs.existsSync(childSessionFile), true);
-		}
-	});
 
-	it("expands top-level parallel task counts before fork session allocation", async () => {
-		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({
-			sessionFile: path.join(tempDir, "parent-count.jsonl"),
-			leafId: "leaf-count",
-		});
-		const executor = makeExecutor();
 
-		const result = await executor.execute(
-			"id",
-			{
-				tasks: [{ agent: "echo", task: "task one", count: 3 }],
-				context: "fork",
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
 
-		assert.equal(result.isError, undefined);
-		assert.deepEqual(openedPaths, [
-			path.join(tempDir, "parent-count.jsonl"),
-			path.join(tempDir, "parent-count.jsonl"),
-			path.join(tempDir, "parent-count.jsonl"),
-		]);
-		assert.deepEqual(branchedLeafIds, ["leaf-count", "leaf-count", "leaf-count"]);
-		const sessionArgs = readSessionArgsFromCalls();
-		assert.equal(sessionArgs.length, 3);
-		assert.equal(new Set(sessionArgs).size, 3);
-	});
 
-	it("rejects top-level parallel worktree runs with a conflicting task cwd", async () => {
-		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: "leaf-777" });
-		const executor = makeExecutor();
 
-		const result = await executor.execute(
-			"id",
-			{
-				tasks: [
-					{ agent: "echo", task: "task one" },
-					{ agent: "second", task: "task two", cwd: `${tempDir}/other` },
-				],
-				worktree: true,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
 
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /worktree isolation uses the shared cwd/i);
-		assert.match(result.content[0]?.text ?? "", /task 2 \(second\) sets cwd/i);
-	});
 
-	it("rejects top-level parallel counts that expand past MAX_PARALLEL", async () => {
-		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: "leaf-max" });
-		const executor = makeExecutor();
 
-		const result = await executor.execute(
-			"id",
-			{
-				tasks: [{ agent: "echo", task: "task one", count: 9 }],
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
 
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /Max 8 tasks/);
-	});
 
-	it("uses top-level parallel config overrides for maxTasks and concurrency", async () => {
-		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: "leaf-max-config" });
-		const maxTasksExecutor = makeExecutorWithConfig({ parallel: { maxTasks: 9 } });
 
-		const maxTasksResult = await maxTasksExecutor.execute(
-			"id",
-			{
-				tasks: [{ agent: "echo", task: "task one", count: 9 }],
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
 
-		assert.equal(maxTasksResult.isError, undefined);
-		assert.equal(mockPi.callCount(), 9);
 
-		for (const testCase of [
-			{ name: "config", configConcurrency: 2, paramsConcurrency: undefined, expectedMaxRunning: 2 },
-			{ name: "per-call", configConcurrency: 3, paramsConcurrency: 1, expectedMaxRunning: 1 },
-		]) {
-			mockPi.reset();
-			for (let i = 0; i < 3; i++) {
-				mockPi.onCall({
-					steps: [
-						{ jsonl: [events.toolStart("bash", { command: `${testCase.name}-${i}` })] },
-						{ delay: 250 },
-						{ jsonl: [events.toolEnd("bash"), events.assistantMessage(`done-${i}`)] },
-					],
-				});
-			}
 
-			const executor = makeExecutorWithConfig({ parallel: { concurrency: testCase.configConcurrency } });
-			let maxRunning = 0;
 
-			const result = await executor.execute(
-				"id",
-				{
-					tasks: [
-						{ agent: "echo", task: "task one" },
-						{ agent: "second", task: "task two" },
-						{ agent: "echo", task: "task three" },
-					],
-					...(testCase.paramsConcurrency ? { concurrency: testCase.paramsConcurrency } : {}),
-				},
-				new AbortController().signal,
-				(update: ProgressUpdate) => {
-					const progress = update.details?.progress ?? [];
-					const running = progress.filter((entry) => entry.status === "running").length;
-					maxRunning = Math.max(maxRunning, running);
-				},
-				makeCtx(makeSessionManagerRecorder().manager),
-			);
 
-			assert.equal(result.isError, undefined, testCase.name);
-			assert.equal(maxRunning, testCase.expectedMaxRunning, testCase.name);
-		}
-	});
 
-	it("caps top-level foreground parallel execution with globalConcurrencyLimit", async () => {
-		mockPi.reset();
-		for (let i = 0; i < 4; i++) {
-			mockPi.onCall({
-				steps: [
-					{ jsonl: [events.toolStart("bash", { command: `global-${i}` })] },
-					{ delay: 250 },
-					{ jsonl: [events.toolEnd("bash"), events.assistantMessage(`done-${i}`)] },
-				],
-			});
-		}
 
-		const executor = makeExecutorWithConfig({ globalConcurrencyLimit: 2, parallel: { concurrency: 4 } });
-		let maxRunning = 0;
 
-		const result = await executor.execute(
-			"id",
-			{
-				tasks: [
-					{ agent: "echo", task: "task one" },
-					{ agent: "second", task: "task two" },
-					{ agent: "echo", task: "task three" },
-					{ agent: "second", task: "task four" },
-				],
-			},
-			new AbortController().signal,
-			(update: ProgressUpdate) => {
-				const progress = update.details?.progress ?? [];
-				const running = progress.filter((entry) => entry.status === "running").length;
-				maxRunning = Math.max(maxRunning, running);
-			},
-			makeCtx(makeSessionManagerRecorder().manager),
-		);
 
-		assert.equal(result.isError, undefined);
-		assert.equal(mockPi.callCount(), 4);
-		assert.equal(maxRunning, 2);
-	});
 
-	it("detaches parallel child runs cleanly on intercom handoff", async () => {
-		mockPi.reset();
-		mockPi.onCall({
-			steps: [
-				{ jsonl: [events.toolStart("intercom", { action: "send", to: "orchestrator" })] },
-				{ delay: 1000, jsonl: [events.assistantMessage("after handoff")] },
-			],
-		});
-		mockPi.onCall({ output: "other done" });
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "echo", description: "Echo", systemPrompt: "Intercom orchestration channel:" },
-				{ name: "second", description: "Second", systemPrompt: "Intercom orchestration channel:" },
-			],
-			projectAgentsDir: null,
-		}));
-		let detachEmitted = false;
-		const result = await executor.execute(
-			"intercom-parallel",
-			{
-				tasks: [
-					{ agent: "echo", task: "send handoff" },
-					{ agent: "second", task: "continue" },
-				],
-			},
-			new AbortController().signal,
-			(update: ProgressUpdate) => {
-				if (detachEmitted) return;
-				if (!update.details?.progress?.some((entry) => entry.currentTool === "intercom")) return;
-				detachEmitted = true;
-				executor.eventsApi.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "parallel-detach" });
-			},
-			makeCtx(makeSessionManagerRecorder().manager),
-		);
 
-		assert.equal(result.isError, undefined);
-		assert.match(result.content[0]?.text ?? "", /Parallel run detached for intercom coordination/);
-		assert.equal(detachEmitted, true);
-		assert.equal(result.details?.results?.some((entry) => entry.detached === true && entry.exitCode === -2), true);
-	});
 
-	it("runs top-level parallel async requests in the background", { skip: !asyncAvailable ? "jiti not available" : undefined }, async () => {
-		const executor = makeExecutor();
 
-		const result = await executor.execute(
-			"id",
-			{
-				tasks: [
-					{ agent: "echo", task: "task one" },
-					{ agent: "second", task: "task two" },
-				],
-				async: true,
-				clarify: false,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(makeSessionManagerRecorder().manager),
-		);
 
-		assert.equal(result.isError, undefined);
-		assert.equal(result.details?.mode, "parallel");
-		assert.ok(result.details?.asyncId, "expected an asyncId for background top-level parallel runs");
-		assert.match(result.content[0]?.text ?? "", /Async parallel:/);
-	});
 
-	it("keeps inherited model-scope warnings non-fatal in async parallel conversion", { skip: !asyncAvailable ? "jiti not available" : undefined }, async () => {
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [{ name: "worker", description: "Worker", model: "openai/gpt-5-mini" }],
-			projectAgentsDir: null,
-			modelScope: { enforce: true, allow: ["anthropic/*"] },
-		}));
-		const ctx = {
-			...makeCtx(makeSessionManagerRecorder().manager),
-			modelRegistry: {
-				getAvailable: () => [{ provider: "openai", id: "gpt-5-mini", api: "openai-responses", reasoning: true }],
-			},
-		};
-		const warnings: string[] = [];
-		const originalWarn = console.warn;
-		console.warn = (message?: unknown) => warnings.push(String(message));
-		try {
-			const result = await executor.execute(
-				"id",
-				{ tasks: [{ agent: "worker", task: "test" }], async: true },
-				new AbortController().signal,
-				undefined,
-				ctx,
-			);
-			assert.equal(result.isError, undefined);
-			assert.ok(result.details?.asyncId);
-			assert.equal(warnings.length, 1);
-			assert.match(warnings[0]!, /outside the configured subagent model scope/);
-		} finally {
-			console.warn = originalWarn;
-		}
-	});
 
-	it("keeps inherited model-scope warnings non-fatal after Clarify switches parallel work to background", { skip: !asyncAvailable ? "jiti not available" : undefined }, async () => {
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [{ name: "worker", description: "Worker", model: "openai/gpt-5-mini" }],
-			projectAgentsDir: null,
-			modelScope: { enforce: true, allow: ["anthropic/*"] },
-		}));
-		const ctx = {
-			...makeCtx(makeSessionManagerRecorder().manager),
-			hasUI: true,
-			ui: {
-				custom: async () => ({
-					confirmed: true,
-					runInBackground: true,
-					templates: ["test"],
-					behaviorOverrides: [{}],
-				}),
-			},
-			modelRegistry: {
-				getAvailable: () => [{ provider: "openai", id: "gpt-5-mini", api: "openai-responses", reasoning: true }],
-			},
-		};
-		const warnings: string[] = [];
-		const originalWarn = console.warn;
-		console.warn = (message?: unknown) => warnings.push(String(message));
-		try {
-			const result = await executor.execute(
-				"id",
-				{ tasks: [{ agent: "worker", task: "test" }], clarify: true },
-				new AbortController().signal,
-				undefined,
-				ctx,
-			);
-			assert.equal(result.isError, undefined);
-			assert.ok(result.details?.asyncId);
-			assert.equal(warnings.length, 2);
-			assert.equal(warnings.every((warning) => warning.includes("outside the configured subagent model scope")), true);
-		} finally {
-			console.warn = originalWarn;
-		}
-	});
 
-	it("keeps raw goals at fork-wrapped async executor boundaries", { skip: !asyncAvailable ? "jiti not available" : undefined }, async () => {
-		const rawSingleGoal = "Direct forked single raw goal";
-		const rawParallelGoal = "Top-level forked first child raw goal";
-		const rawParallelChainGoal = "Parallel chain first child raw goal";
-		const paddedWorkflowGoal = "  preserve this workflow padding  ";
-		const literalPreambleGoal = `${DEFAULT_FORK_PREAMBLE}\n\nTask:\nliteral fresh-context text`;
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "echo", description: "Echo", defaultContext: "fork" },
-				{ name: "second", description: "Second" },
-			],
-			projectAgentsDir: null,
-		}));
-		const started: Array<{ id?: string; goal?: string }> = [];
-		executor.eventsApi.on(SUBAGENT_ASYNC_STARTED_EVENT, (event: unknown) => started.push(event as { id?: string; goal?: string }));
-		const forkManager = () => makeForkingSessionManagerRecorder({
-			sessionFile: path.join(tempDir, "parent-fork-goal.jsonl"),
-			leafId: "fork-goal-leaf",
-		}).manager;
 
-		for (const testCase of [
-			{
-				name: "direct single",
-				goal: rawSingleGoal,
-				params: { agent: "echo", task: rawSingleGoal, async: true, clarify: false },
-			},
-			{
-				name: "top-level parallel",
-				goal: rawParallelGoal,
-				params: { tasks: [{ agent: "echo", task: rawParallelGoal }, { agent: "second", task: "Second child" }], async: true, clarify: false },
-			},
-			{
-				name: "parallel chain whitespace workflow fallback",
-				goal: rawParallelChainGoal,
-				params: { task: "   ", chain: [{ parallel: [{ agent: "echo", task: rawParallelChainGoal }, { agent: "second", task: "Second chain child" }] }], async: true, clarify: false },
-			},
-			{
-				name: "padded workflow goal",
-				goal: paddedWorkflowGoal,
-				params: { task: paddedWorkflowGoal, chain: [{ agent: "echo", task: "Forked child" }], async: true, clarify: false },
-			},
-			{
-				name: "literal preamble in fresh child",
-				goal: literalPreambleGoal.slice(0, 120),
-				allowsLiteralPreamble: true,
-				params: { chain: [{ agent: "second", task: literalPreambleGoal }], async: true, clarify: false },
-			},
-		]) {
-			const result = await executor.execute(
-				`fork-goal-${testCase.name}`,
-				testCase.params,
-				new AbortController().signal,
-				undefined,
-				makeCtx(forkManager()),
-			);
-			assert.equal(result.isError, undefined, testCase.name);
-			assert.ok(result.details?.asyncId, `${testCase.name}: expected an async id`);
-			const event = started.find((entry) => entry.id === result.details?.asyncId);
-			assert.ok(event, `${testCase.name}: missing async-started event for ${result.details?.asyncId}`);
-			assert.equal(event.goal, testCase.goal, testCase.name);
-			if (!("allowsLiteralPreamble" in testCase)) {
-				assert.doesNotMatch(event.goal ?? "", /delegated subagent running from a fork/, testCase.name);
-			}
-		}
-	});
 
-	it("uses edited raw goals when clarification switches each mode to background", { skip: !asyncAvailable ? "jiti not available" : undefined }, async () => {
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "echo", description: "Echo", defaultContext: "fork" },
-				{ name: "second", description: "Second" },
-			],
-			projectAgentsDir: null,
-		}));
-		const started: Array<{ id?: string; goal?: string }> = [];
-		executor.eventsApi.on(SUBAGENT_ASYNC_STARTED_EVENT, (event: unknown) => started.push(event as { id?: string; goal?: string }));
 
-		for (const testCase of [
-			{
-				name: "single",
-				goal: "Edited single goal",
-				params: { agent: "echo", task: "Original single", async: true, clarify: true },
-				templates: ["Edited single goal"],
-			},
-			{
-				name: "parallel",
-				goal: "Edited parallel goal",
-				params: { tasks: [{ agent: "echo", task: "Original parallel" }, { agent: "second", task: "Second child" }], async: true, clarify: true },
-				templates: ["Edited parallel goal", "Second child"],
-			},
-			{
-				name: "chain",
-				goal: "Edited chain goal",
-				params: { chain: [{ agent: "echo", task: "Original chain" }], async: true, clarify: true },
-				templates: ["Edited chain goal"],
-			},
-		]) {
-			const forkManager = makeForkingSessionManagerRecorder({
-				sessionFile: path.join(tempDir, `parent-clarify-${testCase.name}.jsonl`),
-				leafId: `clarify-${testCase.name}-leaf`,
-			}).manager;
-			const ctx = {
-				...makeCtx(forkManager),
-				hasUI: true,
-				ui: {
-					custom: async () => ({
-						confirmed: true,
-						templates: testCase.templates,
-						behaviorOverrides: testCase.templates.map(() => undefined),
-						runInBackground: true,
-					}),
-				},
-			};
-			const result = await executor.execute(
-				`clarify-goal-${testCase.name}`,
-				testCase.params,
-				new AbortController().signal,
-				undefined,
-				ctx,
-			);
-			assert.equal(result.isError, undefined, testCase.name);
-			assert.ok(result.details?.asyncId, `${testCase.name}: expected an async id`);
-			const event = started.find((entry) => entry.id === result.details?.asyncId);
-			assert.equal(event?.goal, testCase.goal, testCase.name);
-			assert.doesNotMatch(event?.goal ?? "", /delegated subagent running from a fork/, testCase.name);
-		}
-	});
 
-	it("runs async chain requests in the background when clarify is omitted", { skip: !asyncAvailable ? "jiti not available" : undefined }, async () => {
-		const executor = makeExecutor();
 
-		const result = await executor.execute(
-			"id",
-			{
-				chain: [
-					{ agent: "echo", task: "task one" },
-					{ agent: "second", task: "task two" },
-				],
-				async: true,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(makeSessionManagerRecorder().manager),
-		);
-
-		assert.equal(result.isError, undefined);
-		assert.equal(result.details?.mode, "chain");
-		assert.ok(result.details?.asyncId, "expected an asyncId for background chain runs");
-		assert.match(result.content[0]?.text ?? "", /Async chain:/);
-	});
-
-	it("keeps explicit clarify async chain requests in the foreground", async () => {
-		const executor = makeExecutor();
-
-		const result = await executor.execute(
-			"id",
-			{
-				chain: [
-					{ agent: "echo", task: "task one" },
-					{ agent: "second", task: "task two" },
-				],
-				async: true,
-				clarify: true,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(makeSessionManagerRecorder().manager),
-		);
-
-		assert.equal(result.isError, undefined);
-		assert.equal(result.details?.mode, "chain");
-		assert.equal(result.details?.asyncId, undefined);
-		assert.doesNotMatch(result.content[0]?.text ?? "", /Async chain:/);
-	});
-
-	it("rejects invalid background top-level parallel requests during executor preflight", async () => {
-		const executor = makeExecutor();
-		for (const testCase of [
-			{
-				name: "max tasks",
-				params: { tasks: [{ agent: "echo", task: "task one", count: 9 }], async: true, clarify: false },
-				patterns: [/Max 8 tasks/],
-			},
-			{
-				name: "worktree cwd conflict",
-				params: {
-					tasks: [
-						{ agent: "echo", task: "task one" },
-						{ agent: "second", task: "task two", cwd: `${tempDir}/other` },
-					],
-					worktree: true,
-					async: true,
-					clarify: false,
-				},
-				patterns: [/worktree isolation uses the shared cwd/i, /task 2 \(second\) sets cwd/i],
-			},
-		]) {
-			const result = await executor.execute(
-				"id",
-				testCase.params,
-				new AbortController().signal,
-				undefined,
-				makeCtx(makeSessionManagerRecorder().manager),
-			);
-
-			assert.equal(result.isError, true, testCase.name);
-			for (const pattern of testCase.patterns) {
-				assert.match(result.content[0]?.text ?? "", pattern, testCase.name);
-			}
-		}
-	});
-
-	it("rejects async chain worktree runs with a conflicting task cwd", async () => {
-		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: "leaf-chain" });
-		const executor = makeExecutor();
-
-		const result = await executor.execute(
-			"id",
-			{
-				chain: [
-					{
-						parallel: [
-							{ agent: "echo", task: "p1" },
-							{ agent: "second", task: "p2", cwd: `${tempDir}/other` },
-						],
-						worktree: true,
-					},
-				],
-				async: true,
-				clarify: false,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
-
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /parallel chain step 1/i);
-		assert.match(result.content[0]?.text ?? "", /task 2 \(second\) sets cwd/i);
-	});
-
-	it("creates isolated forked sessions per chain step (including counted parallel steps)", async () => {
-		const { manager, openedPaths, branchedLeafIds } = makeForkingSessionManagerRecorder({
-			sessionFile: path.join(tempDir, "parent-chain.jsonl"),
-			leafId: "leaf-chain",
-		});
-		const executor = makeExecutor();
-
-		const result = await executor.execute(
-			"id",
-			{
-				chain: [
-					{ agent: "echo", task: "step 1" },
-					{ parallel: [{ agent: "echo", task: "p1", count: 2 }, { agent: "second", task: "p2", count: 2 }] },
-					{ agent: "second", task: "step 3" },
-				],
-				context: "fork",
-				clarify: false,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(manager),
-		);
-
-		assert.equal(result.isError, undefined);
-		assert.deepEqual(openedPaths, Array(6).fill(path.join(tempDir, "parent-chain.jsonl")));
-		assert.deepEqual(branchedLeafIds, Array(6).fill("leaf-chain"));
-		const sessionArgs = readSessionArgsFromCalls().filter((sessionFile) => path.dirname(sessionFile) === tempDir && path.basename(sessionFile).startsWith("fork-"));
-		assert.equal(sessionArgs.length, 6, "1 sequential + 4 parallel + 1 sequential");
-		assert.equal(new Set(sessionArgs).size, 6);
-	});
 
 	it("uses request cwd for management actions", async () => {
 		const executor = makeExecutor();
@@ -1827,35 +1244,18 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		);
 
 		assert.equal(result.isError, undefined);
-		const args = readAllCallArgs().find((callArgs) => (callArgs.at(-1) ?? "").startsWith(`Task: ${task}\n\n## Acceptance Contract`));
-		assert.ok(args, "expected a recorded mock pi call for this test task");
+		const args = readAllCallArgs()[0] ?? [];
+		const taskArg = args.at(-1) ?? "";
+		assert.equal(taskArg, `Task: ${task}`);
+		const systemIndex = args.findIndex((arg) => arg === "--system-prompt" || arg === "--append-system-prompt");
+		assert.notEqual(systemIndex, -1);
+		assert.match(args[systemIndex + 1] ?? "", /## Acceptance Contract/);
 		const modelIndex = args.indexOf("--model");
 		assert.notEqual(modelIndex, -1);
 		assert.equal(args[modelIndex + 1], "anthropic/claude-haiku-4-5");
 	});
 
-	it("resolves parallel task cwd values relative to the request cwd", async () => {
-		const worktreeDir = path.join(tempDir, "worktree");
-		writePackageSkill(path.join(worktreeDir, "packages", "app"), "parallel-step-skill");
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [{ name: "echo", description: "Echo test agent", skills: ["parallel-step-skill"] }],
-			projectAgentsDir: null,
-		}));
 
-		const result = await executor.execute(
-			"id",
-			{
-				tasks: [{ agent: "echo", task: "test", cwd: "packages/app" }],
-				cwd: worktreeDir,
-			},
-			new AbortController().signal,
-			undefined,
-			makeCtx(makeSessionManagerRecorder().manager),
-		);
-
-		assert.equal(result.isError, undefined);
-		assert.deepEqual(result.details?.results?.[0]?.skills, ["parallel-step-skill"]);
-	});
 
 	it("uses request cwd for project builtin overrides during management", async () => {
 		const tempHome = createTempDir("pi-subagent-home-");
