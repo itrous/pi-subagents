@@ -1,0 +1,28 @@
+{
+  "windowMode": "bind",
+  "requested": "fx/alpha,fx/gamma",
+  "cacheExistedBefore": false,
+  "cacheExistsAfter": true,
+  "toolsAfterCreate": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "activeAfterCreate": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "procs": {
+    "before": 0,
+    "afterCreate": 1,
+    "afterDispose": 0
+  },
+  "envEqualToInitial": {
+    "afterWindow": true,
+    "afterCreate": true,
+    "afterDispose": true
+  },
+  "parentMCP_DIRECT_TOOLS_now": null,
+  "errors": []
+}

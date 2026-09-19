@@ -1,0 +1,30 @@
++  963ms pi module loaded, exports: createAgentSession:function DefaultResourceLoader:function ModelRuntime:function SessionManager:function SettingsManager:function resolveCliModel:function
++  992ms prompt() start
++  993ms event message_end
++ 1081ms faux POST /v1/chat/completions msgs=2 toolResult=false tool=spike_respect
++ 1091ms event message_end
++ 1091ms event tool_execution_start spike_respect
++ 2593ms abort() called
++ 2595ms event tool_execution_end spike_respect isError=true
++ 2595ms event message_end
++ 2595ms event turn_end
++ 2595ms event message_end
++ 2595ms event turn_end
++ 2596ms event agent_end
++ 2597ms abort() resolved after 4ms
++ 2598ms prompt() settled {"ok":true} lastStop= error lastRole= assistant
++ 2598ms settle via abort
++ 2598ms dispose() called
++ 2598ms dispose() resolved after 0ms
++ 2598ms child sleep pid=7915 alive=true
++ 4598ms after wait: child sleep pid=7915 alive=false
++ 4599ms events after dispose: []
++ 4599ms ticks file:
+1093 start
+1098 spawned sleep pid=7915
+2099 tick 1 signal.aborted=false
+2594 tick 2 signal.aborted=true
+2594 aborted-observed i=3
+2598 session_shutdown handler start
+2598 session_shutdown handler end
+

@@ -1,0 +1,91 @@
+{
+  "parentCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/parent",
+  "envEqualAfterRuns": true,
+  "sessions": {
+    "A": {
+      "expectedCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/a",
+      "sessionId": "01a0bb0a-45dc-7445-8bb4-c9d3cbe50dd9",
+      "expectedBindings": {
+        "onecpi.review/1": {
+          "subject": "A-subject",
+          "root": "/root/A"
+        }
+      },
+      "probe": {
+        "instance": 1,
+        "sessionId": "01a0bb0a-45dc-7445-8bb4-c9d3cbe50dd9",
+        "ctxCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/a",
+        "processCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/parent",
+        "factoryProcessCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/parent",
+        "bindingsFactoryEnv": "{\"onecpi.review/1\":{\"subject\":\"A-subject\",\"root\":\"/root/A\"}}",
+        "bindingsCallEnv": null,
+        "bindingsBySessionId": {
+          "onecpi.review/1": {
+            "subject": "A-subject",
+            "root": "/root/A"
+          }
+        },
+        "startedAt": 1789844407856,
+        "endedAt": 1789844408256
+      },
+      "inline": {
+        "ctxCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/a",
+        "closureBindings": {
+          "onecpi.review/1": {
+            "subject": "A-subject",
+            "root": "/root/A"
+          }
+        }
+      },
+      "read": {
+        "tool": "read",
+        "isError": false,
+        "text": "CONTENT-A\n"
+      },
+      "errors": []
+    },
+    "B": {
+      "expectedCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/b",
+      "sessionId": "01a0bb0a-45e5-7445-8bb4-c9d5041b6142",
+      "expectedBindings": {
+        "onecpi.review/1": {
+          "subject": "B-subject",
+          "root": "/root/B"
+        }
+      },
+      "probe": {
+        "instance": 2,
+        "sessionId": "01a0bb0a-45e5-7445-8bb4-c9d5041b6142",
+        "ctxCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/b",
+        "processCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/parent",
+        "factoryProcessCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/parent",
+        "bindingsFactoryEnv": "{\"onecpi.review/1\":{\"subject\":\"B-subject\",\"root\":\"/root/B\"}}",
+        "bindingsCallEnv": null,
+        "bindingsBySessionId": {
+          "onecpi.review/1": {
+            "subject": "B-subject",
+            "root": "/root/B"
+          }
+        },
+        "startedAt": 1789844407859,
+        "endedAt": 1789844408259
+      },
+      "inline": {
+        "ctxCwd": "/private/tmp/claude-502/-Users-kiriller-src/193cabfb-7754-4a9d-8a64-151d822b6677/scratchpad/a1r0/c3c4/ws/b",
+        "closureBindings": {
+          "onecpi.review/1": {
+            "subject": "B-subject",
+            "root": "/root/B"
+          }
+        }
+      },
+      "read": {
+        "tool": "read",
+        "isError": false,
+        "text": "CONTENT-B\n"
+      },
+      "errors": []
+    }
+  },
+  "overlapMs": 397
+}

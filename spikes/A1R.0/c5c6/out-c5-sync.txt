@@ -1,0 +1,9 @@
+[child] +  955ms pi module loaded, exports: createAgentSession:function DefaultResourceLoader:function ModelRuntime:function SessionManager:function SettingsManager:function resolveCliModel:function
+[child] +  997ms prompt() start
+[child] +  999ms event message_end
+[child] + 1084ms faux POST /v1/chat/completions msgs=2 toolResult=false tool=spike_sync
+[child] + 1094ms event message_end
+[child] + 1095ms event tool_execution_start spike_sync
+[wrapper +10013ms] TIMEOUT: child pid=8243 silent for 8816ms; SIGTERM
+[wrapper] SIGTERM ignored; SIGKILL 8243
+[wrapper +12022ms] child exit code=null signal=SIGKILL
