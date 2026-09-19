@@ -1,0 +1,15 @@
+1393 start
+1395 spawned sleep pid=3001
+2397 tick 1 signal.aborted=false
+3399 tick 2 signal.aborted=true
+4414 tick 3 signal.aborted=true
+5415 tick 4 signal.aborted=true
+5895 session_shutdown handler start
+5895 session_shutdown handler end
+6418 tick 5 signal.aborted=true
+7419 tick 6 signal.aborted=true
+8421 tick 7 signal.aborted=true
+9423 tick 8 signal.aborted=true
+10424 tick 9 signal.aborted=true
+11427 tick 10 signal.aborted=true
+11428 end

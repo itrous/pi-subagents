@@ -1,0 +1,7 @@
+1093 start
+1098 spawned sleep pid=7915
+2099 tick 1 signal.aborted=false
+2594 tick 2 signal.aborted=true
+2594 aborted-observed i=3
+2598 session_shutdown handler start
+2598 session_shutdown handler end

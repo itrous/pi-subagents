@@ -1,0 +1,18 @@
+mode=CONTROL (no check) root=c6/pkg
+esc-abs.ts                 LOADED value="abs.js"                                                  escaped-code-ran=["outside-abs/abs.js"]
+esc-createRequire.ts       LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]
+esc-dyn-abs-cjs.ts         LOADED value="outside.cjs"                                             escaped-code-ran=[]
+esc-dyn-abs-mjs.ts         LOADED value="abs.mjs"                                                 escaped-code-ran=["outside-abs/abs.mjs"]
+esc-dyn-abs.ts             LOADED value="abs.js"                                                  escaped-code-ran=["outside-abs/abs.js"]
+esc-entry-mjs.mjs          LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]
+esc-fs-eval.ts             LOADED value="fs-eval:76"                                              escaped-code-ran=["fs-eval"]
+esc-mainModule.ts          LOADED value="process.mainModule undefined"                            escaped-code-ran=[]
+esc-module-constructor.ts  LOADED value="outside.cjs"                                             escaped-code-ran=[]
+esc-rel-cjs.ts             LOADED value="outside.cjs"                                             escaped-code-ran=[]
+esc-rel-js.ts              LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]
+esc-rel-mjs.ts             LOADED value="outside.mjs"                                             escaped-code-ran=["outside.mjs"]
+esc-rel-ts.ts              LOADED value="outside.ts"                                              escaped-code-ran=["outside.ts"]
+esc-symlink.ts             LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]
+ok-inside.ts               LOADED value=["inside.ts","inside.mjs"]                                escaped-code-ran=[]
+Module._resolveFilename unchanged: true; Module._load unchanged: true; _extensions[.js] unchanged: true
+Module._resolveFilename.name= source-starts=function(request, parent, isMain, option

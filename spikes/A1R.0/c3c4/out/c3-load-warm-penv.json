@@ -1,0 +1,134 @@
+{
+  "windowMode": "load",
+  "requested": "fx/alpha,fx/gamma",
+  "cacheExistedBefore": true,
+  "cacheExistsAfter": true,
+  "toolsAfterCreate": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "activeAfterCreate": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "toolsAfterPrompt": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "llmToolsSeen": [
+    [
+      "fx_alpha",
+      "fx_gamma",
+      "mcp"
+    ],
+    [
+      "fx_alpha",
+      "fx_gamma",
+      "mcp"
+    ]
+  ],
+  "results": [
+    {
+      "tool": "fx_alpha",
+      "isError": false,
+      "text": "fixture:alpha:pid=25260"
+    }
+  ],
+  "procs": {
+    "before": 0,
+    "afterCreate": 0,
+    "afterPrompt": 1,
+    "afterDispose": 0
+  },
+  "envEqualToInitial": {
+    "afterWindow": true,
+    "afterCreate": true,
+    "afterPrompt": true,
+    "afterDispose": true
+  },
+  "parentMCP_DIRECT_TOOLS_now": "fx/beta,fx/delta",
+  "errors": [],
+  "mcpDirectToolsReads": [
+    {
+      "phase": "pre-create/in-window",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "pre-create/in-window",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "pre-create/in-window",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "pre-create/in-window",
+      "value": "fx/alpha,fx/gamma",
+      "frames": [
+        "installMcpAdapter (pi-mcp-adapter/index.ts:318:30)",
+        "mcpAdapter (pi-mcp-adapter/index.ts:1901:5)"
+      ]
+    },
+    {
+      "phase": "after-window(after-reload)",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "after-window(after-reload)",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "after-window(after-reload)",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "prompt",
+      "value": "fx/beta,fx/delta",
+      "frames": [
+        "Proxy.initializeMcp (pi-mcp-adapter/init.ts:438:33)"
+      ]
+    },
+    {
+      "phase": "prompt",
+      "value": "fx/beta,fx/delta",
+      "frames": [
+        "resolveEnv (pi-mcp-adapter/server-manager.ts:1825:39)",
+        "McpServerManager.createConnection (pi-mcp-adapter/server-manager.ts:909:14)"
+      ]
+    },
+    {
+      "phase": "prompt",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "prompt",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "dispose",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "post",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    },
+    {
+      "phase": "post",
+      "value": "fx/beta,fx/delta",
+      "frames": []
+    }
+  ]
+}

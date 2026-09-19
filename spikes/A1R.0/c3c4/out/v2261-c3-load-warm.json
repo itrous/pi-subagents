@@ -1,0 +1,74 @@
+{
+  "windowMode": "load",
+  "requested": "fx/alpha,fx/gamma",
+  "cacheExistedBefore": true,
+  "cacheExistsAfter": true,
+  "toolsAfterCreate": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "activeAfterCreate": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "toolsAfterPrompt": [
+    "fx_alpha",
+    "fx_gamma",
+    "mcp"
+  ],
+  "llmToolsSeen": [
+    [
+      "fx_alpha",
+      "fx_gamma",
+      "mcp"
+    ],
+    [
+      "fx_alpha",
+      "fx_gamma",
+      "mcp"
+    ]
+  ],
+  "results": [
+    {
+      "tool": "fx_alpha",
+      "isError": false,
+      "text": "fixture:alpha:pid=87819"
+    }
+  ],
+  "procs": {
+    "before": 0,
+    "afterCreate": 0,
+    "afterPrompt": 1,
+    "afterDispose": 0
+  },
+  "envEqualToInitial": {
+    "afterWindow": true,
+    "afterCreate": true,
+    "afterPrompt": true,
+    "afterDispose": true
+  },
+  "parentMCP_DIRECT_TOOLS_now": null,
+  "errors": [],
+  "mcpDirectToolsReads": [
+    {
+      "phase": "pre-create/in-window",
+      "value": "fx/alpha,fx/gamma",
+      "frames": [
+        "pi-mcp-adapter/index.ts:123:30)",
+        "pi-mcp-adapter/index.ts:935:5)"
+      ]
+    },
+    {
+      "phase": "after-window(after-reload)",
+      "frames": [
+        "pi-mcp-adapter/init.ts:374:33)"
+      ]
+    },
+    {
+      "phase": "post",
+      "frames": []
+    }
+  ]
+}

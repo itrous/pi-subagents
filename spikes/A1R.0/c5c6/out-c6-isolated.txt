@@ -1,0 +1,63 @@
+esc-abs.ts                 LOADED value="abs.js"                                                  escaped-code-ran=["outside-abs/abs.js"]
+esc-createRequire.ts       LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]
+esc-dyn-abs-cjs.ts         LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]
+esc-dyn-abs-mjs.ts         LOADED value="abs.mjs"                                                 escaped-code-ran=["outside-abs/abs.mjs"]
+esc-dyn-abs.ts             LOADED value="abs.js"                                                  escaped-code-ran=["outside-abs/abs.js"]
+esc-entry-mjs.mjs          LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]
+esc-fs-eval.ts             LOADED value="fs-eval:76"                                              escaped-code-ran=["fs-eval"]
+esc-mainModule.ts          LOADED value="process.mainModule undefined"                            escaped-code-ran=[]
+esc-module-constructor.ts  LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]
+esc-rel-cjs.ts             LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]
+esc-rel-js.ts              LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]
+esc-rel-mjs.ts             LOADED value="outside.mjs"                                             escaped-code-ran=["outside.mjs"]
+esc-rel-plain-cjs-js.ts    LOADED value="outside-plain.js"                                        escaped-code-ran=["outside-plain.js"]
+esc-rel-ts.ts              LOADED value="outside.ts"                                              escaped-code-ran=["outside.ts"]
+esc-symlink.ts             LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]
+esc-via-inside-cjs.ts      LOADED value="outside-plain.js"                                        escaped-code-ran=["outside-plain.js"]
+ok-inside.ts               LOADED value=["inside.ts","inside.mjs"]                                escaped-code-ran=[]
+mode=CONTROL (no check) root=c6/pkg
+Module._resolveFilename unchanged: true; Module._load unchanged: true; _extensions[.js] unchanged: true
+Module._resolveFilename.name= source-starts=function(request, parent, isMain, option
+
+esc-abs.ts                 THREW C6_BLOCKED transform of $D/c6/outside-abs/abs.js                 escaped-code-ran=[]  transformed=["c6/pkg/esc-abs.ts","c6/outside-abs/abs.js"]
+esc-createRequire.ts       LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]  transformed=["c6/pkg/esc-createRequire.ts"]
+esc-dyn-abs-cjs.ts         LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]  transformed=["c6/pkg/esc-dyn-abs-cjs.ts"]
+esc-dyn-abs-mjs.ts         LOADED value="abs.mjs"                                                 escaped-code-ran=["outside-abs/abs.mjs"]  transformed=["c6/pkg/esc-dyn-abs-mjs.ts"]
+esc-dyn-abs.ts             THREW C6_BLOCKED transform of $D/c6/outside-abs/abs.js                 escaped-code-ran=[]  transformed=["c6/pkg/esc-dyn-abs.ts","c6/outside-abs/abs.js"]
+esc-entry-mjs.mjs          LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]  transformed=[]
+esc-fs-eval.ts             LOADED value="fs-eval:76"                                              escaped-code-ran=["fs-eval"]  transformed=["c6/pkg/esc-fs-eval.ts"]
+esc-mainModule.ts          LOADED value="process.mainModule undefined"                            escaped-code-ran=[]  transformed=["c6/pkg/esc-mainModule.ts"]
+esc-module-constructor.ts  LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]  transformed=["c6/pkg/esc-module-constructor.ts"]
+esc-rel-cjs.ts             LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]  transformed=["c6/pkg/esc-rel-cjs.ts"]
+esc-rel-js.ts              THREW C6_BLOCKED transform of $D/c6/outside.js                         escaped-code-ran=[]  transformed=["c6/pkg/esc-rel-js.ts","c6/outside.js"]
+esc-rel-mjs.ts             LOADED value="outside.mjs"                                             escaped-code-ran=["outside.mjs"]  transformed=["c6/pkg/esc-rel-mjs.ts"]
+esc-rel-plain-cjs-js.ts    LOADED value="outside-plain.js"                                        escaped-code-ran=["outside-plain.js"]  transformed=["c6/pkg/esc-rel-plain-cjs-js.ts"]
+esc-rel-ts.ts              THREW C6_BLOCKED transform of $D/c6/outside.ts                         escaped-code-ran=[]  transformed=["c6/pkg/esc-rel-ts.ts","c6/outside.ts"]
+esc-symlink.ts             THREW C6_BLOCKED transform of $D/c6/outside.js                         escaped-code-ran=[]  transformed=["c6/pkg/esc-symlink.ts","c6/outside.js"]
+esc-via-inside-cjs.ts      LOADED value="outside-plain.js"                                        escaped-code-ran=["outside-plain.js"]  transformed=["c6/pkg/esc-via-inside-cjs.ts"]
+ok-inside.ts               LOADED value=["inside.ts","inside.mjs"]                                escaped-code-ran=[]  transformed=["c6/pkg/ok-inside.ts","c6/pkg/lib/inside.ts"]
+mode=GUARD (transform check) root=c6/pkg
+Module._resolveFilename unchanged: true; Module._load unchanged: true; _extensions[.js] unchanged: true
+Module._resolveFilename.name= source-starts=function(request, parent, isMain, option
+
+esc-abs.ts                 THREW C6_BLOCKED_RESOLVE $D/c6/outside-abs/abs.js from $D/c6/pkg/esc-abs.ts -> $D/c6/outside-abs/abs.js escaped-code-ran=[]  transformed=["c6/pkg/esc-abs.ts"]
+esc-createRequire.ts       LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]  transformed=["c6/pkg/esc-createRequire.ts"]
+esc-dyn-abs-cjs.ts         THREW C6_BLOCKED_RESOLVE $D/c6/outside.cjs from $D/c6/pkg/esc-dyn-abs-cjs.ts -> $D/c6/outside.cjs escaped-code-ran=[]  transformed=["c6/pkg/esc-dyn-abs-cjs.ts"]
+esc-dyn-abs-mjs.ts         THREW C6_BLOCKED_RESOLVE $D/c6/outside-abs/abs.mjs from $D/c6/pkg/esc-dyn-abs-mjs.ts -> $D/c6/outside-abs/abs.mjs escaped-code-ran=[]  transformed=["c6/pkg/esc-dyn-abs-mjs.ts"]
+esc-dyn-abs.ts             THREW C6_BLOCKED_RESOLVE $D/c6/outside-abs/abs.js from $D/c6/pkg/esc-dyn-abs.ts -> $D/c6/outside-abs/abs.js escaped-code-ran=[]  transformed=["c6/pkg/esc-dyn-abs.ts"]
+esc-entry-mjs.mjs          LOADED value="outside.js"                                              escaped-code-ran=["outside.js"]  transformed=[]
+esc-fs-eval.ts             LOADED value="fs-eval:76"                                              escaped-code-ran=["fs-eval"]  transformed=["c6/pkg/esc-fs-eval.ts"]
+esc-mainModule.ts          LOADED value="process.mainModule undefined"                            escaped-code-ran=[]  transformed=["c6/pkg/esc-mainModule.ts"]
+esc-module-constructor.ts  LOADED value="outside.cjs"                                             escaped-code-ran=["outside.cjs"]  transformed=["c6/pkg/esc-module-constructor.ts"]
+esc-rel-cjs.ts             THREW C6_BLOCKED_RESOLVE ../outside.cjs from $D/c6/pkg/esc-rel-cjs.ts -> $D/c6/outside.cjs escaped-code-ran=[]  transformed=["c6/pkg/esc-rel-cjs.ts"]
+esc-rel-js.ts              THREW C6_BLOCKED_RESOLVE ../outside.js from $D/c6/pkg/esc-rel-js.ts -> $D/c6/outside.js escaped-code-ran=[]  transformed=["c6/pkg/esc-rel-js.ts"]
+esc-rel-mjs.ts             THREW C6_BLOCKED_RESOLVE ../outside.mjs from $D/c6/pkg/esc-rel-mjs.ts -> $D/c6/outside.mjs escaped-code-ran=[]  transformed=["c6/pkg/esc-rel-mjs.ts"]
+esc-rel-plain-cjs-js.ts    THREW C6_BLOCKED_RESOLVE ../outside-plain.js from $D/c6/pkg/esc-rel-plain-cjs-js.ts -> $D/c6/outside-plain.js escaped-code-ran=[]  transformed=["c6/pkg/esc-rel-plain-cjs-js.ts"]
+esc-rel-ts.ts              THREW C6_BLOCKED_RESOLVE ../outside.ts from $D/c6/pkg/esc-rel-ts.ts -> $D/c6/outside.ts escaped-code-ran=[]  transformed=["c6/pkg/esc-rel-ts.ts"]
+esc-symlink.ts             THREW C6_BLOCKED_RESOLVE ./link-to-outside.js from $D/c6/pkg/esc-symlink.ts -> $D/c6/outside.js escaped-code-ran=[]  transformed=["c6/pkg/esc-symlink.ts"]
+esc-via-inside-cjs.ts      LOADED value="outside-plain.js"                                        escaped-code-ran=["outside-plain.js"]  transformed=["c6/pkg/esc-via-inside-cjs.ts"]
+ok-inside.ts               LOADED value=["inside.ts","inside.mjs"]                                escaped-code-ran=[]  transformed=["c6/pkg/ok-inside.ts","c6/pkg/lib/inside.ts"]
+mode=GUARD+PROLOGUE (transform check + require/jitiImport rebinding) root=c6/pkg
+Module._resolveFilename unchanged: true; Module._load unchanged: true; _extensions[.js] unchanged: true
+Module._resolveFilename.name= source-starts=function(request, parent, isMain, option
+

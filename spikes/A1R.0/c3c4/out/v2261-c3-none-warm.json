@@ -1,0 +1,62 @@
+{
+  "windowMode": "none",
+  "requested": "fx/alpha,fx/gamma",
+  "cacheExistedBefore": true,
+  "cacheExistsAfter": true,
+  "toolsAfterCreate": [
+    "mcp"
+  ],
+  "activeAfterCreate": [
+    "mcp"
+  ],
+  "toolsAfterPrompt": [
+    "mcp"
+  ],
+  "llmToolsSeen": [
+    [
+      "mcp"
+    ],
+    [
+      "mcp"
+    ]
+  ],
+  "results": [
+    {
+      "tool": "fx_alpha",
+      "isError": true,
+      "text": "Tool fx_alpha not found"
+    }
+  ],
+  "procs": {
+    "before": 0,
+    "afterCreate": 0,
+    "afterPrompt": 0,
+    "afterDispose": 0
+  },
+  "envEqualToInitial": {
+    "afterCreate": true,
+    "afterPrompt": true,
+    "afterDispose": true
+  },
+  "parentMCP_DIRECT_TOOLS_now": null,
+  "errors": [],
+  "mcpDirectToolsReads": [
+    {
+      "phase": "pre-create/in-window",
+      "frames": [
+        "pi-mcp-adapter/index.ts:123:30)",
+        "pi-mcp-adapter/index.ts:935:5)"
+      ]
+    },
+    {
+      "phase": "pre-create/in-window",
+      "frames": [
+        "pi-mcp-adapter/init.ts:374:33)"
+      ]
+    },
+    {
+      "phase": "post",
+      "frames": []
+    }
+  ]
+}
