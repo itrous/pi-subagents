@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { cloneJsonWithinByteLimit } from "../slash/delegation-json.ts";
+import { cloneJsonWithinByteLimit } from "../bound/bound-json.ts";
 
 export const LAUNCH_RECEIPT_VERSION = 1 as const;
 export const LAUNCH_RECEIPT_TTL_MS = 30_000 as const;

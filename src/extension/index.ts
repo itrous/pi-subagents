@@ -60,6 +60,7 @@ import { hasLiveSubagentWork, registerPiWebSessionLiveness } from "../integratio
 import { createRetainedNestedRouteTracker } from "../runs/background/retained-nested-route-tracker.ts";
 import { listHerdrProjectPaneRoots, restoreHerdrProjectPaneSnapshots } from "../inspectors/herdr/project-panes.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
+import { registerBoundControlPlane } from "../bound/index.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { resolveWaitToolConfig } from "../runs/background/subagent-wait.ts";
 import { registerWaitTool } from "../runs/background/wait-tool.ts";
@@ -763,6 +764,15 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		state,
 	});
 
+	registerBoundControlPlane({
+		pi,
+		events: pi.events,
+		getContext: () => state.lastUiContext,
+		config,
+		waitToolEnabled: waitToolConfig.enabled,
+		resolveCapabilityCeiling: (sessionId) => resolveCurrentSubagentCapabilityCeiling(sessionId),
+		expandTilde,
+	});
 
 	const parameters = createSubagentParamsSchema();
 	const tool: ToolDefinition<typeof parameters, Details> = {

@@ -3,13 +3,26 @@
 This repository is the `itrous/pi-subagents` security-focused fork used by the
 OneCPI native review transport.
 
-## Status: A1R.1 — base only, bound capability absent
+## Status: A1R.3 — control plane v2 up, leaf execution and capability pending
 
-This build is upstream `8bd275bba0dc13273eff366e348378d41ad5535e` plus a few
-unwired fork modules. The A1 bound/active-runtime contract is **not** available
-here: the child-process machinery it relied on was removed upstream in `d9bc62f8`
-(#1844, in-process child sessions), so `boundForegroundLeaf` is not announced and
-every OneCPI readiness probe fails closed (`malformed_ping`).
+This build is upstream `8bd275bba0dc13273eff366e348378d41ad5535e` plus the fork
+control plane on `subagents:bound:v2:*` (`src/bound/`): ping, side-effect-free
+preflight with the v2 launch contract, receipt/HMAC admission with a final
+re-resolution, targeted cancel, the attempt coordinator and identity registries,
+reload/drain, and a bounded stop for every child session. Leaf execution and the
+`boundForegroundLeaf` capability land in A1R.4, so the preflight contract is
+served but nothing is launched yet (an admitted request terminates with
+`unavailable_context`), and every OneCPI **A1 (v1)** readiness probe still fails
+closed with `malformed_ping`: the bound layer does not listen on
+`subagents:rpc:v1:*` at all.
+
+**Platform limit.** The bound channel answers everywhere, but a launch contract
+is only issued on a Linux host: `resolveActiveRuntimeSourceIdentity`
+(`src/extension/source-identity.ts:277`) returns `unverified_source` on any
+non-Linux platform or without `/proc/self/fd`. On macOS and Windows the ping
+carries `sourceIdentityUnavailable`, `capabilities` is empty, and preflight
+refuses with `unverified_source`. Tests inject the identity through the
+`resolveSourceIdentity` seam and therefore stay green on every platform.
 
 Migration plan and accepted decisions: `PLAN-A1R-inprocess-upstream-migration.md`;
 spike results: `LANDING-A1R.0-spikes.md`; plan review rounds and the executor
@@ -30,13 +43,21 @@ OneCPI may install until stage A1R.7.
 
 ## Fork delta in this build
 
-Every upstream file is taken from the A1R.1 base verbatim
-(`git diff --name-only --diff-filter=MD <base> HEAD` is empty). What remains of the
-A1 delta are unreferenced modules kept for stages A1R.3/A1R.4:
-`src/shared/canonical-json.ts`, `src/extension/source-identity.ts`,
-`src/runs/shared/core-runtime-tools.ts`, `src/runs/shared/package-tree-evidence.ts`,
-`src/api/launch-receipt.ts`, `src/api/active-bound-environment.ts`,
-`src/slash/bound-identity-registry.ts`.
+Every upstream file is taken from the A1R.1 base verbatim except one hook point:
+`git diff --name-only --diff-filter=MD <base> HEAD -- src` reports exactly five
+paths — `src/extension/index.ts` (T1: the import and the single
+`registerBoundControlPlane({...})` call right after the RPC bridge) plus the four
+carries `src/agents/agent-memory.ts`, `src/runs/shared/long-running-guard.ts`,
+`src/runs/shared/permissions.ts`, `src/shared/jsonl-writer.ts`. The accompanying
+upstream tests are the same four files as before; A1R.3 edits no upstream test.
+
+The bound layer lives in `src/bound/` (entry `src/bound/index.ts`) and owns six
+further modules outside it: `src/shared/canonical-json.ts`,
+`src/extension/source-identity.ts`, `src/runs/shared/core-runtime-tools.ts`,
+`src/runs/shared/package-tree-evidence.ts`, `src/api/launch-receipt.ts`,
+`src/slash/bound-identity-registry.ts`. That exact set is published in the
+contract as `toolRegistry.runtimeExtensions` and is checked against the import
+closure of the layer entry by `test/unit/bound-layer-manifest.test.ts`.
 
 Removed here because they encode the child-process model or its installer:
 the bound tool-registry runtime (bootstrap/gate/runtime/state), package mediator,
@@ -44,22 +65,22 @@ denied-tool runtime, registry collector, `pi-command-evidence`,
 `bound-runtime-evidence`, `active-bound-resolver`, `active-bound-runtime`,
 `install-lib.mjs`, `test/probes/`, and the fork tests covering them.
 
-Coverage gaps introduced here, to be closed when the layer is reconnected:
+Both coverage gaps recorded for A1R.1 are closed here:
 
-- `src/api/active-bound-environment.ts` is kept but its only test
-  (`test/unit/active-bound-environment.test.ts`) was removed with the deleted
-  `active-bound-runtime`; the env-name/byte-limit parser is untested in this build.
-- upstream `src/slash/delegation-json.ts` has no `isProxy` rejection, which the fork
-  copy had. `cloneJsonWithinByteLimit` now returns `{ok:true}` for a Proxy input and
-  invokes its traps, and the kept `src/api/launch-receipt.ts` validates untrusted
-  receipts/tokens through it. Latent while the bound layer is unwired; A1R.3 must
-  restore the strict clone in a fork module (or in an upstream PR) before wiring.
+- `src/api/active-bound-environment.ts` was removed; its namespace parser now lives
+  in `src/bound/bound-bindings.ts` (bindings replace spawn environment variables in
+  the in-process model) and is covered by `test/unit/bound-bindings.test.ts`.
+- the strict JSON clone is back as a fork copy, `src/bound/bound-json.ts`: upstream
+  `src/slash/delegation-json.ts` byte for byte plus a single divergence, a Proxy is
+  rejected before any own-key inspection. `src/api/launch-receipt.ts` validates
+  untrusted receipts and cancellation tokens through that copy.
+  `test/unit/bound-json.test.ts` diffs both implementations over a value corpus, so
+  a drift from upstream is visible.
 
-Deferred to A1R.3/A1R.4 (removed only because they cannot typecheck against the new
-upstream API, not because the behaviour is dropped): `tool-registry-proof`,
-`denied-tool-proof`, `active-bound-preflight`, `active-bound-package-extensions`,
-`bound-pending-cancellation-registry`, `structured-attempt-coordinator`, plus their
-tests and `test/fixtures/active-runtime-parent-probe.ts`.
+Still deferred to A1R.4 (execution): `denied-tool-proof`, the `ChildSessionFactory`
+decorator, the `streamFunction` barrier, the `MCP_DIRECT_TOOLS` window, the denial
+collector, `test/fixtures/active-runtime-parent-probe.ts`, and the announcement of
+`boundForegroundLeaf`.
 
 Installation from this fork uses upstream `install.mjs` or, as OneCPI does,
 `pi install git:https://github.com/itrous/pi-subagents.git@<40-hex-commit>`. The
@@ -88,8 +109,15 @@ OneCPI consumers migrate in A1R.6.
 npm ci
 npm run typecheck
 LC_ALL=C npm run test:unit
-LC_ALL=C npm run test:integration
+LC_ALL=C npm run test:integration   # под нагрузкой добавить --test-concurrency=2
 node --experimental-strip-types --test test/unit/source-identity.test.ts
+# Fork edit surface: exactly five upstream src files (T1 plus four carries).
+git diff --name-only --diff-filter=MD 8bd275bba0dc13273eff366e348378d41ad5535e -- src
+# The layer manifest equals the import closure of src/bound/index.ts.
+node --experimental-strip-types --test test/unit/bound-layer-manifest.test.ts
+# The bound capability is not announced, and no upstream channel is occupied.
+git grep -n boundForegroundLeaf -- src
+git grep -n "subagents:rpc:v1\|prompt-template:subagent" -- src/bound
 ```
 
 `LC_ALL=C` is required: upstream `test/integration/async-execution.part-2.test.ts`
@@ -97,4 +125,5 @@ matches English git error text and fails under a localized git, on this build an
 a pristine upstream checkout alike.
 
 A1 probes (`test:probe:active-runtime`), the packed-package check and the real
-Git-installed stop-gate return in A1R.5 once the bound layer is reconnected.
+Git-installed stop-gate return in A1R.5 once leaf execution is connected; that
+probe runs on a Linux host, because source identity is unavailable elsewhere.

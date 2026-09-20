@@ -1,0 +1,133 @@
+{
+	"version": 2,
+	"prospectiveRunId": "123e4567-e89b-12d3-a456-426614174000",
+	"requestDigest": "<requestDigest>",
+	"serverInstanceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+	"sourceIdentityDigest": "5cdb208c1f145e5ec428a02b56e7567f00075bcc6bbeb40e9293ece23429ea3e",
+	"activeSessionDigest": "<activeSessionDigest>",
+	"canonicalCwd": "<canonicalCwd>",
+	"agent": {
+		"name": "reviewer",
+		"source": "project",
+		"definitionProjectionVersion": 2,
+		"definitionDigest": "<definitionDigest>",
+		"fileContentDigest": "<fileContentDigest>"
+	},
+	"model": "openai/gpt-5",
+	"modelRegistryDigest": "cb698ec8c14ae1d2956c17bb83e15af51bf7fb1e51e2bf01c1fb9ffbed62ee4a",
+	"modelCandidates": [
+		"openai/gpt-5:medium"
+	],
+	"thinking": "medium",
+	"context": "fresh",
+	"taskDigest": "f876e08efde0c9b7354d3fcc311e44e63da65180d71c7528cdd502fb2cfb8662",
+	"skills": [
+		{
+			"name": "review-notes",
+			"source": "project",
+			"contentDigest": "<skillContentDigest>"
+		}
+	],
+	"bindings": {
+		"version": 1,
+		"namespace": "onecpi-review/1",
+		"names": [],
+		"valuesDigest": "a6a20076da005b27c9afc3a5d5b2457798c0ac817d1abc38b2fee4398ac3f133"
+	},
+	"packageExtensions": [],
+	"packageExtensionsDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+	"tools": {
+		"effectiveAllowlist": [
+			"read"
+		],
+		"requiredChildTools": [
+			"read"
+		],
+		"disableAmbientExtensions": true
+	},
+	"mcpDirectTools": [],
+	"toolRegistry": {
+		"modelApi": "openai-responses",
+		"piRuntime": {
+			"name": "@earendil-works/pi-coding-agent",
+			"version": "0.85.1",
+			"packageRootDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+			"filesDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+			"fileCount": 1056
+		},
+		"piRuntimeVersion": "0.85.1",
+		"projection": {
+			"version": 1,
+			"projectionVersion": 1,
+			"required": [
+				"read"
+			],
+			"effectiveCallerTools": [
+				"read"
+			],
+			"internalTools": [],
+			"missing": [],
+			"digest": "250659437988abe00ffcf2c9a56325ba3337dc6b084015ed497b825666045575"
+		},
+		"runtimeExtensions": {
+			"version": 2,
+			"entries": [
+				{
+					"name": "bound/index.ts",
+					"contentDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+				},
+				{
+					"name": "bound/bound-resolver.ts",
+					"contentDigest": "4444444444444444444444444444444444444444444444444444444444444444"
+				}
+			]
+		},
+		"runtimeBuiltins": {
+			"version": 1,
+			"names": [
+				"bash",
+				"edit",
+				"find",
+				"grep",
+				"ls",
+				"powershell",
+				"read",
+				"write"
+			],
+			"digest": "a9cb2d86a50a09dc0105a1f15f24d69d307f1b03d97c98e9c246b3f999797693"
+		},
+		"digest": "fc6c4d19445afdaff73b33b900be3d1d195f65e78efef6b5b9e1740a3ede8a08"
+	},
+	"roots": {
+		"baseRootPathDigest": "<baseRootPathDigest>",
+		"baseRootIdentityDigest": "<baseRootIdentityDigest>",
+		"sessionRootDigest": "<sessionRootDigest>",
+		"sessionDirDigest": "<sessionDirDigest>",
+		"sessionFileDigest": "<sessionFileDigest>"
+	},
+	"policy": {
+		"foregroundOnly": true,
+		"async": false,
+		"clarify": false,
+		"share": false,
+		"acceptance": false,
+		"mission": false,
+		"output": false,
+		"outputMode": "inline",
+		"artifacts": false,
+		"watchdog": false,
+		"control": false,
+		"intercom": false,
+		"usageBudget": false,
+		"waitToolEnabled": false,
+		"parentDepth": 0,
+		"maxSubagentDepth": 1,
+		"modelScopeDigest": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+	},
+	"result": {
+		"kind": "text"
+	},
+	"timeoutMs": 60000,
+	"launchInputsDigest": "<launchInputsDigest>",
+	"digest": "<digest>"
+}
