@@ -47,34 +47,26 @@ export function createBoundedChildShutdownFactory(base: ChildSessionFactory, opt
 			const children = [...live].filter((child) => !child.detached);
 			for (const child of children) live.delete(child);
 			for (const child of children) child.shutDown = true;
+			// Дедлайн один на всю остановку, а не на каждую фазу: И3.11 обещает возврат в
+			// пределах дедлайна, а не трёх подряд.
 			const deadline = schedule(deadlineMs);
+			const within = async (work: () => Promise<unknown>): Promise<void> => {
+				await Promise.race([work(), deadline.promise]);
+			};
 			try {
-				await Promise.race([Promise.allSettled(children.map((child) => child.abort())), deadline.promise]);
+				await within(() => Promise.allSettled(children.map((child) => child.abort())));
+				// Dispose before returning, not on a later tick: the caller must observe a
+				// released child. Собственный dispose ребёнка тоже под дедлайном: у
+				// remote-детей он ходит к чужому процессу и не ограничен ничем.
+				await within(() => Promise.allSettled(children.map((child) => {
+					try { return child.dispose(); } catch { return Promise.resolve(); }
+				})));
+				// Базовая фабрика держит тех же детей в своём live-наборе и в dispose() снова
+				// ждёт их abort() без предела (upstream child-session.ts:386-393). Без этой
+				// гонки дедлайн был бы мёртв: остановка сессии всё равно висела бы вечно.
+				await within(() => base.dispose());
 			} finally {
 				deadline.cancel();
-			}
-			// Dispose before returning, not on a later tick: the caller must observe a
-			// released child. Собственный dispose ребёнка тоже под дедлайном: у remote-детей
-			// он ходит к чужому процессу и не ограничен ничем.
-			const childDisposeDeadline = schedule(deadlineMs);
-			try {
-				await Promise.race([
-					Promise.allSettled(children.map((child) => {
-						try { return child.dispose(); } catch { return Promise.resolve(); }
-					})),
-					childDisposeDeadline.promise,
-				]);
-			} finally {
-				childDisposeDeadline.cancel();
-			}
-			// Базовая фабрика держит тех же детей в своём live-наборе и в dispose() снова
-			// ждёт их abort() без предела (upstream child-session.ts:386-393). Без этой гонки
-			// дедлайн был бы мёртв: остановка сессии всё равно висела бы вечно.
-			const baseDeadline = schedule(deadlineMs);
-			try {
-				await Promise.race([base.dispose(), baseDeadline.promise]);
-			} finally {
-				baseDeadline.cancel();
 			}
 		},
 	};

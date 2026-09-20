@@ -147,6 +147,10 @@ export function createBoundRuntimeService(options: BoundRuntimeServiceOptions): 
 		if (enforceAdmissionLifetime
 			? !receipts.verify(binding.receipt) || !receipts.verifyCancellation(binding.cancellationToken)
 			: !receipts.verifyCancellationAuthenticity(binding.cancellationToken)) return undefined;
+		// Ветка без проверки срока не ходит в receipts.verify, поэтому структуру receipt
+		// проверяем здесь: подменённый `{}` обязан дать отказ, а не TypeError из
+		// синхронного обработчика шины.
+		if (!binding.receipt || typeof binding.receipt !== "object" || !binding.receipt.payload || typeof binding.receipt.payload !== "object") return undefined;
 		const receipt = binding.receipt.payload; const token = binding.cancellationToken.payload;
 		const consistent = receipt.serverInstanceId === options.serverInstanceId
 			&& token.serverInstanceId === receipt.serverInstanceId && token.sourceIdentityDigest === receipt.sourceIdentityDigest

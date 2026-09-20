@@ -311,6 +311,10 @@ test("an exhausted coordinator answers with a terminal and releases the reservat
 		// Резерв второй идентичности отпущен.
 		assert.equal(h.identities.has(FIXTURE_SERVER_INSTANCE_ID, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"), false);
 		assert.equal(h.identities.size(), 1);
+		// Повтор того же конверта не даёт второго терминала на одну попытку (И3.9):
+		// записи в координаторе нет, поэтому дубль ловит сам мост.
+		await h.bus.deliver(BOUND_LAUNCH_EVENT, launchEnvelope(second.request, second.binding));
+		assert.equal(h.bus.of(BOUND_TERMINAL_EVENT).length, afterFirst + 1);
 	} finally { h.dispose(); }
 });
 

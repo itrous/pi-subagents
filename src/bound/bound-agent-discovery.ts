@@ -89,9 +89,12 @@ export function resolveBoundAgent(input: {
 	// Refinement-оверлей проекта попадает в системный промпт листа через
 	// buildEffectiveSystemPrompt, но не в digest контракта. Пока он не аттестован,
 	// запуск отвергается — как это делал A1 (main:src/api/active-bound-resolver.ts:269).
+	// Имя, непригодное как имя файла, означает, что оверлея быть не может: upstream в
+	// этом случае просто не добавляет его (agent-refinements.ts:426-433), поэтому отказ
+	// здесь закрыл бы разрешённый запуск.
 	let hasRefinement: boolean;
 	try { hasRefinement = (deps.refinementExists ?? ((cwd: string, name: string) => fs.existsSync(getAgentRefinementPath(cwd, name))))(input.activeCwd, agent.name); }
-	catch { return { ok: false, code: "unsupported_mode" }; }
+	catch { hasRefinement = false; }
 	if (hasRefinement) return { ok: false, code: "unsupported_mode" };
 	const explicitSkills = Array.isArray(input.skill)
 		? input.skill.map((name) => name.trim()).filter(Boolean)

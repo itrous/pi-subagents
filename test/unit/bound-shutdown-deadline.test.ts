@@ -181,3 +181,32 @@ test("the deadline also bounds the base factory dispose", async () => {
 	]);
 	assert.equal(settled, "returned");
 });
+
+test("the deadline covers the whole shutdown, not each phase separately", async () => {
+	// Ни abort(), ни dispose() ребёнка, ни dispose() фабрики не завершаются: возврат
+	// обязан уложиться в один дедлайн, а не в три подряд (И3.11).
+	const base: ChildSessionFactory = {
+		async create() {
+			return {
+				subscribe: () => () => {},
+				prompt: async () => {},
+				steer: async () => {},
+				followUp: async () => {},
+				abort: () => new Promise<void>(() => {}),
+				dispose: () => new Promise<void>(() => {}),
+				messages: [],
+				sessionFile: undefined,
+				sessionId: "stuck-all",
+				modelId: undefined,
+			} as unknown as ChildSession;
+		},
+		dispose: () => new Promise<void>(() => {}),
+	};
+	const deadlineMs = 40;
+	const wrapper = createBoundedChildShutdownFactory(base, { deadlineMs });
+	await wrapper.create({} as never);
+	const startedAt = Date.now();
+	await wrapper.dispose();
+	const elapsed = Date.now() - startedAt;
+	assert.ok(elapsed < deadlineMs * 2, `остановка заняла ${elapsed} мс при дедлайне ${deadlineMs} мс`);
+});

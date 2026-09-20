@@ -64,9 +64,16 @@ export function registerBoundLaunchBridge(options: BoundLaunchBridgeOptions): Bo
 	 * клиент ждал бы ответа, которого не будет. Повтор уже осевшей тройки молчит —
 	 * второй терминал на одну попытку недопустим.
 	 */
+	// Тройки, терминал которых опубликован в обход координатора (ёмкость исчерпана,
+	// записи нет): повтор того же конверта не должен дать второй терминал.
+	const sunkByCapacity = new Set<string>();
 	const rejectWithTerminal = (tuple: BoundAttemptTuple, code: string): void => {
 		const value = terminal(tuple, code);
-		if (options.coordinator.commitRejected(tuple, options.runtimeId, value) === "capacity") sink(value);
+		if (options.coordinator.commitRejected(tuple, options.runtimeId, value) !== "capacity") return;
+		const key = `${tuple.requestId}\u0000${tuple.ownerRunId}\u0000${tuple.nodeId}`;
+		if (sunkByCapacity.has(key)) return;
+		sunkByCapacity.add(key);
+		sink(value);
 	};
 
 	const onLaunch = async (raw: unknown): Promise<void> => {

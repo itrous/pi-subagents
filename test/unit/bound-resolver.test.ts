@@ -213,3 +213,23 @@ test("an existing session root refuses rather than resolving over it", () => {
 	fs.mkdirSync(path.join(fs.realpathSync(fixture.sessionDir), result.contract.prospectiveRunId), { recursive: true });
 	assert.deepEqual(resolve(), { ok: false, code: "host_required" });
 });
+
+test("an agent name that cannot be a refinement file name still launches", () => {
+	// Оверлей для такого имени невозможен: upstream просто не добавляет его, значит
+	// закрывать запуск незачем (иначе отказ без причины).
+	fixture.writeAgent(fs.readFileSync(fixture.agentPath, "utf8").replace("name: reviewer", "name: my reviewer"));
+	const outcome = resolve({}, { agent: "my reviewer" });
+	assert.equal(outcome.ok, true, outcome.ok ? "" : `refused with ${outcome.code}`);
+});
+
+test("an empty subagentOnlyExtensions list widens nothing and stays allowed", () => {
+	// Upstream нормализует пустую строку frontmatter в [], расширений лист не получает.
+	// Пустая строка frontmatter — именно та форма, которую upstream нормализует в [];
+	// запись `[]` он разбирает как имя расширения "[]", это другой случай.
+	fixture.writeAgent(fs.readFileSync(fixture.agentPath, "utf8").replace("tools: read", "tools: read\nsubagentOnlyExtensions:"));
+	const outcome = resolve();
+	assert.equal(outcome.ok, true, outcome.ok ? "" : `refused with ${outcome.code}`);
+	// Контроль: непустой список у проектного агента по-прежнему закрывает запуск.
+	fixture.writeAgent(fs.readFileSync(fixture.agentPath, "utf8").replace("subagentOnlyExtensions:", "subagentOnlyExtensions:\n  - ./ext.ts"));
+	assert.deepEqual(resolve(), { ok: false, code: "unsupported_mode" });
+});

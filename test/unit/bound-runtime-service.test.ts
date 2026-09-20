@@ -103,6 +103,13 @@ test("a receipt is accepted only when it is ours, live, and unmodified", async (
 	const data = await successful(own);
 	const binding = bindingOf(data);
 	assert.ok(own.verifyActiveCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding));
+	// Подменённый receipt обязан дать отказ: исключение вылетело бы из синхронного
+	// обработчика шины и потеряло бы отмену.
+	for (const broken of [{}, { payload: null }, { payload: 1 }]) {
+		const tampered = { ...binding, receipt: broken } as unknown as typeof binding;
+		assert.equal(own.verifyActiveCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, tampered), undefined);
+		assert.equal(own.verifyPendingCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, tampered), undefined);
+	}
 	// A foreign service holds a different secret.
 	const foreign = service({ receipts: createLaunchReceiptService({ secret: new Uint8Array(32).fill(9), clock: () => now }) });
 	assert.equal(foreign.verifyActiveCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding), undefined);
