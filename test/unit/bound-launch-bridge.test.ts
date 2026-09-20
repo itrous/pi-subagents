@@ -52,10 +52,10 @@ interface Harness {
 	dispose(): void;
 }
 
-function harness(executionPort?: BoundExecutionPort, runtimeId = "gen-1"): Harness {
+function harness(executionPort?: BoundExecutionPort, runtimeId = "gen-1", identityCapacity?: number): Harness {
 	const bus = createBus();
 	const service = createBoundRuntimeService(fixture.serviceOptions() as unknown as BoundRuntimeServiceOptions);
-	const coordinator = new BoundAttemptCoordinator();
+	const coordinator = identityCapacity === undefined ? new BoundAttemptCoordinator() : new BoundAttemptCoordinator(identityCapacity);
 	const identities = getBoundIdentityRegistry({});
 	const pending = new BoundPendingCancellationRegistryV2(() => 1_000);
 	const bridge = registerBoundLaunchBridge({
@@ -291,4 +291,38 @@ test("a terminal from a stopped generation reaches the client once through the n
 		assert.equal(oldBus.of(BOUND_TERMINAL_EVENT).length, 0);
 		newBridge.dispose();
 	} finally { service.dispose(); }
+});
+
+test("an exhausted coordinator answers with a terminal and releases the reservation", async () => {
+	// Ёмкость 1: первая попытка занимает её целиком, вторая отвергается координатором.
+	const h = harness(undefined, "gen-1", 1);
+	try {
+		const first = await preflighted(h.service);
+		await h.bus.deliver(BOUND_LAUNCH_EVENT, launchEnvelope(first.request, first.binding));
+		const afterFirst = h.bus.of(BOUND_TERMINAL_EVENT).length;
+		assert.equal(h.identities.size(), 1);
+		const second = await preflighted(h.service, { requestId: "request-3", nodeId: "node-3", prospectiveRunId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" });
+		await h.bus.deliver(BOUND_LAUNCH_EVENT, launchEnvelope(second.request, second.binding));
+		// Клиент получает терминал, а не молчание.
+		const terminals = h.bus.of(BOUND_TERMINAL_EVENT);
+		assert.equal(terminals.length, afterFirst + 1);
+		assert.equal(terminals.at(-1)!.requestId, "request-3");
+		assert.equal(terminals.at(-1)!.status, "unavailable_context");
+		// Резерв второй идентичности отпущен.
+		assert.equal(h.identities.has(FIXTURE_SERVER_INSTANCE_ID, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"), false);
+		assert.equal(h.identities.size(), 1);
+	} finally { h.dispose(); }
+});
+
+test("a launch envelope whose tuple differs from the signed request is refused", async () => {
+	const h = harness();
+	try {
+		const { request, binding } = await preflighted(h.service);
+		await h.bus.deliver(BOUND_LAUNCH_EVENT, launchEnvelope(request, binding, { requestId: "envelope-x" }));
+		// Отчётность и отмена должны идти по подписанной тройке, поэтому запуск закрыт.
+		assert.equal(h.bus.of(BOUND_STARTED_EVENT).length, 0);
+		const terminals = h.bus.of(BOUND_TERMINAL_EVENT);
+		assert.equal(terminals.at(-1)!.requestId, "envelope-x");
+		assert.equal(terminals.at(-1)!.status, "invalid_request");
+	} finally { h.dispose(); }
 });

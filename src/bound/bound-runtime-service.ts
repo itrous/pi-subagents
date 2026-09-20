@@ -222,8 +222,11 @@ export function createBoundRuntimeService(options: BoundRuntimeServiceOptions): 
 				launch: { request: parsed.request, contract: resolved.contract, agent: resolved.agent, packageExtensionPaths: resolved.packageExtensionPaths },
 			};
 		},
-		verifyPendingCancellation(tuple, binding) { return verifyBinding(tuple, binding, false); },
-		verifyActiveCancellation(tuple, binding) { return verifyBinding(tuple, binding, true); },
+		// Семантика A1: TTL receipt ограничивает окно приёма, а не срок жизни принятой
+		// попытки. Поэтому время проверяется у pending-отмены (запуск ещё не принят) и
+		// НЕ проверяется у активной: иначе попытку нельзя остановить через 30 с.
+		verifyPendingCancellation(tuple, binding) { return verifyBinding(tuple, binding, true); },
+		verifyActiveCancellation(tuple, binding) { return verifyBinding(tuple, binding, false); },
 		dispose() {
 			if (disposed) return;
 			disposed = true;

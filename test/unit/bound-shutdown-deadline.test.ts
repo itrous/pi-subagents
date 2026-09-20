@@ -146,3 +146,38 @@ test("a non-detached child beside a detached one still gets abort, dispose, and 
 	assert.deepEqual(detached.log, []);
 	assert.equal(detached.shutDown, undefined);
 });
+
+test("the deadline also bounds the base factory dispose", async () => {
+	// Базовая фабрика, которая держит ребёнка в live и после child.dispose():
+	// её dispose() снова ждёт abort() без предела — ровно как upstream
+	// (child-session.ts:386-393), если ребёнок не снялся с учёта.
+	const live = new Set<ChildSession>();
+	const base: ChildSessionFactory = {
+		async create() {
+			const child = {
+				subscribe: () => () => {},
+				prompt: async () => {},
+				steer: async () => {},
+				followUp: async () => {},
+				abort: () => new Promise<void>(() => {}),
+				dispose: async () => {},
+				messages: [],
+				sessionFile: undefined,
+				sessionId: "held",
+				modelId: undefined,
+			} as unknown as ChildSession;
+			live.add(child);
+			return child;
+		},
+		async dispose() {
+			await Promise.allSettled([...live].map((child) => child.abort()));
+		},
+	};
+	const wrapper = createBoundedChildShutdownFactory(base, { scheduleDeadline: immediateDeadline });
+	await wrapper.create({} as never);
+	const settled = await Promise.race([
+		wrapper.dispose().then(() => "returned" as const),
+		new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 2_000)),
+	]);
+	assert.equal(settled, "returned");
+});

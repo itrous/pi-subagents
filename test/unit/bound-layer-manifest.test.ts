@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -34,6 +35,7 @@ const KEPT_A1_MODULES = [
  */
 const EXPECTED_UPSTREAM_DEPENDENCIES = [
 	"@earendil-works/pi-coding-agent",
+	"agents/agent-refinements.ts",
 	"agents/agents.ts",
 	"agents/skills.ts",
 	"api/delegation.ts",
@@ -51,28 +53,28 @@ const EXPECTED_UPSTREAM_DEPENDENCIES = [
 
 const IMPORT_SPECIFIER = /(?:^|[\s;{(])(?:import|export)\s*(?:type\s*)?(?:[^'"()]*?\bfrom\s*)?["']([^"']+)["']/gm;
 
-function listForkOwned(extra: readonly string[] = []): Set<string> {
+function listForkOwned(extra: readonly string[] = [], root: string = sourceRoot): Set<string> {
 	const owned = new Set<string>(KEPT_A1_MODULES);
-	for (const entry of fs.readdirSync(path.join(sourceRoot, "bound"))) owned.add(`bound/${entry}`);
+	for (const entry of fs.readdirSync(path.join(root, "bound"))) owned.add(`bound/${entry}`);
 	for (const entry of extra) owned.add(entry);
 	return owned;
 }
 
-function importsOf(moduleName: string): string[] {
-	const source = fs.readFileSync(path.join(sourceRoot, ...moduleName.split("/")), "utf8");
+function importsOf(moduleName: string, root: string = sourceRoot): string[] {
+	const source = fs.readFileSync(path.join(root, ...moduleName.split("/")), "utf8");
 	const found: string[] = [];
 	for (const match of source.matchAll(IMPORT_SPECIFIER)) {
 		const specifier = match[1]!;
 		if (specifier.startsWith("node:")) continue;
 		if (!specifier.startsWith(".")) { found.push(specifier); continue; }
-		const resolved = path.relative(sourceRoot, path.resolve(path.dirname(path.join(sourceRoot, ...moduleName.split("/"))), specifier));
+		const resolved = path.relative(root, path.resolve(path.dirname(path.join(root, ...moduleName.split("/"))), specifier));
 		found.push(resolved.split(path.sep).join("/"));
 	}
 	return found;
 }
 
-function auditLayer(extraOwned: readonly string[] = []): { owned: string[]; upstream: string[] } {
-	const forkOwned = listForkOwned(extraOwned);
+function auditLayer(extraOwned: readonly string[] = [], root: string = sourceRoot): { owned: string[]; upstream: string[] } {
+	const forkOwned = listForkOwned(extraOwned, root);
 	const seen = new Set<string>();
 	const upstream = new Set<string>();
 	const queue = ["bound/index.ts"];
@@ -80,7 +82,7 @@ function auditLayer(extraOwned: readonly string[] = []): { owned: string[]; upst
 		const current = queue.pop()!;
 		if (seen.has(current)) continue;
 		seen.add(current);
-		for (const dependency of importsOf(current)) {
+		for (const dependency of importsOf(current, root)) {
 			if (forkOwned.has(dependency)) queue.push(dependency);
 			else upstream.add(dependency);
 		}
@@ -118,20 +120,22 @@ test("the import closure of the layer entry equals the manifest, fork-owned modu
 });
 
 test("a fork module outside the manifest fails the audit", () => {
-	const probe = path.join(sourceRoot, "bound", "__manifest-audit-probe.ts");
-	fs.writeFileSync(probe, 'export const probe = 1;\n', "utf8");
+	// Проба идёт по копии слоя во временном каталоге: рабочее дерево не трогается,
+	// поэтому прерывание прогона не оставляет в src/bound инородный импорт.
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "bound-manifest-audit-"));
 	try {
-		const entry = path.join(sourceRoot, "bound", "index.ts");
-		const original = fs.readFileSync(entry, "utf8");
-		fs.writeFileSync(entry, `import "./__manifest-audit-probe.ts";\n${original}`, "utf8");
-		try {
-			const audit = auditLayer();
-			assert.ok(audit.owned.includes("bound/__manifest-audit-probe.ts"));
-			assert.notDeepEqual(audit.owned, [...BOUND_LAYER_MODULES].sort());
-		} finally {
-			fs.writeFileSync(entry, original, "utf8");
-		}
+		// Копируется весь src: обход спускается и в сохранённые модули A1 вне bound/.
+		fs.cpSync(sourceRoot, root, { recursive: true });
+		fs.writeFileSync(path.join(root, "bound", "__manifest-audit-probe.ts"), 'export const probe = 1;\n', "utf8");
+		const entry = path.join(root, "bound", "index.ts");
+		fs.writeFileSync(entry, `import "./__manifest-audit-probe.ts";\n${fs.readFileSync(entry, "utf8")}`, "utf8");
+		const audit = auditLayer([], root);
+		assert.ok(audit.owned.includes("bound/__manifest-audit-probe.ts"));
+		assert.notDeepEqual(audit.owned, [...BOUND_LAYER_MODULES].sort());
+		// Положительный контроль: рабочее дерево осталось нетронутым.
+		assert.equal(fs.existsSync(path.join(sourceRoot, "bound", "__manifest-audit-probe.ts")), false);
+		assert.deepEqual(auditLayer().owned, [...BOUND_LAYER_MODULES].sort());
 	} finally {
-		fs.rmSync(probe, { force: true });
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });

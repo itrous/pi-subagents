@@ -33,6 +33,13 @@ export function createBoundedChildShutdownFactory(base: ChildSessionFactory, opt
 		async create(launch) {
 			const child = await base.create(launch);
 			live.add(child);
+			// Штатно утилизированный ребёнок снимается с учёта: иначе следующая остановка
+			// сессии снова звала бы ему abort(), а detached-дети держались бы вечно.
+			const ownDispose = child.dispose.bind(child);
+			child.dispose = (...args: Parameters<ChildSession["dispose"]>) => {
+				live.delete(child);
+				return ownDispose(...args);
+			};
 			return child;
 		},
 		async dispose() {
@@ -47,11 +54,28 @@ export function createBoundedChildShutdownFactory(base: ChildSessionFactory, opt
 				deadline.cancel();
 			}
 			// Dispose before returning, not on a later tick: the caller must observe a
-			// released child, and upstream already bounds this step by its own timeout.
-			await Promise.allSettled(children.map((child) => {
-				try { return child.dispose(); } catch { return Promise.resolve(); }
-			}));
-			await base.dispose();
+			// released child. Собственный dispose ребёнка тоже под дедлайном: у remote-детей
+			// он ходит к чужому процессу и не ограничен ничем.
+			const childDisposeDeadline = schedule(deadlineMs);
+			try {
+				await Promise.race([
+					Promise.allSettled(children.map((child) => {
+						try { return child.dispose(); } catch { return Promise.resolve(); }
+					})),
+					childDisposeDeadline.promise,
+				]);
+			} finally {
+				childDisposeDeadline.cancel();
+			}
+			// Базовая фабрика держит тех же детей в своём live-наборе и в dispose() снова
+			// ждёт их abort() без предела (upstream child-session.ts:386-393). Без этой гонки
+			// дедлайн был бы мёртв: остановка сессии всё равно висела бы вечно.
+			const baseDeadline = schedule(deadlineMs);
+			try {
+				await Promise.race([base.dispose(), baseDeadline.promise]);
+			} finally {
+				baseDeadline.cancel();
+			}
 		},
 	};
 	Object.defineProperty(wrapper, MARKER, { value: true, enumerable: false, configurable: false, writable: false });

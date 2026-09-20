@@ -115,11 +115,15 @@ test("a receipt is accepted only when it is ours, live, and unmodified", async (
 	const tampered = structuredClone(binding);
 	tampered.cancellationToken.payload.nodeId = "node-2";
 	assert.equal(own.verifyActiveCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-2" }, tampered), undefined);
-	// Expiry closes the admission window.
+	// TTL закрывает окно приёма, а не жизнь принятой попытки (семантика A1).
 	now = 1_000 + 30_000;
-	assert.equal(own.verifyActiveCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding), undefined);
-	// Authenticity without the lifetime check still holds for a pending cancel.
-	assert.ok(own.verifyPendingCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding));
+	// Pending-отмена приходит до приёма и живёт внутри того же окна.
+	assert.equal(own.verifyPendingCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding), undefined);
+	// Принятая попытка работает дольше окна (таймаут листа — минуты), и адресная
+	// отмена обязана её останавливать: проверяется подлинность, а не срок.
+	assert.ok(own.verifyActiveCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding));
+	// Приём после истечения окна закрыт.
+	assert.deepEqual(await own.admit(fixture.request(), binding), { ok: false, code: "invalid_request" });
 	own.dispose();
 	assert.equal(own.verifyPendingCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding), undefined);
 	assert.equal(own.verifyActiveCancellation({ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1" }, binding), undefined);

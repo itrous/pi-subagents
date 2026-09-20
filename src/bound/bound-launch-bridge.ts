@@ -58,6 +58,17 @@ export function registerBoundLaunchBridge(options: BoundLaunchBridgeOptions): Bo
 
 	const sink = (value: BoundTerminal): void => { options.events.emit(BOUND_TERMINAL_EVENT, value); };
 
+	/**
+	 * Отказ до записи попытки. Координатор хранит терминал и публикует его сам, но при
+	 * исчерпании ёмкости запись не создаётся: тогда терминал уходит напрямую, иначе
+	 * клиент ждал бы ответа, которого не будет. Повтор уже осевшей тройки молчит —
+	 * второй терминал на одну попытку недопустим.
+	 */
+	const rejectWithTerminal = (tuple: BoundAttemptTuple, code: string): void => {
+		const value = terminal(tuple, code);
+		if (options.coordinator.commitRejected(tuple, options.runtimeId, value) === "capacity") sink(value);
+	};
+
 	const onLaunch = async (raw: unknown): Promise<void> => {
 		if (stopped) return;
 		const envelope = parseBoundLaunchEnvelope(raw);
@@ -67,22 +78,30 @@ export function registerBoundLaunchBridge(options: BoundLaunchBridgeOptions): Bo
 		const bindingKey = boundCancellationBindingKey(envelope.binding);
 		const admitted = await options.service.admit(envelope.request, envelope.binding);
 		if (!admitted.ok) {
-			options.coordinator.commitRejected(tuple, options.runtimeId, terminal(tuple, admitted.code === "invalid_request" ? "invalid_request" : "unavailable_context"));
+			rejectWithTerminal(tuple, admitted.code === "invalid_request" ? "invalid_request" : "unavailable_context");
+			return;
+		}
+		// Тройка конверта должна совпадать с тройкой подписанного запроса: иначе
+		// отчётность и отмена шли бы по одной тройке, а доказательство — по другой,
+		// и попытка стала бы неотменяемой.
+		const signed = admitted.launch.request;
+		if (signed.requestId !== tuple.requestId || signed.ownerRunId !== tuple.ownerRunId || signed.nodeId !== tuple.nodeId) {
+			rejectWithTerminal(tuple, "invalid_request");
 			return;
 		}
 		const prospectiveRunId = admitted.launch.request.prospectiveRunId;
 		const reservation = identities.reserve(serverInstanceId, prospectiveRunId);
 		if (reservation !== "reserved") {
-			options.coordinator.commitRejected(tuple, options.runtimeId, terminal(tuple, reservation === "duplicate" ? "duplicate_node" : "unavailable_context"));
+			rejectWithTerminal(tuple, reservation === "duplicate" ? "duplicate_node" : "unavailable_context");
 			return;
 		}
 		const attempt = options.coordinator.admit(tuple, options.runtimeId, bindingKey);
 		if (!attempt.accepted) {
 			identities.release(serverInstanceId, prospectiveRunId);
 			if (attempt.reason === "duplicate_node") {
-				options.coordinator.commitRejected(tuple, options.runtimeId, terminal(tuple, "duplicate_node"));
+				rejectWithTerminal(tuple, "duplicate_node");
 			} else if (attempt.reason === "capacity") {
-				options.coordinator.commitRejected(tuple, options.runtimeId, terminal(tuple, "unavailable_context"));
+				rejectWithTerminal(tuple, "unavailable_context");
 			}
 			// A duplicate tuple was already settled once; a second terminal is not published.
 			return;
