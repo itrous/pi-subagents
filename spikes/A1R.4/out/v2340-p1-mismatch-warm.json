@@ -1,0 +1,59 @@
+{
+  "cwdMode": "mismatch",
+  "layer": "pi",
+  "configOverride": false,
+  "adapter": "/Users/kiriller/.pi/agent/npm/node_modules/pi-mcp-adapter/index.ts",
+  "processCwd": "/Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/runs/v2340-p1-mismatch-warm/ws-parent",
+  "sessionCwd": "/Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/runs/v2340-p1-mismatch-warm/ws-leaf",
+  "configPath": "/Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/runs/v2340-p1-mismatch-warm/ws-leaf/.pi/mcp.json",
+  "requested": "fx/alpha,fx/gamma,fy/beta,fy/delta",
+  "expected": [
+    "fx_alpha",
+    "fx_gamma",
+    "fy_beta",
+    "fy_delta"
+  ],
+  "activeAfterCreate": [
+    "mcp"
+  ],
+  "allAfterCreate": [
+    "mcp"
+  ],
+  "activeAfterSettle": [
+    "mcp"
+  ],
+  "allAfterSettle": [
+    "mcp"
+  ],
+  "activeAfterPrompt": [
+    "mcp"
+  ],
+  "complete": {
+    "afterCreate": false,
+    "afterSettle": false,
+    "afterPrompt": false
+  },
+  "results": [
+    {
+      "tool": "fx_alpha",
+      "isError": true,
+      "text": "Tool fx_alpha not found"
+    }
+  ],
+  "llmToolsSeen": [
+    [
+      "mcp"
+    ],
+    [
+      "mcp"
+    ]
+  ],
+  "procs": {
+    "before": 0,
+    "afterCreate": 0,
+    "afterDispose": 0
+  },
+  "envEqualToInitial": true,
+  "parentMCP_DIRECT_TOOLS_now": null,
+  "errors": []
+}

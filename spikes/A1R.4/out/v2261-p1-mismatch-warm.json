@@ -1,0 +1,79 @@
+{
+  "cwdMode": "mismatch",
+  "layer": "pi",
+  "configOverride": false,
+  "adapter": "/Users/kiriller/src/onecpi/node_modules/pi-mcp-adapter/index.ts",
+  "processCwd": "/Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/runs/v2261-p1-mismatch-warm/ws-parent",
+  "sessionCwd": "/Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/runs/v2261-p1-mismatch-warm/ws-leaf",
+  "configPath": "/Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/runs/v2261-p1-mismatch-warm/ws-leaf/.pi/mcp.json",
+  "requested": "fx/alpha,fx/gamma,fy/beta,fy/delta",
+  "expected": [
+    "fx_alpha",
+    "fx_gamma",
+    "fy_beta",
+    "fy_delta"
+  ],
+  "activeAfterCreate": [
+    "mcp"
+  ],
+  "allAfterCreate": [
+    "mcp"
+  ],
+  "activeAfterSettle": [
+    "fx_alpha",
+    "fx_gamma",
+    "fy_beta",
+    "fy_delta",
+    "mcp"
+  ],
+  "allAfterSettle": [
+    "fx_alpha",
+    "fx_gamma",
+    "fy_beta",
+    "fy_delta",
+    "mcp"
+  ],
+  "activeAfterPrompt": [
+    "fx_alpha",
+    "fx_gamma",
+    "fy_beta",
+    "fy_delta",
+    "mcp"
+  ],
+  "complete": {
+    "afterCreate": false,
+    "afterSettle": true,
+    "afterPrompt": true
+  },
+  "results": [
+    {
+      "tool": "fx_alpha",
+      "isError": false,
+      "text": "fixture:alpha:pid=4282"
+    }
+  ],
+  "llmToolsSeen": [
+    [
+      "fx_alpha",
+      "fx_gamma",
+      "fy_beta",
+      "fy_delta",
+      "mcp"
+    ],
+    [
+      "fx_alpha",
+      "fx_gamma",
+      "fy_beta",
+      "fy_delta",
+      "mcp"
+    ]
+  ],
+  "procs": {
+    "before": 0,
+    "afterCreate": 2,
+    "afterDispose": 0
+  },
+  "envEqualToInitial": true,
+  "parentMCP_DIRECT_TOOLS_now": null,
+  "errors": []
+}

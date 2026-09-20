@@ -1,0 +1,13 @@
+{
+  "mode": "fake-no-stream",
+  "piRoot": "/opt/homebrew/Cellar/pi-coding-agent/0.85.1/libexec/lib/node_modules/@earendil-works/pi-coding-agent",
+  "error": "TypeError: Cannot read properties of undefined (reading 'tools')\n    at AgentSession.getActiveToolNames (file:///opt/homebrew/Cellar/pi-coding-agent/0.85.1/libexec/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js:636:33)\n    at selfCheck (file:///Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/p2.mjs:68:86)\n    at async file:///Users/kiriller/src/pi-subagents.feat-a1r-base/spikes/A1R.4/p2.mjs:81:16",
+  "verdict": false,
+  "durationMs": 14.9,
+  "providerRequests": 0,
+  "fsUnchanged": false,
+  "fsDiff": {
+    "before": 3,
+    "after": 5
+  }
+}

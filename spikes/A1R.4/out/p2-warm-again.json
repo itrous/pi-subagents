@@ -1,0 +1,18 @@
+{
+  "mode": "real",
+  "piRoot": "/opt/homebrew/Cellar/pi-coding-agent/0.85.1/libexec/lib/node_modules/@earendil-works/pi-coding-agent",
+  "checks": {
+    "hasLoaded": true,
+    "hasAgent": true,
+    "hasStreamFunction": true,
+    "hasGetActiveToolNames": true,
+    "activeToolNamesSample": 4,
+    "canShadowStreamFunction": true
+  },
+  "error": null,
+  "verdict": true,
+  "durationMs": 16.1,
+  "providerRequests": 0,
+  "fsUnchanged": true,
+  "fsDiff": null
+}
