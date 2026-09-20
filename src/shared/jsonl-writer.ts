@@ -50,6 +50,9 @@ export function createJsonlWriter(
 	let backpressured = false;
 	let closed = false;
 	let bytesWritten = 0;
+	// Ошибка потока во время close(): callback end() уже не придёт, и без этого
+	// разрешения close() висел бы вечно.
+	let closeResolve: (() => void) | undefined;
 	const maxBytes = deps.maxBytes ?? DEFAULT_MAX_JSONL_BYTES;
 	// The mirror is best effort: a stream that cannot open or write (for example
 	// because its directory was removed) must not surface as an uncaught error.
@@ -60,6 +63,8 @@ export function createJsonlWriter(
 			backpressured = false;
 			source.resume();
 		}
+		closeResolve?.();
+		closeResolve = undefined;
 	});
 
 	return {
@@ -86,7 +91,13 @@ export function createJsonlWriter(
 			closed = true;
 			const current = stream;
 			stream = undefined;
-			await new Promise<void>((resolve) => current.end(() => resolve()));
+			await new Promise<void>((resolve) => {
+				closeResolve = resolve;
+				current.end(() => {
+					closeResolve = undefined;
+					resolve();
+				});
+			});
 		},
 	};
 }

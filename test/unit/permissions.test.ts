@@ -9,10 +9,11 @@ import {
 } from "../../src/runs/shared/permissions.ts";
 
 describe("native child permissions", () => {
-	it("defaults every unconfigured tool and bash to pass-through", () => {
+	it("defaults every unconfigured tool and runtime shell to pass-through", () => {
 		assert.equal(permissionDecision(undefined, "write"), "allow");
 		assert.equal(permissionDecision({ write: "deny" }, "unknown_tool"), "allow");
 		assert.equal(permissionDecision({ write: "deny" }, "bash"), "allow");
+		assert.equal(permissionDecision({ powershell: "deny" }, "powershell"), "allow");
 		assert.equal(resolvePermissionRules(), undefined);
 	});
 
@@ -23,8 +24,9 @@ describe("native child permissions", () => {
 		), { edit: "deny", read: "deny" });
 	});
 
-	it("rejects bash and coordination-tool rules", () => {
+	it("rejects runtime shell and coordination-tool rules", () => {
 		assert.throws(() => validatePermissionRules({ bash: "ask" }, "permissions"), /pi-guard/);
+		assert.throws(() => validatePermissionRules({ powershell: "ask" }, "permissions"), /pi-guard/);
 		assert.throws(() => validatePermissionRules({ contact_supervisor: "deny" }, "permissions"), /reserved for child coordination/);
 		assert.throws(() => validatePermissionConfig({ rules: { write: "sometimes" } }), /allow, ask, or deny/);
 	});

@@ -17,6 +17,7 @@ class MockStream implements JsonlWriteStream {
 	writes: string[] = [];
 	ended = false;
 	private drainHandler?: () => void;
+	private errorHandler?: () => void;
 	private readonly writeResults: boolean[];
 	constructor(writeResults: boolean[] = []) {
 		this.writeResults = writeResults;
@@ -29,6 +30,13 @@ class MockStream implements JsonlWriteStream {
 	once(event: "drain", listener: () => void): JsonlWriteStream {
 		if (event === "drain") this.drainHandler = listener;
 		return this;
+	}
+	on(event: "error", listener: () => void): JsonlWriteStream {
+		if (event === "error") this.errorHandler = listener;
+		return this;
+	}
+	emitError(): void {
+		this.errorHandler?.();
 	}
 	end(callback?: () => void): void {
 		this.ended = true;
@@ -115,5 +123,15 @@ describe("createJsonlWriter", () => {
 		writer.writeLine(line);
 		writer.writeLine(line);
 		assert.equal(stream.writes.length, 2);
+	});
+});
+
+describe("createJsonlWriter: ошибка потока", () => {
+	it("settles close when the stream errors during end", async () => {
+		const source = new MockSource();
+		const stream = new MockStream();
+		stream.end = () => stream.emitError();
+		const writer = createJsonlWriter("/tmp/out.jsonl", source, { createWriteStream: () => stream });
+		await writer.close();
 	});
 });
