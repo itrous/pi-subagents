@@ -2,6 +2,7 @@
 // Запуск: PI_CODING_AGENT_DIR=<fixture>/agent node --experimental-strip-types mcp-diff.mjs <repoRoot> <fixtureRoot>
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 const repo = process.argv[2];
 const fixture = process.argv[3];
@@ -42,15 +43,27 @@ const names = async (modulePath, selectors) => {
 	return sel.map((entry) => entry.name).sort();
 };
 
+// Версию форка достаём сами: файл в дереве не хранится, сверка остаётся воспроизводимой.
 const forkPath = path.join(repo, "src/runs/shared/__fork-mcp-allowlist.ts");
+const forkRef = process.env.A1R2_FORK_REF ?? "main";
+fs.writeFileSync(forkPath, execFileSync("git", ["-C", repo, "show", `${forkRef}:src/runs/shared/mcp-direct-tool-allowlist.ts`], { encoding: "utf-8" }));
+process.on("exit", () => { try { fs.unlinkSync(forkPath); } catch {} });
 const basePath = path.join(repo, "src/runs/shared/mcp-direct-tool-allowlist.ts");
-
-const exclude = SELECTORS.filter((s) => s !== "bsl-ws/event_log");
 
 const fork10 = await names(forkPath, SELECTORS);
 const base10 = await names(basePath, SELECTORS);
-const fork9 = await names(forkPath, exclude);
-const base9 = await names(basePath, exclude);
+
+// Контроль — тот же набор селекторов, но сервер снимает один инструмент глобом
+// excludeTools: путь фильтрации, а не длина списка селекторов.
+fs.writeFileSync(path.join(agentDir, "mcp.json"), JSON.stringify({
+	mcpServers: { ...servers, "bsl-ws": { ...servers["bsl-ws"], excludeTools: ["event_*"] } },
+}, null, 2));
+const cacheExcluded = JSON.parse(fs.readFileSync(path.join(agentDir, "mcp-cache.json"), "utf-8"));
+cacheExcluded.servers["bsl-ws"].configHash = hashOf({ ...servers["bsl-ws"], excludeTools: ["event_*"] });
+fs.writeFileSync(path.join(agentDir, "mcp-cache.json"), JSON.stringify(cacheExcluded, null, 2));
+
+const fork9 = await names(forkPath + "?excluded", SELECTORS);
+const base9 = await names(basePath + "?excluded", SELECTORS);
 
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 const result = {
@@ -58,7 +71,7 @@ const result = {
 	baseNames: base10,
 	equal10: same(fork10, base10),
 	count10: { fork: fork10.length, base: base10.length },
-	control9: { fork: fork9.length, base: base9.length, equal: same(fork9, base9) },
+	control9: { fork: fork9.length, base: base9.length, equal: same(fork9, base9), excluded: "bsl-ws excludeTools: event_*" },
 };
 console.log(JSON.stringify(result, null, 2));
 process.exit(result.equal10 && result.count10.fork === 10 && result.control9.equal && result.control9.fork === 9 ? 0 : 1);

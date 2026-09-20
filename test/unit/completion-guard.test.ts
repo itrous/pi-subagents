@@ -667,6 +667,13 @@ test("Cursor replay tool calls count only edit/write activity as mutation", () =
 	assert.equal(isMutatingTool("cursor", { activityTitle: "Cursor read" }), false);
 });
 
+test("powershell counts as the runtime shell for mutation evidence (A1P3)", () => {
+	assert.equal(isMutatingTool("powershell", { command: "Get-ChildItem" }), true);
+	assert.equal(isMutatingTool("powershell", { command: "   " }), false);
+	assert.equal(hasMutationToolCall([assistantToolCall("powershell", { command: "Remove-Item x" })]), true);
+	assert.equal(hasMutationToolCall([assistantToolCall("powershell", {})]), false);
+});
+
 test("claimed changedFiles without mutation evidence does not bypass the guard", () => {
 	const report = assistantText(`Done.\n\`\`\`acceptance-report\n{\n  "changedFiles": ["docs/BACKEND_ARCHITECTURE.md"]\n}\n\`\`\``);
 	assert.equal(hasMutationToolCall([report]), false);

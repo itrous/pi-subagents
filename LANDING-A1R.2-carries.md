@@ -20,7 +20,7 @@ upstream и разобраны в A1R.1). Каждая строка несёт �
 - Перенесено сейчас: **4 файла upstream** (`permissions.ts`, `agent-memory.ts`,
   `long-running-guard.ts`, `jsonl-writer.ts`) — ровно бюджет Т4–Т7 — плюс 3 файла
   upstream-тестов, покрывающих эти же переносы.
-- Проверки: `npm run typecheck` зелёный; `LC_ALL=C npm run test:unit` — 3338 прошли,
+- Проверки: `npm run typecheck` зелёный; `LC_ALL=C npm run test:unit` — 3340 прошли,
   0 упали; `LC_ALL=C npm run test:integration` — 1072 прошли, 0 упали.
 - Кандидаты PR в upstream (Р10, пункт «малые исправления»): все четыре (в).
 
@@ -36,7 +36,10 @@ upstream и разобраны в A1R.1). Каждая строка несёт �
 | контроль: без `bsl-ws/event_log` | 9 | 9 | да |
 
 Вывод: правки форка в `mcp-direct-tool-allowlist.ts` для exact-ten не нужны — (а).
-Скрипт сверки: `spikes/A1R.2/mcp-diff.mjs`.
+Контроль — не укороченный список селекторов, а путь фильтрации: сервер `bsl-ws` снимает
+`event_log` глобом `excludeTools: ["event_*"]`, и обе реализации дают 9.
+Скрипт сверки: `spikes/A1R.2/mcp-diff.mjs` (версию форка достаёт сам через
+`git show main:…`, переопределяется `A1R2_FORK_REF`).
 
 ## Таблица решений
 
@@ -79,6 +82,7 @@ upstream и разобраны в A1R.1). Каждая строка несёт �
 | `test/unit/fleet.test.ts` | отложено | возвращается с приватной проекцией Fleet (A1R.4) |
 | `test/unit/index-child-registration.test.ts` | отложено | возвращается с регистрацией bound-модуля (A1R.3) |
 | `test/unit/jsonl-writer.test.ts` | (в) | добавлен `error` в MockStream и тест расчёта close при ошибке |
+| `test/unit/completion-guard.test.ts` (powershell) | (в) | тест переноса в `long-running-guard.ts`: непустой вызов powershell мутирует, пустой — нет |
 | `test/unit/permissions.test.ts` | (в) | два powershell-кейса добавлены в тесты базы |
 | `test/unit/prompt-template-bridge.test.ts` | отложено | возвращается с каналом v2 (A1R.3) |
 | `test/unit/rpc.test.ts` | отложено | возвращается с ping/preflight v2 (A1R.3) |
