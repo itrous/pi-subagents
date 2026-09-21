@@ -2,9 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, test } from "node:test";
 import { getBoundRunRegistry } from "../../src/bound/bound-run-registry.ts";
-import { registerSubagentRpcBridge, SUBAGENT_RPC_REQUEST_EVENT } from "../../src/extension/rpc.ts";
 import { createBoundFixture, type BoundFixture } from "../fixtures/bound/harness.ts";
-import { createExecutorStand, until } from "../support/bound-executor.ts";
+import { createExecutorStand, createRpcClient as rpcClient, until } from "../support/bound-executor.ts";
 import { admitBoundLaunch } from "../support/bound-launch.ts";
 
 let fixture: BoundFixture;
@@ -17,30 +16,6 @@ afterEach(() => {
 	for (const runId of opened.splice(0)) getBoundRunRegistry().close(runId);
 	fixture.cleanup();
 });
-
-type Reply = { success: boolean; data?: Record<string, unknown>; error?: { code: string; message: string } };
-
-function rpcClient(current: ReturnType<typeof createExecutorStand>) {
-	let handler: ((raw: unknown) => unknown) | undefined;
-	const replies = new Map<string, Reply>();
-	registerSubagentRpcBridge({
-		events: {
-			on(event: string, listener: (raw: unknown) => unknown) { if (event === SUBAGENT_RPC_REQUEST_EVENT) handler = listener; return () => {}; },
-			emit(_event: string, data: unknown) { const reply = data as Reply & { requestId: string }; replies.set(reply.requestId, reply); },
-		},
-		getContext: () => current.ctx,
-		execute: (id, params, signal, onUpdate, ctx) => current.executor.executePublic(id, params, signal, onUpdate, ctx),
-		state: current.state,
-	} as unknown as Parameters<typeof registerSubagentRpcBridge>[0]);
-	let sequence = 0;
-	return async (method: string, params: Record<string, unknown> = {}, requestId = `request-${++sequence}`): Promise<Reply> => {
-		await handler!({ version: 1, requestId, method, params });
-		await until(() => replies.has(requestId), `${method} reply`);
-		const { success, data, error } = replies.get(requestId)!;
-		replies.delete(requestId);
-		return { success, ...(data ? { data } : {}), ...(error ? { error } : {}) };
-	};
-}
 
 async function startBound(current: ReturnType<typeof createExecutorStand>): Promise<{ runId: string; done: Promise<unknown> }> {
 	const launch = await admitBoundLaunch(fixture);

@@ -1,6 +1,8 @@
 import type { PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 
 const ENV = "MCP_DIRECT_TOOLS";
+/** Builtins this stand's Pi exposes; `read` is the one the fixture agents allow. */
+const BUILTINS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
 export type FailurePoint = "reload" | "refresh" | "inheritProvider" | "sessionManager" | "resolveCliModel" | "createAgentSession" | "bindExtensions";
 
@@ -8,35 +10,101 @@ export interface Probe {
 	envAtReload: Array<string | undefined>;
 	envAtBind: Array<string | undefined>;
 	hookNames: string[];
+	/** Calls that reached the original stream function: the provider counter. */
 	requests: number;
 	disposed: number;
 	prompts: number;
 	aborts: number;
+	sessions: number;
+	/** Live registry snapshots taken by the layer, per session, in creation order. */
+	activeToolNames: string[][];
+	/** Releases the held prompt of session `index` (creation order). */
+	release(index: number): void;
+	releaseAll(): void;
 }
+
+export interface FakePiOptions {
+	fail?: FailurePoint;
+	activeTools?: (launchTools: string[]) => string[];
+	requiredError?: string;
+	childSessionId?: string;
+	hangShutdown?: boolean;
+	/** Every prompt waits for this promise before its model call. */
+	promptGate?: Promise<void>;
+	/** Every prompt waits until `probe.release(index)`; an abort releases it too. */
+	holdPrompts?: boolean;
+	/** The model `resolveCliModel` returns; defaults to `openai/gpt-5`. */
+	modelId?: string;
+	/** A prompt that passed the barrier calls the registered `structured_output` tool with this value. */
+	structuredValue?: unknown;
+}
+
+interface Tool { name: string; execute?: (...args: unknown[]) => unknown }
+type Listener = (event: Record<string, unknown>) => void;
 
 /**
  * Tier-1 stand-in for the Pi module: exactly the members upstream `open()` uses,
- * each able to fail on request. Extension factories run during `reload()` and
- * `session_start` fires inside `bindExtensions()`, as in Pi.
+ * each able to fail on request. Each loader carries its own extension handlers
+ * and tools; factories run during `reload()` and `session_start` fires inside
+ * `bindExtensions()`, as in Pi. The active tool set is the launch allowlist
+ * restricted to builtins and registered tools.
  */
-export function fakePi(options: { fail?: FailurePoint; activeTools?: (launchTools: string[]) => string[]; requiredError?: string; childSessionId?: string; hangShutdown?: boolean; promptGate?: Promise<void> } = {}): { pi: PiCodingAgentModule; probe: Probe } {
-	const probe: Probe = { envAtReload: [], envAtBind: [], hookNames: [], requests: 0, disposed: 0, prompts: 0, aborts: 0 };
-	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
-	const sessionId = options.childSessionId ?? "child-session";
+export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; probe: Probe } {
+	const gates: Array<() => void> = [];
+	let loaders = 0;
+	const releaseQueue = new Set<number>();
+	const probe: Probe = {
+		envAtReload: [], envAtBind: [], hookNames: [], requests: 0, disposed: 0, prompts: 0, aborts: 0, sessions: 0, activeToolNames: [],
+		release(index) { releaseQueue.add(index); gates[index]?.(); },
+		releaseAll() { for (let index = 0; index < Math.max(gates.length, 64); index++) probe.release(index); },
+	};
 	// Upstream's own child hooks also run here; members they touch but this stand does not model answer inertly.
 	const inert = <T extends object>(target: T): T => new Proxy(target, { get: (object, property) => (property in object ? Reflect.get(object, property) : () => undefined) });
-	const ctx = inert({ cwd: process.cwd(), hasUI: false, sessionManager: inert({ getSessionId: () => sessionId, getEntries: () => [], getBranch: () => [] }) });
-	const api = inert({
-		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
-		registerTool() {},
-		getAllTools: () => [],
-		getActiveTools: () => [],
-	});
-	const emit = async (event: { type: string }) => {
-		// A `session_shutdown` handler that never returns, as in the S5 measurement.
-		if (options.hangShutdown && event.type === "session_shutdown") return new Promise<void>(() => {});
-		for (const handler of handlers.get(event.type) ?? []) await handler(event, ctx);
-	};
+
+	class FakeLoader {
+		loaded = false;
+		readonly handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+		readonly tools = new Map<string, Tool>();
+		readonly sessionId: string;
+		private readonly factories: Array<{ name: string; factory: (pi: unknown) => unknown }>;
+		constructor(input: { extensionFactories?: Array<{ name: string; factory: (pi: unknown) => unknown }> }) {
+			this.factories = input.extensionFactories ?? [];
+			const ordinal = loaders++;
+			this.sessionId = options.childSessionId ?? (ordinal === 0 ? "child-session" : `child-session-${ordinal}`);
+		}
+		get ctx() {
+			return inert({ cwd: process.cwd(), hasUI: false, sessionManager: inert({ getSessionId: () => this.sessionId, getEntries: () => [], getBranch: () => [] }) });
+		}
+		async reload() {
+			probe.envAtReload.push(process.env[ENV]);
+			if (options.fail === "reload") throw new Error("injected reload failure");
+			const api = inert({
+				on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => { this.handlers.set(event, [...(this.handlers.get(event) ?? []), handler]); },
+				registerTool: (tool: Tool) => { this.tools.set(tool.name, tool); },
+				getAllTools: () => [],
+				getActiveTools: () => [],
+			});
+			for (const hook of this.factories) {
+				probe.hookNames.push(hook.name);
+				// Pi records a throwing inline factory as a load error and goes on.
+				try { await hook.factory(api); } catch { /* recorded as a load error by Pi */ }
+			}
+		}
+		getExtensions() {
+			return {
+				extensions: [],
+				errors: options.requiredError ? [{ path: options.requiredError, error: "injected required failure" }] : [],
+				runtime: options.fail === "refresh" ? { pendingProviderRegistrations: [{ name: "injected", config: {}, extensionPath: "/injected.ts" }] } : {},
+			};
+		}
+		async emit(event: { type: string }) {
+			// A `session_shutdown` handler that never returns, as in the S5 measurement.
+			if (options.hangShutdown && event.type === "session_shutdown") return new Promise<void>(() => {});
+			for (const handler of this.handlers.get(event.type) ?? []) await handler(event, this.ctx);
+		}
+	}
+
+	const model = { provider: "openai", id: options.modelId ?? "gpt-5", api: "openai-responses" };
 	const pi = {
 		ModelRuntime: {
 			create: async () => ({
@@ -46,23 +114,7 @@ export function fakePi(options: { fail?: FailurePoint; activeTools?: (launchTool
 			}),
 		},
 		SettingsManager: { create: () => ({ getTheme: () => ({}) }) },
-		DefaultResourceLoader: class {
-			loaded = false;
-			private readonly factories: Array<{ name: string; factory: (pi: unknown) => unknown }>;
-			constructor(input: { extensionFactories?: Array<{ name: string; factory: (pi: unknown) => unknown }> }) { this.factories = input.extensionFactories ?? []; }
-			async reload() {
-				probe.envAtReload.push(process.env[ENV]);
-				if (options.fail === "reload") throw new Error("injected reload failure");
-				for (const hook of this.factories) { probe.hookNames.push(hook.name); await hook.factory(api); }
-			}
-			getExtensions() {
-				return {
-					extensions: [],
-					errors: options.requiredError ? [{ path: options.requiredError, error: "injected required failure" }] : [],
-					runtime: options.fail === "refresh" ? { pendingProviderRegistrations: [{ name: "injected", config: {}, extensionPath: "/injected.ts" }] } : {},
-				};
-			}
-		},
+		DefaultResourceLoader: FakeLoader,
 		SessionManager: new Proxy({}, {
 			get: () => () => {
 				if (options.fail === "sessionManager") throw new Error("injected session manager failure");
@@ -71,12 +123,25 @@ export function fakePi(options: { fail?: FailurePoint; activeTools?: (launchTool
 		}),
 		resolveCliModel: () => options.fail === "resolveCliModel"
 			? { error: "injected model failure" }
-			: { model: { provider: "openai", id: "gpt-5", api: "openai-responses" }, thinkingLevel: "medium" },
-		createAgentSession: async (input: { tools?: string[] }) => {
+			: { model, thinkingLevel: "medium" },
+		createAgentSession: async (input: { tools?: string[]; resourceLoader: FakeLoader }) => {
 			if (options.fail === "createAgentSession") throw new Error("injected createAgentSession failure");
+			const loader = input.resourceLoader;
+			const index = probe.sessions++;
+			let release!: () => void;
+			const held = options.holdPrompts ? new Promise<void>((resolve) => { release = resolve; }) : undefined;
+			if (held) { gates[index] = release; if (releaseQueue.has(index)) release(); }
 			const launchTools = input.tools ?? [];
-			const active = options.activeTools ? options.activeTools(launchTools) : launchTools;
-			const model = { provider: "openai", id: "gpt-5", api: "openai-responses" };
+			const active = () => options.activeTools
+				? options.activeTools(launchTools)
+				: launchTools.filter((name) => BUILTINS.has(name) || loader.tools.has(name));
+			const listeners = new Set<Listener>();
+			const messages: Array<Record<string, unknown>> = [];
+			let aborted = false;
+			const emitEvent = (event: Record<string, unknown>) => {
+				if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) messages.push(event.message as Record<string, unknown>);
+				for (const listener of [...listeners]) listener(event);
+			};
 			const agent = {
 				streamFunction: (() => { probe.requests += 1; return {}; }) as (model: unknown, context: unknown) => unknown,
 				hasQueuedMessages: () => false,
@@ -84,25 +149,52 @@ export function fakePi(options: { fail?: FailurePoint; activeTools?: (launchTool
 			const session = {
 				agent,
 				model,
-				messages: [],
+				messages,
 				sessionFile: undefined,
-				sessionId,
-				getActiveToolNames: () => [...active],
+				sessionId: loader.sessionId,
+				getActiveToolNames: () => {
+					const names = active();
+					probe.activeToolNames[index] = [...names];
+					return names;
+				},
 				async bindExtensions() {
 					probe.envAtBind.push(process.env[ENV]);
 					if (options.fail === "bindExtensions") throw new Error("injected bindExtensions failure");
-					await emit({ type: "session_start" });
+					await loader.emit({ type: "session_start" });
 				},
-				extensionRunner: { hasHandlers: (event: string) => (options.hangShutdown === true && event === "session_shutdown") || handlers.has(event), emit },
-				subscribe: () => () => {},
+				extensionRunner: { hasHandlers: (event: string) => (options.hangShutdown === true && event === "session_shutdown") || loader.handlers.has(event), emit: (event: { type: string }) => loader.emit(event) },
+				subscribe: (listener: Listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
 				async prompt() {
 					probe.prompts += 1;
 					await options.promptGate;
+					await held;
+					if (aborted) {
+						emitEvent({ type: "message_end", message: { role: "assistant", content: [], stopReason: "aborted", errorMessage: "aborted" } });
+						emitEvent({ type: "agent_end", messages: [...messages], willRetry: false });
+						return;
+					}
+					let refusal: string | undefined;
 					// Pi turns a stream-function failure into an error message, never a rejected prompt.
-					try { agent.streamFunction(model, { tools: active.map((name) => ({ name })) }); } catch { /* recorded by the barrier */ }
+					try { agent.streamFunction(model, { tools: active().map((name) => ({ name })) }); }
+					catch (error) { refusal = error instanceof Error ? error.message : String(error); }
+					if (!refusal && options.structuredValue !== undefined) {
+						emitEvent({ type: "tool_execution_start", toolName: "structured_output", args: { value: options.structuredValue } });
+						await loader.tools.get("structured_output")?.execute?.("structured", { value: options.structuredValue }, new AbortController().signal, undefined, loader.ctx);
+						emitEvent({ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } });
+						emitEvent({ type: "tool_execution_end", toolName: "structured_output" });
+					}
+					emitEvent({
+						type: "message_end",
+						message: refusal
+							? { role: "assistant", content: [], model: model.id, stopReason: "error", errorMessage: refusal, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } }
+							: { role: "assistant", content: [{ type: "text", text: "done" }], model: model.id, stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+					});
+					emitEvent({ type: "agent_end", messages: [...messages], willRetry: false });
+					emitEvent({ type: "agent_settled" });
 				},
-				steer: async () => {}, followUp: async () => {}, abort: async () => { probe.aborts += 1; },
-				dispose() { probe.disposed += 1; },
+				steer: async () => {}, followUp: async () => {},
+				abort: async () => { probe.aborts += 1; aborted = true; release?.(); },
+				dispose() { probe.disposed += 1; listeners.clear(); },
 			};
 			return { session };
 		},

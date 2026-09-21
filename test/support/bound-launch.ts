@@ -17,8 +17,8 @@ export function boundBindingOf(data: { serverInstanceId: string; launchContract:
 }
 
 /** A real preflight plus admission; each call takes a fresh run id, since run ids are reserved process-wide. */
-export async function admitBoundLaunch(fixture: BoundFixture, requestOverrides: Record<string, unknown> = {}): Promise<BoundAuthorizedLaunch> {
-	const service = createBoundRuntimeService(fixture.serviceOptions() as unknown as BoundRuntimeServiceOptions);
+export async function admitBoundLaunch(fixture: BoundFixture, requestOverrides: Record<string, unknown> = {}, serviceOverrides: Record<string, unknown> = {}): Promise<BoundAuthorizedLaunch> {
+	const service = createBoundRuntimeService(fixture.serviceOptions(serviceOverrides) as unknown as BoundRuntimeServiceOptions);
 	try {
 		const request = fixture.request({ prospectiveRunId: randomUUID(), ...requestOverrides });
 		const preflight = await service.preflight(request);
