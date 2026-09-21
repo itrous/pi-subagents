@@ -154,7 +154,18 @@ TUI Fleet (`src/tui/fleet.ts`, `src/tui/fleet-status.ts`) и признак ак
 
 ## Тесты
 
-Локально (macOS, `b2df9867` плюс правка теста) и на ii-01 (`$B/testcheckout`):
-`npm run typecheck`, `test:unit`, `test:integration -- --test-concurrency=2`, те же наборы с
-`PI_SUBAGENTS_NATIVE_SDK`. Linux-only `test/unit/source-identity.test.ts` впервые прогнан на
-Linux: 27 тестов identity зелёные. Итоги — в отчёте этапа.
+Локально (macOS, Pi 0.85.1 из Homebrew для яруса 2): `npm run typecheck` — чисто;
+`test:unit` 3548 pass / 0 fail; `test:integration -- --test-concurrency=2` 1083 / 0;
+с `PI_SUBAGENTS_NATIVE_SDK` — 3559 / 0 и 1086 / 0.
+
+ii-01 (`$B/testcheckout` на `b2df9867`, ярус 2 — `PI_SUBAGENTS_NATIVE_SDK=$B/sdk`):
+`test:unit` 28 fail, `test:integration` 3 fail в обоих ярусах. Все, кроме двух, — в
+upstream-файлах (`native-supervisor-channel`, `orca-progress-tabs`, `herdr-inspector`,
+`agent-eject-disable`, `agent-frontmatter`, `run-child-session`, `single-execution.part-1`,
+`async-execution.part-2`) и дедлайн-тестах `bound-cancel-deadline`/`bound-shutdown-deadline`;
+те же файлы на базе `4699ab43` на том же хосте дают те же 26 + 2 падения
+(окружение ii-01: чужой `/tmp/.agents`, 30 пользователей, load average до 7,4).
+Оставшиеся два — новый `bound-package-extensions.test.ts`, чинится якорем `.pi` в `6af88bf3`,
+после чего проходит на ii-01. Linux-only `source-identity.test.ts` на ii-01 зелёный целиком.
+Bound-интеграция `bound-foreground-real-sdk` и `bound-foreground-lifecycle` на ii-01 с
+настоящим SDK — 14 / 0.
