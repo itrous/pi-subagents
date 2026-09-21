@@ -5,6 +5,7 @@ import type { ResolvedSubagentCapabilityCeiling } from "../runs/shared/capabilit
 import type { ActiveRuntimeSourceIdentityResolution } from "../extension/source-identity.ts";
 import type { ExtensionConfig } from "../shared/types.ts";
 import { BoundAttemptCoordinator, getBoundAttemptCoordinator } from "./bound-attempt-coordinator.ts";
+import { createBoundExecutionPort, type BoundExecuteDelegated, type BoundExecutionPortHandle } from "./bound-execution-port.ts";
 import { registerBoundLaunchBridge, type BoundExecutionPort } from "./bound-launch-bridge.ts";
 import { createBoundRuntimeService, type BoundRuntimeService, type BoundRuntimeServiceOptions } from "./bound-runtime-service.ts";
 import { installBoundedChildShutdown, type BoundedChildShutdownOptions } from "./bounded-child-shutdown.ts";
@@ -54,6 +55,10 @@ export interface RegisterBoundControlPlaneOptions {
 	discoveryDeps?: BoundRuntimeServiceOptions["discoveryDeps"];
 	coordinator?: BoundAttemptCoordinator;
 	executionPort?: BoundExecutionPort;
+	/** Executor entry the layer builds its own execution port from; an explicit `executionPort` wins. */
+	executeDelegated?: BoundExecuteDelegated;
+	/** Passed to the built port; see `BoundExecutionPortOptions.childFactoryWired`. */
+	childFactoryWired?: () => boolean;
 	childShutdown?: BoundedChildShutdownOptions | false;
 	store?: Record<string, unknown>;
 }
@@ -120,12 +125,21 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 		...(options.discoveryDeps ? { discoveryDeps: options.discoveryDeps } : {}),
 	});
 
+	const builtPort: BoundExecutionPortHandle | undefined = !options.executionPort && options.executeDelegated
+		? createBoundExecutionPort({
+			executeDelegated: options.executeDelegated,
+			getContext: contextForReply,
+			config: options.config,
+			...(options.childFactoryWired ? { childFactoryWired: options.childFactoryWired } : {}),
+		})
+		: undefined;
+	const executionPort = options.executionPort ?? builtPort;
 	const bridge = registerBoundLaunchBridge({
 		events: options.events,
 		service,
 		coordinator,
 		runtimeId,
-		...(options.executionPort ? { executionPort: options.executionPort } : {}),
+		...(executionPort ? { executionPort } : {}),
 	});
 
 	const reply = (envelope: BoundReplyEnvelopeV2): void => { options.events.emit(boundReplyEvent(envelope.requestId), envelope); };
@@ -155,6 +169,7 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 		stopped = true;
 		if (typeof unsubscribeRequest === "function") unsubscribeRequest();
 		bridge.dispose();
+		builtPort?.dispose();
 		service.dispose();
 		// Live attempts of this generation are aborted; their single terminal is
 		// delivered through whichever sink is active when they settle.
@@ -170,6 +185,7 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 	const previous = store[BOUND_CONTROL_PLANE_GLOBAL_KEY] as PublishedGeneration | undefined;
 	if (previous !== undefined && (typeof previous !== "object" || typeof previous.stop !== "function" || typeof previous.serverInstanceId !== "string")) {
 		bridge.dispose();
+		builtPort?.dispose();
 		service.dispose();
 		if (typeof unsubscribeRequest === "function") unsubscribeRequest();
 		throw new Error("Incompatible process-global bound control plane generation.");

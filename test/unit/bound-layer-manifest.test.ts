@@ -39,6 +39,7 @@ const EXPECTED_UPSTREAM_DEPENDENCIES = [
 	"agents/agents.ts",
 	"agents/skills.ts",
 	"api/delegation.ts",
+	"runs/foreground/subagent-executor.ts",
 	"runs/shared/capability-ceiling.ts",
 	"runs/shared/child-session.ts",
 	"runs/shared/child-tool-plan.ts",
