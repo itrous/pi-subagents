@@ -1,0 +1,46 @@
+{
+  "mode": "adapter-mismatch-config",
+  "processCwd": "/home/kelishev/a1r5-probe-20260921/ws-parent",
+  "sessionCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+  "argvHasMcpConfig": true,
+  "node": "v22.22.1",
+  "pi": "0.85.1",
+  "ms": 5217,
+  "providerRequestsTotal": 0,
+  "result": {
+    "afterCreate": [
+      "bsl-ref_its_help",
+      "bsl-ref_search",
+      "bsl-ref_syntax_help",
+      "bsl-ws_diagnostics",
+      "bsl-ws_event_log",
+      "bsl-ws_graph",
+      "bsl-ws_metadata",
+      "bsl-ws_query",
+      "bsl-ws_search",
+      "bsl-ws_symbol_info"
+    ],
+    "afterSettle": [
+      "bsl-ref_its_help",
+      "bsl-ref_search",
+      "bsl-ref_syntax_help",
+      "bsl-ws_diagnostics",
+      "bsl-ws_event_log",
+      "bsl-ws_graph",
+      "bsl-ws_metadata",
+      "bsl-ws_query",
+      "bsl-ws_search",
+      "bsl-ws_symbol_info"
+    ],
+    "complete": {
+      "afterCreate": true,
+      "afterSettle": true
+    },
+    "cacheServers": [
+      "bsl-ref",
+      "bsl-ws"
+    ],
+    "envEqualToInitial": true,
+    "errors": []
+  }
+}

@@ -1,0 +1,29 @@
+Installing git:https://github.com/itrous/pi-subagents.git@b2df9867b71896260fc711b89e8569beb6bd1b81...
+Cloning into '/home/kelishev/a1r5-probe-20260921/home/.pi/agent/git/github.com/itrous/pi-subagents'...
+done.
+Note: switching to 'b2df9867b71896260fc711b89e8569beb6bd1b81'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at b2df9867 fix(a1r.5): приватная шина pi.events для пакетных фабрик bound-листа
+
+added 5 packages, and audited 7 packages in 2s
+
+1 package is looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+Installed git:https://github.com/itrous/pi-subagents.git@b2df9867b71896260fc711b89e8569beb6bd1b81

@@ -1,0 +1,35 @@
+A1R5-DEBUG violation setActiveTools:after-barrier
+Error
+    at deny (/home/kelishev/a1r5-probe-20260921/dbg/home/.pi/agent/git/github.com/itrous/pi-subagents/src/bound/bound-package-api.ts:68:64)
+    at Proxy.<anonymous> (/home/kelishev/a1r5-probe-20260921/dbg/home/.pi/agent/git/github.com/itrous/pi-subagents/src/bound/bound-package-api.ts:136:46)
+    at syncProxyTool (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/index.ts:913:12)
+    at syncToolSurface (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/index.ts:256:5)
+    at nextState.onToolMetadataUpdated (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/index.ts:324:9)
+    at notifyToolMetadataUpdated (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/init.ts:547:49)
+    at lazyConnect (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/init.ts:648:5)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Object.execute (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/direct-tools.ts:389:21)
+--
+A1R5-DEBUG violation setActiveTools:after-barrier
+Error
+    at deny (/home/kelishev/a1r5-probe-20260921/dbg/home/.pi/agent/git/github.com/itrous/pi-subagents/src/bound/bound-package-api.ts:68:64)
+    at Proxy.<anonymous> (/home/kelishev/a1r5-probe-20260921/dbg/home/.pi/agent/git/github.com/itrous/pi-subagents/src/bound/bound-package-api.ts:136:46)
+    at syncProxyTool (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/index.ts:913:12)
+    at syncToolSurface (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/index.ts:256:5)
+    at nextState.onToolMetadataUpdated (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/index.ts:324:9)
+    at notifyToolMetadataUpdated (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/init.ts:547:49)
+    at lazyConnect (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/init.ts:648:5)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Object.execute (/home/kelishev/a1r5-probe-20260921/dbg/owner/node_modules/pi-mcp-adapter/direct-tools.ts:389:21)
+--
+A1R5-DEBUG violation registerTool:read
+Error
+    at deny (/home/kelishev/a1r5-probe-20260921/dbg/home/.pi/agent/git/github.com/itrous/pi-subagents/src/bound/bound-package-api.ts:68:64)
+    at Proxy.<anonymous> (/home/kelishev/a1r5-probe-20260921/dbg/home/.pi/agent/git/github.com/itrous/pi-subagents/src/bound/bound-package-api.ts:129:108)
+    at Object.shadow [as factory] (/home/kelishev/a1r5-probe-20260921/dbg/owner/agents/ext/shadow.ts:3:6)
+    at factory (/home/kelishev/a1r5-probe-20260921/dbg/home/.pi/agent/git/github.com/itrous/pi-subagents/src/bound/bound-package-loader.ts:164:27)
+    at initializeExtension (file:///home/kelishev/a1r5-probe-20260921/sdk/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js:462:15)
+    at loadExtensionFromFactory (file:///home/kelishev/a1r5-probe-20260921/sdk/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js:493:12)
+    at BoundResourceLoader.loadExtensionFactories (file:///home/kelishev/a1r5-probe-20260921/sdk/node_modules/@earendil-works/pi-coding-agent/dist/core/resource-loader.js:749:41)
+    at async BoundResourceLoader.loadFinalExtensionSet (file:///home/kelishev/a1r5-probe-20260921/sdk/node_modules/@earendil-works/pi-coding-agent/dist/core/resource-loader.js:427:38)
+    at async BoundResourceLoader.reload (file:///home/kelishev/a1r5-probe-20260921/sdk/node_modules/@earendil-works/pi-coding-agent/dist/core/resource-loader.js:319:34)

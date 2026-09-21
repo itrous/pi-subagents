@@ -1,0 +1,515 @@
+{
+  "mode": "main",
+  "processCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+  "sessionCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+  "argvHasMcpConfig": false,
+  "node": "v22.22.1",
+  "pi": "0.85.1",
+  "ms": 65178,
+  "providerRequestsTotal": 9,
+  "result": {
+    "parent": {
+      "processCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+      "sessionCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+      "hasUI": false,
+      "extensionPaths": [
+        "/home/kelishev/a1r5-probe-20260921/home/.pi/agent/git/github.com/itrous/pi-subagents/index.ts"
+      ],
+      "loadErrors": [],
+      "bindErrors": [],
+      "piSubagentsCopies": 1
+    },
+    "ping": {
+      "responders": 1,
+      "serverInstanceIds": [
+        "a239db7d-c2b3-4612-8333-c7cdc60c76eb"
+      ],
+      "sourceIdentity": {
+        "version": 1,
+        "kind": "git",
+        "repository": "https://github.com/itrous/pi-subagents.git",
+        "commit": "4724606a2134515ceaecb01c0d5859a79d58bbd8",
+        "digest": "21a09cd54fee4ec19f6321c6b1c429dedb9faf7a95df467bc920bb83f7389845"
+      },
+      "sourceIdentityUnavailable": null,
+      "capabilities": {
+        "activeRuntimeIdentity": {
+          "version": 2
+        },
+        "boundForegroundLeaf": {
+          "version": 2
+        }
+      },
+      "session": {
+        "cwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+        "sessionId": "01a0c473-c4f2-7121-bbf1-e5e96565b373",
+        "sessionFile": "/home/kelishev/a1r5-probe-20260921/sessions-main/2026-09-21T14-51-56-530Z_01a0c473-c4f2-7121-bbf1-e5e96565b373.jsonl"
+      }
+    },
+    "readyEvents": 1,
+    "generationSlot": true,
+    "plain": {
+      "preflight": {
+        "replies": 1,
+        "ms": 1382,
+        "contract": {
+          "tools": {
+            "effectiveAllowlist": [
+              "read"
+            ],
+            "requiredChildTools": [
+              "read"
+            ],
+            "disableAmbientExtensions": true
+          },
+          "mcpDirectTools": [],
+          "canonicalCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf"
+        }
+      },
+      "started": 1,
+      "terminals": [
+        {
+          "status": "completed",
+          "launchContractDigest": "3f9ae4525fe90860c7b58e2127ea38ec0912bc65e7c801a144bcd509655bf53a",
+          "deniedToolCalls": [],
+          "result": {
+            "kind": "text",
+            "text": "DONE"
+          },
+          "keys": [
+            "agent",
+            "deniedToolCalls",
+            "exitCode",
+            "launchContractDigest",
+            "model",
+            "result",
+            "runId",
+            "status",
+            "thinking",
+            "toolRegistry",
+            "usage"
+          ]
+        }
+      ],
+      "digestMatches": true,
+      "providerRequests": 1,
+      "providerTools": [
+        [
+          "read"
+        ]
+      ]
+    },
+    "structured": {
+      "preflight": {
+        "replies": 1,
+        "ms": 651,
+        "contract": {
+          "tools": {
+            "effectiveAllowlist": [
+              "read",
+              "structured_output"
+            ],
+            "requiredChildTools": [
+              "read",
+              "structured_output"
+            ],
+            "disableAmbientExtensions": true
+          },
+          "mcpDirectTools": [],
+          "canonicalCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf"
+        }
+      },
+      "started": 1,
+      "terminals": [
+        {
+          "status": "structured_output_failed",
+          "launchContractDigest": "0650a350b75483cd2d78ff96c3b467d43f429b87c08f8409811fcd2ea24b3b92",
+          "deniedToolCalls": [],
+          "keys": [
+            "agent",
+            "deniedToolCalls",
+            "error",
+            "exitCode",
+            "launchContractDigest",
+            "model",
+            "runId",
+            "status",
+            "thinking",
+            "toolRegistry",
+            "usage"
+          ]
+        }
+      ],
+      "digestMatches": true,
+      "providerRequests": 2,
+      "providerTools": [
+        [
+          "read",
+          "structured_output"
+        ],
+        [
+          "read",
+          "structured_output"
+        ]
+      ]
+    },
+    "mcp": {
+      "preflight": {
+        "replies": 1,
+        "ms": 1361,
+        "contract": {
+          "tools": {
+            "effectiveAllowlist": [
+              "read",
+              "bsl-ws_search",
+              "bsl-ws_symbol_info",
+              "bsl-ws_graph",
+              "bsl-ws_metadata",
+              "bsl-ws_diagnostics",
+              "bsl-ws_query",
+              "bsl-ws_event_log",
+              "bsl-ref_syntax_help",
+              "bsl-ref_search",
+              "bsl-ref_its_help"
+            ],
+            "requiredChildTools": [
+              "read",
+              "bsl-ws_search",
+              "bsl-ws_symbol_info",
+              "bsl-ws_graph",
+              "bsl-ws_metadata",
+              "bsl-ws_diagnostics",
+              "bsl-ws_query",
+              "bsl-ws_event_log",
+              "bsl-ref_syntax_help",
+              "bsl-ref_search",
+              "bsl-ref_its_help"
+            ],
+            "disableAmbientExtensions": true
+          },
+          "mcpDirectTools": [
+            "bsl-ws_search",
+            "bsl-ws_symbol_info",
+            "bsl-ws_graph",
+            "bsl-ws_metadata",
+            "bsl-ws_diagnostics",
+            "bsl-ws_query",
+            "bsl-ws_event_log",
+            "bsl-ref_syntax_help",
+            "bsl-ref_search",
+            "bsl-ref_its_help"
+          ],
+          "canonicalCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf"
+        }
+      },
+      "started": 1,
+      "terminals": [
+        {
+          "status": "unavailable_context",
+          "toolRegistryError": "package_load_error",
+          "launchContractDigest": "f65948daf0c1fb6319aa3f76132bbb75a454a7e3130730d6d140366dc724073f",
+          "deniedToolCalls": [],
+          "keys": [
+            "agent",
+            "deniedToolCalls",
+            "error",
+            "exitCode",
+            "launchContractDigest",
+            "model",
+            "runId",
+            "status",
+            "thinking",
+            "toolRegistryError",
+            "usage"
+          ]
+        }
+      ],
+      "digestMatches": true,
+      "providerRequests": 0,
+      "providerTools": []
+    },
+    "mcpToolResults": 1,
+    "cancel": {
+      "afterWrongTokens": {
+        "terminals": 0,
+        "heldA": true,
+        "heldB": true
+      },
+      "cancelled": [
+        {
+          "status": "cancelled",
+          "keys": [
+            "status"
+          ]
+        }
+      ],
+      "cancelMs": 1197,
+      "providerAborted": true,
+      "updatesStableAfterCancel": true,
+      "neighbour": [
+        {
+          "status": "completed",
+          "launchContractDigest": "9fefcb9dd18fea1b025d92e6cc98a507036ca0570658e073a36195a12c8489e6",
+          "deniedToolCalls": [],
+          "result": {
+            "kind": "text",
+            "text": "DONE"
+          },
+          "keys": [
+            "agent",
+            "deniedToolCalls",
+            "exitCode",
+            "launchContractDigest",
+            "model",
+            "result",
+            "runId",
+            "status",
+            "thinking",
+            "toolRegistry",
+            "usage"
+          ]
+        }
+      ]
+    },
+    "canaries": {
+      "narrow": {
+        "preflight": {
+          "replies": 1,
+          "error": {
+            "version": 2,
+            "code": "unsupported_mode"
+          },
+          "ms": 645
+        }
+      },
+      "shadow": {
+        "preflight": {
+          "replies": 1,
+          "error": {
+            "version": 2,
+            "code": "unsupported_mode"
+          },
+          "ms": 697
+        }
+      },
+      "drift": {
+        "preflight": {
+          "replies": 1,
+          "error": {
+            "version": 2,
+            "code": "unsupported_mode"
+          },
+          "ms": 639
+        }
+      },
+      "positiveControl": {
+        "preflight": {
+          "replies": 1,
+          "ms": 643,
+          "contract": {
+            "tools": {
+              "effectiveAllowlist": [
+                "read"
+              ],
+              "requiredChildTools": [
+                "read"
+              ],
+              "disableAmbientExtensions": true
+            },
+            "mcpDirectTools": [],
+            "canonicalCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf"
+          }
+        },
+        "started": 1,
+        "terminals": [
+          {
+            "status": "completed",
+            "launchContractDigest": "d5ecc6597ec91acb7516bee4643b9de9531a57e3e4c1d7570e32e1e26580bc50",
+            "deniedToolCalls": [],
+            "result": {
+              "kind": "text",
+              "text": "DONE"
+            },
+            "keys": [
+              "agent",
+              "deniedToolCalls",
+              "exitCode",
+              "launchContractDigest",
+              "model",
+              "result",
+              "runId",
+              "status",
+              "thinking",
+              "toolRegistry",
+              "usage"
+            ]
+          }
+        ],
+        "digestMatches": true,
+        "providerRequests": 1,
+        "providerTools": [
+          [
+            "read"
+          ]
+        ]
+      }
+    },
+    "privacy": {
+      "rpcStatusReplies": 1,
+      "fleet": {
+        "version": 1,
+        "entries": [],
+        "totalActive": 0,
+        "topLevelAsyncCapacity": {
+          "used": 0,
+          "limit": 0
+        },
+        "omitted": 0
+      },
+      "mentionsRunId": false,
+      "mentionsAgent": false,
+      "terminal": {
+        "status": "completed",
+        "launchContractDigest": "7b6956c7fe37bc94f043e61f70aaaceaa8791f7cf342b2a2d2e3e3bb4af48c0d",
+        "deniedToolCalls": [],
+        "result": {
+          "kind": "text",
+          "text": "DONE"
+        },
+        "keys": [
+          "agent",
+          "deniedToolCalls",
+          "exitCode",
+          "launchContractDigest",
+          "model",
+          "result",
+          "runId",
+          "status",
+          "thinking",
+          "toolRegistry",
+          "usage"
+        ]
+      }
+    },
+    "reload": {
+      "reloadMs": 13809,
+      "oldTerminals": [
+        {
+          "status": "cancelled",
+          "keys": [
+            "status"
+          ]
+        }
+      ],
+      "ping": {
+        "responders": 1,
+        "serverInstanceIds": [
+          "ab34ea99-1f88-4567-9005-79588bf7a1a8"
+        ],
+        "sourceIdentity": {
+          "version": 1,
+          "kind": "git",
+          "repository": "https://github.com/itrous/pi-subagents.git",
+          "commit": "4724606a2134515ceaecb01c0d5859a79d58bbd8",
+          "digest": "21a09cd54fee4ec19f6321c6b1c429dedb9faf7a95df467bc920bb83f7389845"
+        },
+        "sourceIdentityUnavailable": null,
+        "capabilities": {
+          "activeRuntimeIdentity": {
+            "version": 2
+          },
+          "boundForegroundLeaf": {
+            "version": 2
+          }
+        },
+        "session": {
+          "cwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+          "sessionId": "01a0c473-c4f2-7121-bbf1-e5e96565b373",
+          "sessionFile": "/home/kelishev/a1r5-probe-20260921/sessions-main/2026-09-21T14-51-56-530Z_01a0c473-c4f2-7121-bbf1-e5e96565b373.jsonl"
+        }
+      },
+      "newGeneration": true,
+      "staleTargetReplies": 0,
+      "fresh": {
+        "preflight": {
+          "replies": 1,
+          "ms": 784,
+          "contract": {
+            "tools": {
+              "effectiveAllowlist": [
+                "read"
+              ],
+              "requiredChildTools": [
+                "read"
+              ],
+              "disableAmbientExtensions": true
+            },
+            "mcpDirectTools": [],
+            "canonicalCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf"
+          }
+        },
+        "started": 1,
+        "terminals": [
+          {
+            "status": "completed",
+            "launchContractDigest": "f75e8b6bea23ddf70f939dab2574d4451ce594fdb13694aa35e9f3be33251320",
+            "deniedToolCalls": [],
+            "result": {
+              "kind": "text",
+              "text": "DONE"
+            },
+            "keys": [
+              "agent",
+              "deniedToolCalls",
+              "exitCode",
+              "launchContractDigest",
+              "model",
+              "result",
+              "runId",
+              "status",
+              "thinking",
+              "toolRegistry",
+              "usage"
+            ]
+          }
+        ],
+        "digestMatches": true,
+        "providerRequests": 1,
+        "providerTools": [
+          [
+            "read"
+          ]
+        ]
+      },
+      "generationSlot": true
+    },
+    "envEqualToInitial": true,
+    "finalPing": {
+      "responders": 1,
+      "serverInstanceIds": [
+        "ab34ea99-1f88-4567-9005-79588bf7a1a8"
+      ],
+      "sourceIdentity": {
+        "version": 1,
+        "kind": "git",
+        "repository": "https://github.com/itrous/pi-subagents.git",
+        "commit": "4724606a2134515ceaecb01c0d5859a79d58bbd8",
+        "digest": "21a09cd54fee4ec19f6321c6b1c429dedb9faf7a95df467bc920bb83f7389845"
+      },
+      "sourceIdentityUnavailable": null,
+      "capabilities": {
+        "activeRuntimeIdentity": {
+          "version": 2
+        },
+        "boundForegroundLeaf": {
+          "version": 2
+        }
+      },
+      "session": {
+        "cwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+        "sessionId": "01a0c473-c4f2-7121-bbf1-e5e96565b373",
+        "sessionFile": "/home/kelishev/a1r5-probe-20260921/sessions-main/2026-09-21T14-51-56-530Z_01a0c473-c4f2-7121-bbf1-e5e96565b373.jsonl"
+      }
+    }
+  }
+}

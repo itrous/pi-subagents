@@ -33,8 +33,15 @@ non-Linux platform or without `/proc/self/fd`. On macOS and Windows the ping
 carries `sourceIdentityUnavailable`, `capabilities` is empty, preflight refuses
 with `unverified_source`, the self-check does not run, and the execution path is
 therefore inactive. Tests inject the identity through the `resolveSourceIdentity`
-seam and therefore stay green on every platform; the real installed probe is
-A1R.5 on a Linux host.
+seam and therefore stay green on every platform.
+
+**A1R.5, installed probe on Linux.** `pi install git:…@<sha>` into a throwaway
+agent dir on a Linux host, real Pi 0.85.1, SDK parent, faux provider and fixture
+MCP servers behind pi-mcp-adapter 2.26.1: the identity resolves without the seam,
+the ping announces `boundForegroundLeaf: { version: 2 }`, and plain, structured,
+exact-ten MCP, cancel, reload, privacy and the closed canaries pass
+(`LANDING-A1R.5-installed-probe.md`, `spikes/A1R.5/`). The probe found four defects
+the seams hid; their fixes are listed below.
 
 Migration plan and accepted decisions: `PLAN-A1R-inprocess-upstream-migration.md`;
 spike results: `LANDING-A1R.0-spikes.md`; plan review rounds and the executor
@@ -74,6 +81,13 @@ seven paths —
 
 The accompanying upstream tests are the same four files as before; no upstream
 test is edited.
+
+Outside `src`, `package-lock.json` differs from the base by two `"peer": true`
+lines on dev entries (A1R.5): `pi install git:` runs `npm install --omit=dev`, npm 11
+drops them, and the rewritten lockfile made the installed checkout `dirty` for the
+source identity. The fork's lockfile is the fixed point of `npm install --omit=dev`,
+`npm ci` and `npm install`. The tree tracks no symlink or gitlink, which the
+identity refuses as `unverified_source` (`test/unit/source-identity.test.ts`).
 
 The bound layer lives in `src/bound/` (entry `src/bound/index.ts`) and owns six
 further modules outside it: `src/shared/canonical-json.ts`,
@@ -118,12 +132,21 @@ D10 therefore stays: a leaf with MCP direct tools and
 `process.cwd() !== contract.canonicalCwd` is refused before any session work
 (`unavailable_context`, `mcp_cwd_mismatch`). The measured alternative — passing
 the adapter its config path explicitly — is fork B1 and awaits a human decision.
+A1R.5 repeated the measurement on Linux with the installed adapter: without the
+explicit path the set is incomplete on a cold metadata cache and complete on a warm
+one; with it, complete on both. The bound layer does not pass the path, so D10
+refuses such a leaf even when the host was started with `--mcp-config`.
 Side fact for A1R.6: adapter 2.34.0 with `PI_MCP_CONFIG_MODE=exclusive` collapses
 config sources to the global one and disables project `.pi/mcp.json` entirely.
 
 ### Accepted weaknesses (decisions R4, R6)
 
-- **R4, import containment is hygiene, not a boundary.** Package factories load
+- **R4, import containment is hygiene, not a boundary.** The package facade gives
+  the factories of one run a private `pi.events` (pi-mcp-adapter emits its
+  tool-approval request there); the host bus is not reachable through it. The
+  private jiti instance has no Pi aliases: `typebox` and `@earendil-works/*` that a
+  package imports at runtime resolve from the owner's `node_modules`, not from the
+  host. Package factories load
   through a private jiti instance whose `transform` refuses files outside the
   attested package roots, after the entry bytes and the package tree are
   re-measured. Native `.mjs`/`.cjs`, `createRequire`, `module.constructor._load`
@@ -224,6 +247,7 @@ git grep -n "subagents:rpc:v1\|prompt-template:subagent" -- src/bound   # only t
 matches English git error text and fails under a localized git, on this build and on
 a pristine upstream checkout alike.
 
-A1 probes (`test:probe:active-runtime`), the packed-package check and the real
-Git-installed stop-gate return in A1R.5; that probe runs on a Linux host, because
-source identity is unavailable elsewhere.
+The real Git-installed probe is `spikes/A1R.5/run-probe.sh` on a Linux host
+(`LANDING-A1R.5-installed-probe.md`), because source identity is unavailable
+elsewhere. The A1 probes (`test:probe:active-runtime`) and the packed-package check
+were not restored.

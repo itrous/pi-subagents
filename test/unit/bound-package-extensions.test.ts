@@ -19,6 +19,8 @@ function write(file: string, content: string): void {
 function packageAgent(ref: string): AgentConfig {
 	const owner = path.join(fixture.tempRoot, "owner");
 	write(path.join(owner, "package.json"), JSON.stringify({ name: "fixture-owner", version: "1.0.0", pi: { subagents: { agents: ["./agents"] } } }));
+	// Anchors the project root here: a stray `.agents` or `.pi` above the temp dir would otherwise win.
+	fs.mkdirSync(path.join(owner, ".pi"), { recursive: true });
 	write(path.join(owner, "agents", "ext", "tool.ts"), "export default function tool(): void {}\n");
 	write(path.join(fixture.tempRoot, "outside.ts"), "export default function outside(): void {}\n");
 	write(path.join(owner, "agents", "leaf.md"), `---\nname: leaf\ndescription: Leaf.\ntools: read\nsubagentOnlyExtensions: ${ref}\n---\n\nAnswer.\n`);

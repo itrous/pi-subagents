@@ -1,0 +1,22 @@
+{
+  "name": "a1r5-probe-owner",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "subagents": {
+      "agents": [
+        "./agents"
+      ]
+    }
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-tui": "0.84.3",
+    "pi-mcp-adapter": "2.26.1",
+    "typebox": "1.1.38"
+  }
+}

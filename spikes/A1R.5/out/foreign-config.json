@@ -1,0 +1,161 @@
+{
+  "mode": "foreign-config",
+  "processCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+  "sessionCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+  "argvHasMcpConfig": true,
+  "node": "v22.22.1",
+  "pi": "0.85.1",
+  "ms": 28215,
+  "providerRequestsTotal": 2,
+  "result": {
+    "parent": {
+      "processCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+      "sessionCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+      "hasUI": false,
+      "extensionPaths": [
+        "/home/kelishev/a1r5-probe-20260921/home/.pi/agent/git/github.com/itrous/pi-subagents/index.ts"
+      ],
+      "loadErrors": [],
+      "bindErrors": [],
+      "piSubagentsCopies": 1
+    },
+    "ping": {
+      "responders": 1,
+      "serverInstanceIds": [
+        "0f48a54b-f14e-41ee-87fb-b75508a0f551"
+      ],
+      "sourceIdentity": {
+        "version": 1,
+        "kind": "git",
+        "repository": "https://github.com/itrous/pi-subagents.git",
+        "commit": "b2df9867b71896260fc711b89e8569beb6bd1b81",
+        "digest": "96b245869802c9e1349086185cb2c24140b4d226f31bcbd1527eb418f7532f71"
+      },
+      "sourceIdentityUnavailable": null,
+      "capabilities": {
+        "activeRuntimeIdentity": {
+          "version": 2
+        },
+        "boundForegroundLeaf": {
+          "version": 2
+        }
+      },
+      "session": {
+        "cwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf",
+        "sessionId": "01a0c489-8c0b-75a5-9ef5-39d5cf7aede5",
+        "sessionFile": "/home/kelishev/a1r5-probe-20260921/sessions-foreign-config/2026-09-21T15-15-43-756Z_01a0c489-8c0b-75a5-9ef5-39d5cf7aede5.jsonl"
+      }
+    },
+    "readyEvents": 1,
+    "generationSlot": true,
+    "mcpForeign": {
+      "preflight": {
+        "replies": 1,
+        "ms": 2145,
+        "contract": {
+          "tools": {
+            "effectiveAllowlist": [
+              "read",
+              "bsl-ws_search",
+              "bsl-ws_symbol_info",
+              "bsl-ws_graph",
+              "bsl-ws_metadata",
+              "bsl-ws_diagnostics",
+              "bsl-ws_query",
+              "bsl-ws_event_log",
+              "bsl-ref_syntax_help",
+              "bsl-ref_search",
+              "bsl-ref_its_help"
+            ],
+            "requiredChildTools": [
+              "read",
+              "bsl-ws_search",
+              "bsl-ws_symbol_info",
+              "bsl-ws_graph",
+              "bsl-ws_metadata",
+              "bsl-ws_diagnostics",
+              "bsl-ws_query",
+              "bsl-ws_event_log",
+              "bsl-ref_syntax_help",
+              "bsl-ref_search",
+              "bsl-ref_its_help"
+            ],
+            "disableAmbientExtensions": true
+          },
+          "mcpDirectTools": [
+            "bsl-ws_search",
+            "bsl-ws_symbol_info",
+            "bsl-ws_graph",
+            "bsl-ws_metadata",
+            "bsl-ws_diagnostics",
+            "bsl-ws_query",
+            "bsl-ws_event_log",
+            "bsl-ref_syntax_help",
+            "bsl-ref_search",
+            "bsl-ref_its_help"
+          ],
+          "canonicalCwd": "/home/kelishev/a1r5-probe-20260921/ws-leaf"
+        }
+      },
+      "started": 1,
+      "terminals": [
+        {
+          "status": "completed",
+          "launchContractDigest": "67739fbb09720b5e41b5c1ea5df399474b8946e2bcd1b94aed29389cb10766d5",
+          "deniedToolCalls": [],
+          "result": {
+            "kind": "text",
+            "text": "DONE"
+          },
+          "keys": [
+            "agent",
+            "deniedToolCalls",
+            "exitCode",
+            "launchContractDigest",
+            "model",
+            "result",
+            "runId",
+            "status",
+            "thinking",
+            "toolRegistry",
+            "usage"
+          ]
+        }
+      ],
+      "digestMatches": true,
+      "providerRequests": 2,
+      "providerTools": [
+        [
+          "bsl-ref_its_help",
+          "bsl-ref_search",
+          "bsl-ref_syntax_help",
+          "bsl-ws_diagnostics",
+          "bsl-ws_event_log",
+          "bsl-ws_graph",
+          "bsl-ws_metadata",
+          "bsl-ws_query",
+          "bsl-ws_search",
+          "bsl-ws_symbol_info",
+          "read"
+        ],
+        [
+          "bsl-ref_its_help",
+          "bsl-ref_search",
+          "bsl-ref_syntax_help",
+          "bsl-ws_diagnostics",
+          "bsl-ws_event_log",
+          "bsl-ws_graph",
+          "bsl-ws_metadata",
+          "bsl-ws_query",
+          "bsl-ws_search",
+          "bsl-ws_symbol_info",
+          "read"
+        ]
+      ],
+      "toolTexts": [
+        "fixture:a1r5-bsl-ws:search"
+      ]
+    },
+    "envEqualToInitial": true
+  }
+}
