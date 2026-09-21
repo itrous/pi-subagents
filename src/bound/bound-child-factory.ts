@@ -139,7 +139,7 @@ function refusalFailure(refusal: BoundBarrierRefusal): BoundRunFailure {
 }
 
 /** The upstream launch with the bound layer's edits; the recheck already passed on the original. */
-function boundLaunch(launch: ChildSessionLaunch, extra: { hooks: ChildSessionLaunch["hooks"]; processEnv: Record<string, string>; onExtensionError: NonNullable<ChildSessionLaunch["onExtensionError"]> }): ChildSessionLaunch {
+export function boundLaunch(launch: ChildSessionLaunch, extra: { hooks: ChildSessionLaunch["hooks"]; processEnv: Record<string, string>; onExtensionError: NonNullable<ChildSessionLaunch["onExtensionError"]> }): ChildSessionLaunch {
 	return {
 		...launch,
 		// Attested `package:` and relative refs leave the path list; their factories

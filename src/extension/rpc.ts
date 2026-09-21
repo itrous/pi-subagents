@@ -484,7 +484,7 @@ async function executeChecked(
 	return dataFromToolResult(result);
 }
 
-/** Targeted status/steer/interrupt/resume: a live bound run answers like an unknown id. */
+/** Targeted status/steer/interrupt/resume: a bound run answers like an unknown id. */
 async function executeCheckedPublicTarget(
 	options: RegisterSubagentRpcBridgeOptions,
 	ctx: ExtensionContext,

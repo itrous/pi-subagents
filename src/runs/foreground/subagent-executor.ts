@@ -6564,7 +6564,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							: item),
 					};
 				};
-				// Status reads see no live bound run (I4.13); writes still reach deps.state.
+				// Status reads see no bound run (I4.13); writes still reach deps.state.
 				const statusState = publicBoundStatusState(deps.state);
 				const nestedScope = nestedResolutionScopeForExecutor(deps);
 				const sessionRoots = trustedSessionRootsForStatus(ctx, deps);

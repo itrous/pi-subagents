@@ -8,6 +8,8 @@ import type { ToolRegistryProjectionV1 } from "./bound-tool-registry-projection.
 // is visible to every module instance of this build, including a reloaded one.
 export const BOUND_RUN_REGISTRY_GLOBAL_KEY = "__piSubagentBoundRunRegistryV1";
 export const BOUND_DENIED_TOOL_MAX_CALLS = 128;
+/** Far above any plausible number of live foreground controls in one process. */
+export const BOUND_PRIVATE_RUN_IDS_CAPACITY = 4096;
 
 /**
  * Capability carried on the executor params. A symbol key never reaches
@@ -103,6 +105,12 @@ export class BoundRunRegistryV1 {
 	readonly contractVersion!: 1;
 	private readonly runs = new Map<string, BoundRunRecord>();
 	private readonly sessionBindings = new Map<string, { runId: string; bindings: Readonly<BoundBindingsV1> }>();
+	/**
+	 * Every bound run id this process ever opened. Privacy follows these ids, not
+	 * the execution record: a detached leaf keeps its control and child after
+	 * the executor returned and the record closed.
+	 */
+	private readonly privateRunIds = new Set<string>();
 
 	constructor() {
 		Object.defineProperty(this, "contractVersion", { value: 1, enumerable: false, configurable: false, writable: false });
@@ -123,6 +131,10 @@ export class BoundRunRegistryV1 {
 			settled: false,
 		};
 		this.runs.set(runId, record);
+		this.privateRunIds.delete(runId);
+		this.privateRunIds.add(runId);
+		// Insertion order: the oldest id is evicted first.
+		while (this.privateRunIds.size > BOUND_PRIVATE_RUN_IDS_CAPACITY) this.privateRunIds.delete(this.privateRunIds.values().next().value!);
 		return record;
 	}
 
@@ -134,10 +146,14 @@ export class BoundRunRegistryV1 {
 		return this.runs.has(runId);
 	}
 
-	/** The upstream resolver accepts unique prefixes, so a prefix of a live run names it too. */
+	isPrivate(runId: string): boolean {
+		return this.privateRunIds.has(runId);
+	}
+
+	/** The upstream resolver accepts unique prefixes, so a prefix of a bound run names it too. */
 	names(target: string): boolean {
 		if (!target) return false;
-		for (const runId of this.runs.keys()) if (runId.startsWith(target)) return true;
+		for (const runId of this.privateRunIds) if (runId.startsWith(target)) return true;
 		return false;
 	}
 
@@ -192,14 +208,14 @@ export function getBoundRunRegistry(store: Record<string, unknown> = globalThis 
 	return registry;
 }
 
-/** T3 privacy check: a live bound run answers like an unknown id on every public surface. */
+/** T3 privacy check: a bound run answers like an unknown id on every public surface, for as long as it leaves traces. */
 export function isPrivateBoundRun(runId: string | undefined, store?: Record<string, unknown>): boolean {
-	return typeof runId === "string" && getBoundRunRegistry(store).has(runId);
+	return typeof runId === "string" && getBoundRunRegistry(store).isPrivate(runId);
 }
 
 /**
  * Public view of the executor state for status reads (T2): every read of
- * `foregroundControls` sees a map without live bound runs, and
+ * `foregroundControls` sees a map without bound runs, and
  * `lastForegroundControlId` reads undefined when it names one. Every other read
  * and every write goes to the real object, so budget and session fields never
  * diverge.
@@ -209,11 +225,11 @@ export function publicBoundStatusState<T extends { foregroundControls: Map<strin
 	return new Proxy(state, {
 		get(target, property, receiver) {
 			if (property === "foregroundControls") {
-				return new Map([...target.foregroundControls].filter(([runId]) => !registry.has(runId)));
+				return new Map([...target.foregroundControls].filter(([runId]) => !registry.isPrivate(runId)));
 			}
 			if (property === "lastForegroundControlId") {
 				const latest = target.lastForegroundControlId;
-				return typeof latest === "string" && registry.has(latest) ? undefined : latest;
+				return typeof latest === "string" && registry.isPrivate(latest) ? undefined : latest;
 			}
 			return Reflect.get(target, property, receiver);
 		},
@@ -230,7 +246,7 @@ function replaceStrings(value: unknown, from: string, to: string): unknown {
 }
 
 /**
- * T3: a request that targets a live bound run (by id, run id, or unique prefix)
+ * T3: a request that targets a bound run (by id, run id, or unique prefix)
  * is executed against a fresh id nothing answers to, and that id is written back
  * to the requested one in the reply. The public answer is therefore exactly the
  * "unknown id" answer for the requested target, and the run is never touched.

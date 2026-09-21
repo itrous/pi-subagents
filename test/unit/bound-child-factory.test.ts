@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import { afterEach, beforeEach, test } from "node:test";
-import { BOUND_CHILD_REFUSED_TEXT, createBoundChildSessionFactory, type BoundChildSessionFactoryOptions } from "../../src/bound/bound-child-factory.ts";
+import { BOUND_CHILD_REFUSED_TEXT, boundLaunch, createBoundChildSessionFactory, type BoundChildSessionFactoryOptions } from "../../src/bound/bound-child-factory.ts";
 import { BOUND_RUN_HOOK_NAME } from "../../src/bound/bound-run-hooks.ts";
 import { BoundRunRegistryV1 } from "../../src/bound/bound-run-registry.ts";
 import type { BoundAuthorizedLaunch } from "../../src/bound/bound-runtime-service.ts";
@@ -57,13 +57,20 @@ test("create() returns the base factory's child, with the run hook first and the
 	assert.equal(record.registry.failure, undefined);
 });
 
-test("the base factory receives no required-extension paths, so a loader error for one cannot fail open()", async () => {
-	// A host with required child extensions is refused at preflight (bound-resolver.test.ts);
-	// here the decorator's own guarantee is checked: it hands none to the base factory.
-	const { registry, record, launch } = await setup();
+test("the launch handed to the base factory carries no required-extension or package paths", async () => {
+	// As upstream builds it under a host policy (registerRequiredChildExtensions): the
+	// required path sits in both `requiredExtensions` and `extensionPaths`. The recheck
+	// refuses such a launch and preflight refuses the host (bound-resolver.test.ts), so
+	// the decorator's own guarantee is checked on `boundLaunch` as a unit.
+	const { launch } = await setup();
+	const policy = { ...launch, requiredExtensions: [{ id: "host-policy", path: "/host-required.ts" }], extensionPaths: ["/host-required.ts", "package:fixture-ext"] };
+	const handed = boundLaunch(policy, { hooks: [], processEnv: {}, onExtensionError: () => {} });
+	assert.deepEqual([handed.requiredExtensions, handed.extensionPaths], [[], []]);
+	// End to end: a base factory that would throw "Required child extension failed to
+	// load" for that path never sees it.
 	const { pi } = fakePi({ requiredError: "/host-required.ts" });
-	await factoryFor(registry, record.runId, pi).create(launch);
-	assert.equal(record.registry.failure, undefined);
+	await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi }).create(handed);
+	await assert.rejects(createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi }).create(policy), /Required child extension failed to load/, "positive control: the raw launch does fail open()");
 });
 
 /**

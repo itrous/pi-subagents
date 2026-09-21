@@ -29,8 +29,13 @@ function boundedError(text: string): string {
 	if (Buffer.byteLength(text, "utf8") <= MAX_ERROR_BYTES) return text;
 	let end = MAX_ERROR_BYTES;
 	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > MAX_ERROR_BYTES) end--;
+	// Never end on the high half of a surrogate pair.
+	const last = text.charCodeAt(end - 1);
+	if (end > 0 && last >= 0xd800 && last <= 0xdbff) end--;
 	return text.slice(0, end);
 }
+
+export const BOUND_EXECUTOR_FAILED_TEXT = "Bound leaf executor failed without an error message.";
 
 /** Private fields `executeDelegated` accepts and strips before execution. */
 export interface BoundExecutionParams extends SubagentParamsLike {
@@ -245,8 +250,8 @@ export function createBoundExecutionPort(options: BoundExecutionPortOptions): Bo
 			try { return await options.executeDelegated(launch.request.requestId, params, signal, relay, ctx); }
 			// A thrown executor still reports the run's evidence; without a child result it is `failed`.
 			catch (thrown) {
-				const reason = thrown instanceof Error ? thrown.message : String(thrown);
-				return reason ? { content: [{ type: "text", text: reason }], details: emptyResult.details } : emptyResult;
+				const reason = thrown instanceof Error ? thrown.message : typeof thrown === "string" ? thrown : "";
+				return { content: [{ type: "text", text: reason.trim() ? reason : BOUND_EXECUTOR_FAILED_TEXT }], details: emptyResult.details };
 			}
 		})();
 		// The record, and with it the run's privacy (T3), lives exactly as long as

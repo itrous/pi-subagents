@@ -97,3 +97,16 @@ test("denials beyond the cap raise the overflow flag instead of being lost silen
 	assert.equal(record.denials.calls.length, BOUND_DENIED_TOOL_MAX_CALLS);
 	assert.equal(record.denials.overflow, true);
 });
+
+test("privacy outlives the execution record, and only the oldest id is evicted beyond capacity", async () => {
+	const { BOUND_PRIVATE_RUN_IDS_CAPACITY } = await import("../../src/bound/bound-run-registry.ts");
+	const registry = new BoundRunRegistryV1();
+	assert.ok(registry.open(launch("run-first", {})));
+	registry.close("run-first");
+	assert.equal(registry.has("run-first"), false, "the execution record is gone");
+	assert.equal(registry.isPrivate("run-first"), true, "the run id stays private");
+	assert.equal(registry.names("run-fi"), true);
+	for (let index = 0; index < BOUND_PRIVATE_RUN_IDS_CAPACITY; index++) { registry.open(launch(`run-${index}`, {})); registry.close(`run-${index}`); }
+	assert.equal(registry.isPrivate("run-first"), false, "the oldest id is evicted first");
+	assert.equal(registry.isPrivate(`run-${BOUND_PRIVATE_RUN_IDS_CAPACITY - 1}`), true);
+});

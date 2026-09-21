@@ -4,7 +4,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { BoundAttemptCoordinator } from "../../src/bound/bound-attempt-coordinator.ts";
 import { BOUND_BINDINGS_NAMESPACE } from "../../src/bound/bound-bindings.ts";
 import {
-	buildBoundExecutionParams, createBoundExecutionPort, type BoundExecuteDelegated, type BoundExecutionPortOptions,
+	BOUND_EXECUTOR_FAILED_TEXT, buildBoundExecutionParams, createBoundExecutionPort, type BoundExecuteDelegated, type BoundExecutionPortOptions,
 } from "../../src/bound/bound-execution-port.ts";
 import { registerBoundLaunchBridge, type BoundExecutionPort } from "../../src/bound/bound-launch-bridge.ts";
 import { boundRunIdOf, BoundRunRegistryV1, getBoundRunRegistry, isPrivateBoundRun } from "../../src/bound/bound-run-registry.ts";
@@ -205,6 +205,17 @@ test("an executor exception settles as failed with the run's evidence", async ()
 	const verbose = port(async () => { throw new Error("ж".repeat(5000)); });
 	const long = await verbose.handle.run({ launch: await admittedLaunch(), signal: new AbortController().signal, onUpdate: noUpdate });
 	assert.ok(Buffer.byteLength(String(long.error), "utf8") <= 4096, "the reason is bounded like the client's limit");
+	const astral = port(async () => { throw new Error(`${"a".repeat(4093)}\u{1D49C}`); });
+	const cut = String((await astral.handle.run({ launch: await admittedLaunch(), signal: new AbortController().signal, onUpdate: noUpdate })).error);
+	assert.ok(Buffer.byteLength(cut, "utf8") <= 4096);
+	const tail = cut.charCodeAt(cut.length - 1);
+	assert.ok(!(tail >= 0xd800 && tail <= 0xdbff), "no dangling high surrogate");
+	for (const [label, rejection] of [["a plain object", {}], ["no value", undefined], ["a string", "plain string reason"]] as const) {
+		const odd = port(async () => { throw rejection; });
+		const outcome = await odd.handle.run({ launch: await admittedLaunch(), signal: new AbortController().signal, onUpdate: noUpdate });
+		assert.equal(outcome.status, "failed", label);
+		assert.equal(outcome.error, rejection === "plain string reason" ? "plain string reason" : BOUND_EXECUTOR_FAILED_TEXT, label);
+	}
 });
 
 test("a recorded registry failure wins over the executor status (D8 mapping)", async () => {

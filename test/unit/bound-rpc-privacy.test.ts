@@ -172,3 +172,42 @@ test("the model's own subagent tool by explicit id or prefix treats a bound run 
 	current.release();
 	await Promise.all([bound.done, plain.done]);
 });
+
+type Detachable = { detach?: () => boolean };
+
+test("a detached bound run stays private after its execution record closed; positive control: a detached public run stays visible", async () => {
+	stand = createExecutorStand(fixture);
+	const current = stand;
+	const rpc = rpcClient(current);
+	const plain = await startPlain(current);
+	assert.equal((current.state.foregroundControls.get(plain.runId) as unknown as Detachable).detach?.(), true);
+	await plain.done;
+	const bound = await startBound(current);
+	assert.equal((current.state.foregroundControls.get(bound.runId) as unknown as Detachable).detach?.(), true);
+	await bound.done;
+	// The port closes the execution record once the executor returned; the child is still held.
+	getBoundRunRegistry().close(bound.runId);
+	assert.equal(getBoundRunRegistry().has(bound.runId), false);
+	assert.ok(current.state.foregroundControls.has(bound.runId), "the detached control is still in the process");
+
+	const tool = async (params: Record<string, unknown>) => {
+		const result = await current.executor.executePublic("tool-call", params, new AbortController().signal, undefined, current.ctx as never);
+		return { isError: result.isError, content: result.content };
+	};
+	for (const base of [{ action: "status" }, { action: "interrupt" }, { action: "steer", message: "m" }, { action: "stop" }, { action: "dismiss" }] as Array<Record<string, unknown>>) {
+		for (const target of [bound.runId, bound.runId.slice(0, 8)]) {
+			const unknown = target === bound.runId ? randomUUID() : "ffffffff";
+			assert.deepEqual(await tool({ ...base, id: target }), JSON.parse(JSON.stringify(await tool({ ...base, id: unknown })).replaceAll(unknown, target)), `tool ${String(base.action)} ${target}`);
+		}
+	}
+	await assertAnswersAsUnknown(rpc, "interrupt", {}, bound.runId);
+	await assertAnswersAsUnknown(rpc, "status", {}, bound.runId);
+	const fleet = await rpc("status");
+	assert.equal((fleet.data!.fleet as { totalActive: number }).totalActive, 1, "only the public run counts in Fleet");
+	const fleetView = await rpc("status", { view: "fleet" });
+	for (const reply of [fleet, fleetView]) assert.equal(JSON.stringify(reply).includes(bound.runId), false);
+	// Positive control: the detached public run is still listed and named.
+	assert.ok(JSON.stringify(fleetView).includes(plain.runId), "the detached public run is visible in view: fleet");
+	assert.equal(current.boundProbe.aborts, 0, "the detached bound child was not interrupted");
+	current.release();
+});
