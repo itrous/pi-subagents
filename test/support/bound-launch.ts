@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 import { boundExpectedSystemPrompt } from "../../src/bound/bound-launch-recheck.ts";
 import { createBoundRuntimeService, type BoundAuthorizedLaunch, type BoundRuntimeServiceOptions } from "../../src/bound/bound-runtime-service.ts";
 import { BOUND_CHANNEL_VERSION, type BoundBindingV2 } from "../../src/bound/channel.ts";
@@ -51,4 +53,24 @@ export function contractLaunch(fixture: BoundFixture, authorized: BoundAuthorize
 			...(contract.mcpDirectTools.length > 0 ? { mcpDirectTools: [...contract.mcpDirectTools] } : {}),
 		} as ChildSessionLaunch["runtime"],
 	};
+}
+
+/**
+ * Project MCP config plus a fresh pi-mcp-adapter metadata cache, so upstream
+ * resolves `server/tool` selectors for these pairs from the fixture project.
+ */
+export function writeMcpFixture(fixture: BoundFixture, pairs: ReadonlyArray<readonly [string, string]>): void {
+	const servers = Object.fromEntries([...new Set(pairs.map(([server]) => server))].map((server) => [server, { command: "node", args: [`${server}.js`] }]));
+	fs.mkdirSync(path.join(fixture.project, ".pi"), { recursive: true });
+	fs.writeFileSync(path.join(fixture.project, ".pi", "mcp.json"), JSON.stringify({ mcpServers: servers }));
+	const agentDir = path.join(fixture.home, ".pi", "agent");
+	fs.mkdirSync(agentDir, { recursive: true });
+	const cachedAt = Date.now();
+	fs.writeFileSync(path.join(agentDir, "mcp-cache.json"), JSON.stringify({
+		version: 1,
+		servers: Object.fromEntries(Object.entries(servers).map(([server, definition]) => [server, {
+			configHash: computeMcpServerHash(definition), cachedAt,
+			tools: pairs.filter(([owner]) => owner === server).map(([, tool]) => ({ name: tool })),
+		}])),
+	}));
 }

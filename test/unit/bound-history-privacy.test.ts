@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { getBoundRunRegistry } from "../../src/bound/bound-run-registry.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
@@ -18,6 +20,11 @@ afterEach(() => {
 });
 
 type Control = { detach?: () => boolean };
+/** The third history writer: `recordRun` appends one line per finished foreground run. */
+const runHistoryLines = (): string[] => {
+	try { return fs.readFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "run-history.jsonl"), "utf8").split("\n").filter(Boolean); }
+	catch { return []; }
+};
 const remembered = (state: SubagentState): Map<string, { children: Array<{ status?: string }> }> =>
 	(state.foregroundRuns ?? new Map()) as unknown as Map<string, { children: Array<{ status?: string }> }>;
 
@@ -28,7 +35,9 @@ test("an ordinary completion: the bound run is absent from history, the non-boun
 	stand.release();
 	opened.push(boundLaunch.contract.prospectiveRunId);
 	await stand.run(stand.bound(boundLaunch));
+	assert.deepEqual(runHistoryLines(), [], "no run-history line for the bound run");
 	await stand.run(stand.plain(plainLaunch));
+	assert.equal(runHistoryLines().length, 1, "positive control: the non-bound run is recorded");
 	const plainRunId = stand.plainLaunches[0]!.runtime.runId!;
 	assert.equal(remembered(stand.state).has(boundLaunch.contract.prospectiveRunId), false);
 	assert.equal(remembered(stand.state).has(plainRunId), true, "positive control: the non-bound run is remembered");
@@ -60,4 +69,6 @@ test("a detached exit: the bound run never reaches history, the non-bound run is
 	await until(() => remembered(current.state).get(plainRunId)?.children[0]?.status !== "detached", "detached writer of the non-bound run");
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	assert.equal(remembered(current.state).has(boundLaunch.contract.prospectiveRunId), false);
+	// Both detached children finished; only the non-bound one wrote its run-history line.
+	assert.equal(runHistoryLines().length, 1);
 });

@@ -23,7 +23,9 @@ type DelegatedResult = Awaited<ReturnType<BoundExecuteDelegated>>;
 const HARD_TIMER_MS = 60;
 const SHUTDOWN_MS = 90;
 const PROMISED_MS = HARD_TIMER_MS + SHUTDOWN_MS;
-const SLACK_MS = 250;
+// Generous under load, yet far below the controls: a port that waits for the
+// executor never settles, and the upstream default needs 5 000 ms.
+const SLACK_MS = 2_000;
 
 let fixture: BoundFixture;
 beforeEach(() => { fixture = createBoundFixture(); fs.mkdirSync(fixture.sessionDir, { recursive: true }); });
@@ -217,3 +219,34 @@ test("the layer's session_shutdown handler cancels live attempts and waits until
 		assert.deepEqual(terminals.map((entry) => entry.data.status), ["cancelled"], "the terminal exists once the handler returned");
 	} finally { plane.stop(); }
 });
+
+for (const [label, timing] of [
+	["create() starts only after the deadline", { createAfterMs: 200, reloadDelayMs: 0, sessions: 0 }],
+	["create() is still loading when the deadline passes", { createAfterMs: 0, reloadDelayMs: 200, sessions: 1 }],
+] as const) {
+	test(`a child that would appear after the cancel deadline is never left alive: ${label}`, async () => {
+		const registry = new BoundRunRegistryV1();
+		const launch = await admitBoundLaunch(fixture);
+		const { pi, probe } = fakePi({ reloadDelayMs: timing.reloadDelayMs });
+		let created: Promise<unknown> | undefined;
+		const executeDelegated: BoundExecuteDelegated = async (_id, params) => {
+			const runId = boundRunIdOf(params)!;
+			await sleep(timing.createAfterMs);
+			created = createBoundChildSessionFactory({ runId, expectedRunId: runId }, { registry, loadPiCodingAgent: async () => pi, processCwd: () => fixture.project, shutdownTimeoutMs: SHUTDOWN_MS })
+				.create(contractLaunch(fixture, launch));
+			await created.catch(() => {});
+			return { content: [], details: { mode: "single", results: [] } } as unknown as DelegatedResult;
+		};
+		const port = createBoundExecutionPort({ executeDelegated, getContext: () => fixture.context() as never, config: fixture.config, registry, hardTimerMs: HARD_TIMER_MS });
+		const controller = new AbortController();
+		const outcome = port.run({ launch, signal: controller.signal, onUpdate: () => {} });
+		controller.abort();
+		assert.equal((await outcome).status, "cancelled");
+		await port.whenIdle();
+		for (let attempt = 0; attempt < 200 && !created; attempt++) await sleep(5);
+		await assert.rejects(created!, "the late child is refused, not handed to the executor");
+		assert.equal(probe.disposed, probe.sessions, "every session that was created is disposed exactly once");
+		assert.equal(probe.sessions, timing.sessions);
+		assert.equal(probe.requests, 0);
+	});
+}

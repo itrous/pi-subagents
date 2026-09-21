@@ -198,9 +198,13 @@ test("an executor exception settles as failed with the run's evidence", async ()
 	const { handle, registry } = port(async (_id, params) => { recordEvidence(registry, params); throw new Error("executor broke"); });
 	const outcome = await handle.run({ launch, signal: new AbortController().signal, onUpdate: noUpdate });
 	assert.equal(outcome.status, "failed");
+	assert.equal(outcome.error, "executor broke", "the reason of the exception reaches the terminal");
 	assert.equal(outcome.launchContractDigest, launch.contract.digest);
 	assert.deepEqual(outcome.deniedToolCalls, []);
 	assert.equal(registry.has(launch.contract.prospectiveRunId), false);
+	const verbose = port(async () => { throw new Error("ж".repeat(5000)); });
+	const long = await verbose.handle.run({ launch: await admittedLaunch(), signal: new AbortController().signal, onUpdate: noUpdate });
+	assert.ok(Buffer.byteLength(String(long.error), "utf8") <= 4096, "the reason is bounded like the client's limit");
 });
 
 test("a recorded registry failure wins over the executor status (D8 mapping)", async () => {

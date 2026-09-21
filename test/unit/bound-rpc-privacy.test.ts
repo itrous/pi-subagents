@@ -140,3 +140,35 @@ test("positive control: a public run is visible in the same status views and by 
 	current.release();
 	await Promise.all([bound.done, plain.done]);
 });
+
+test("the model's own subagent tool by explicit id or prefix treats a bound run as unknown; positive control: a public run is interrupted", async () => {
+	stand = createExecutorStand(fixture);
+	const current = stand;
+	const plain = await startPlain(current);
+	const bound = await startBound(current);
+	const tool = async (params: Record<string, unknown>) => {
+		const result = await current.executor.executePublic("tool-call", params, new AbortController().signal, undefined, current.ctx as never);
+		return { isError: result.isError, content: result.content };
+	};
+	const cases: Array<Record<string, unknown>> = [
+		{ action: "interrupt" }, { action: "steer", message: "change course" }, { action: "resume", message: "go on" }, { action: "stop" }, { action: "dismiss" },
+	];
+	for (const base of cases) {
+		for (const target of [bound.runId, bound.runId.slice(0, 8)]) {
+			const unknown = target === bound.runId ? randomUUID() : "ffffffff";
+			const aboutBound = await tool({ ...base, id: target });
+			const aboutUnknown = await tool({ ...base, id: unknown });
+			assert.deepEqual(aboutBound, JSON.parse(JSON.stringify(aboutUnknown).replaceAll(unknown, target)), `${String(base.action)} ${target}`);
+		}
+	}
+	const interruptBound = await tool({ action: "interrupt", id: bound.runId });
+	assert.equal(JSON.stringify(interruptBound).includes(bound.runId), false);
+	assert.equal(current.boundProbe.aborts, 0, "the bound attempt was not interrupted");
+
+	const interruptPlain = await tool({ action: "interrupt", id: plain.runId });
+	assert.equal(interruptPlain.isError, undefined, JSON.stringify(interruptPlain));
+	assert.ok(JSON.stringify(interruptPlain).includes(plain.runId));
+	await until(() => current.plainAborts.length > 0, "public run interrupted");
+	current.release();
+	await Promise.all([bound.done, plain.done]);
+});

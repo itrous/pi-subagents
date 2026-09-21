@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import { MCP_DIRECT_TOOLS_ENV } from "../runs/shared/child-launch.ts";
+import { resolveMcpDirectToolResolution } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import {
 	createDefaultChildSessionFactory, type ChildSession, type ChildSessionExtensionError, type ChildSessionFactory,
 	type ChildSessionLaunch, type PiCodingAgentModule,
@@ -83,6 +84,11 @@ function boundPiModule(pi: PiCodingAgentModule, hooks: { restore(): void; onSess
 		override async reload(...args: Parameters<InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>["reload"]>): Promise<void> {
 			try { await super.reload(...args); } catch (error) { hooks.restore(); throw error; }
 		}
+
+		// Read by open() right after reload (required-extension check, provider flush).
+		override getExtensions(...args: Parameters<InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>["getExtensions"]>): ReturnType<InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>["getExtensions"]> {
+			try { return super.getExtensions(...args); } catch (error) { hooks.restore(); throw error; }
+		}
 	}
 	const sessionManager = new Proxy(pi.SessionManager, {
 		get(target, property, receiver) {
@@ -105,6 +111,26 @@ function boundPiModule(pi: PiCodingAgentModule, hooks: { restore(): void; onSess
 		return created;
 	};
 	return { ...pi, DefaultResourceLoader: BoundResourceLoader, SessionManager: sessionManager, resolveCliModel, createAgentSession };
+}
+
+/**
+ * The window value for the effective direct tools only. The recheck already tied
+ * `launch.runtime.mcpDirectTools` to `contract.mcpDirectTools`, the names left
+ * after a capability ceiling; each name is mapped back to its own `server/tool`
+ * selector through the same upstream resolution the tool plan used. A foreground
+ * launch carries no `processEnv` (upstream sets it for the runner host only), so
+ * the value cannot be taken from the launch. Undefined when a name no longer
+ * resolves.
+ */
+function effectiveMcpWindow(record: BoundRunRecord): string | undefined {
+	const { contract, agent } = record.launch;
+	if (contract.mcpDirectTools.length === 0) return "__none__";
+	let resolution: ReturnType<typeof resolveMcpDirectToolResolution>;
+	try { resolution = resolveMcpDirectToolResolution(agent.mcpDirectTools, contract.canonicalCwd); } catch { return undefined; }
+	if (resolution.unresolvedSelectors.length > 0) return undefined;
+	const selectorByName = new Map(resolution.selections.map((selection) => [selection.name, selection.selector]));
+	const selectors = contract.mcpDirectTools.map((name) => selectorByName.get(name));
+	return selectors.every((selector): selector is string => typeof selector === "string") ? selectors.join(",") : undefined;
 }
 
 function refusalFailure(refusal: BoundBarrierRefusal): BoundRunFailure {
@@ -172,8 +198,9 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 				model: contract.model,
 				api: contract.toolRegistry.modelApi,
 			};
-			const selectors = contract.mcpDirectTools.length > 0 ? record.launch.agent.mcpDirectTools ?? [] : [];
-			const window = createEnvWindow(selectors.length > 0 ? selectors.join(",") : "__none__");
+			const windowValue = effectiveMcpWindow(record);
+			if (windowValue === undefined) throw refuse(record, { status: "unavailable_context", toolRegistryError: "launch_contract_mismatch" });
+			const window = createEnvWindow(windowValue);
 			const envWindow = options.envRestore === "none" ? { processEnv: window.processEnv, restore: () => {} } : window;
 			const commitBarrier = (session: AgentSession): void => {
 				const snapshot = snapshotBoundToolRegistry(session, { required: contract.toolRegistry.projection.required, internalTools: contract.toolRegistry.projection.internalTools });
@@ -213,17 +240,17 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 			];
 			const upstreamOnError = launch.onExtensionError;
 			const onExtensionError = (error: ChildSessionExtensionError): void => {
-				upstreamOnError?.(error);
-				// Both are reported immediately before `open()` throws.
+				// Both are reported immediately before `open()` throws; restore first, so a
+				// throwing upstream callback cannot skip it.
 				if (error.event === "inherit_provider" || error.event === "refresh_providers") envWindow.restore();
-				// Without the loader cache reset, package factories would share module
-				// state with other sessions in this process.
-				if (error.extensionPath === "<loader>" && error.event === "load") closeRun({ status: "unavailable_context", toolRegistryError: "package_load_error" });
+				upstreamOnError?.(error);
 			};
 			base = createDefaultChildSessionFactory({
 				loadPiCodingAgent: async () => boundPiModule(await loadPi(), { restore: envWindow.restore, onSession }),
 				shutdownTimeoutMs: options.shutdownTimeoutMs ?? BOUND_CHILD_SHUTDOWN_TIMEOUT_MS,
 			});
+			// The pre-work above awaits; a run settled meanwhile gets no session at all.
+			if (record.settled || registry.get(record.runId) !== record) throw refuse(record, { status: "unavailable_context", toolRegistryError: "launch_contract_mismatch" });
 			let child: ChildSession;
 			try { child = await base.create(boundLaunch(launch, { hooks, processEnv: envWindow.processEnv, onExtensionError })); }
 			// D2 (c): the last safety net; the window normally closed inside open().
@@ -233,7 +260,12 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 				await child.dispose();
 				throw new Error(BOUND_CHILD_REFUSED_TEXT);
 			}
-			registry.attachChild(record.runId, child);
+			// A cancel can settle the run while the session was being created: that child
+			// belongs to nobody, so it is disposed here and never handed to the executor.
+			if (!registry.attachChild(record.runId, child)) {
+				await child.dispose();
+				throw new Error(BOUND_CHILD_REFUSED_TEXT);
+			}
 			return child;
 		},
 		async dispose() {

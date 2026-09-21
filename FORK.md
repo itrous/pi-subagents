@@ -160,14 +160,15 @@ with `toolsMissing`/`toolsExtra` and no `toolRegistryError`.
 ### Known privacy limits
 
 A live bound run is private on the public surfaces of this build: Fleet and
-`status` (including `view: "fleet"`/`"transcript"` and the model's own `subagent`
-status by id or prefix), targeted `steer`/`interrupt`/`resume`, `interrupt`
-without an id, and the foreground history. It stays visible and controllable
-through the host owner's surfaces:
+`status` (including `view: "fleet"`/`"transcript"`), targeted
+`steer`/`interrupt`/`resume` over RPC, `interrupt` without an id, the model's own
+`subagent` tool (`status`, `interrupt`, `steer`, `resume`, `stop`, `dismiss` by id
+or prefix answer as for an unknown id), the foreground history, and
+`run-history.jsonl`. It stays visible and controllable through the host owner's
+surfaces:
 
 - slash commands (`src/slash/slash-commands.ts:238,246`);
 - the TUI Fleet (`src/tui/fleet.ts`, `src/tui/fleet-status.ts`);
-- `interrupt` by explicit id through the model's `subagent` tool;
 - the pi-web activity signal (`src/integrations/pi-web-session-liveness.ts:49`),
   which only reports that some work is active.
 

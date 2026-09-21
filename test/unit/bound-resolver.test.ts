@@ -233,3 +233,15 @@ test("an empty subagentOnlyExtensions list widens nothing and stays allowed", ()
 	fixture.writeAgent(fs.readFileSync(fixture.agentPath, "utf8").replace("subagentOnlyExtensions:", "subagentOnlyExtensions:\n  - ./ext.ts"));
 	assert.deepEqual(resolve(), { ok: false, code: "unsupported_mode" });
 });
+
+test("a host that requires extensions in every child is refused at preflight, not at execution", async () => {
+	const { registerRequiredChildExtensions } = await import("../../src/shared/required-child-extensions.ts");
+	const required = path.join(fixture.tempRoot, "host-required.ts");
+	fs.writeFileSync(required, "export default function () {}\n", "utf8");
+	const registration = registerRequiredChildExtensions({ sessionId: "parent-session-id", extensions: [{ id: "host-policy", path: required }] });
+	try {
+		assert.deepEqual(resolve(), { ok: false, code: "unsupported_mode" });
+	} finally { registration.dispose(); }
+	// Positive control: without the host policy the same request resolves.
+	assert.equal(resolve().ok, true);
+});

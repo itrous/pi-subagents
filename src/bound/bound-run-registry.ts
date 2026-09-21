@@ -91,6 +91,12 @@ export interface BoundRunRecord {
 	/** Bound runs are never visible through public surfaces (T3). */
 	readonly private: true;
 	child: ChildSession | undefined;
+	/**
+	 * Set by the port once the run's outcome is decided (before a deadline
+	 * dispose). A child that appears afterwards is never attached; its factory
+	 * disposes it.
+	 */
+	settled: boolean;
 }
 
 export class BoundRunRegistryV1 {
@@ -114,6 +120,7 @@ export class BoundRunRegistryV1 {
 			denials: new BoundDenialCollector(),
 			private: true,
 			child: undefined,
+			settled: false,
 		};
 		this.runs.set(runId, record);
 		return record;
@@ -136,7 +143,7 @@ export class BoundRunRegistryV1 {
 
 	attachChild(runId: string, child: ChildSession): boolean {
 		const record = this.runs.get(runId);
-		if (!record || record.child) return false;
+		if (!record || record.child || record.settled) return false;
 		record.child = child;
 		return true;
 	}

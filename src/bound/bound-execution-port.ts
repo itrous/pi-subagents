@@ -22,6 +22,15 @@ type PortOutcome = Awaited<ReturnType<BoundExecutionPort["run"]>>;
 export const BOUND_CANCEL_HARD_TIMER_MS = 3_000;
 const MAX_RESULT_BYTES = 1024 * 1024;
 const MAX_CURRENT_TOOL_BYTES = 128;
+/** The client accepts at most this many UTF-8 bytes of `error`. */
+const MAX_ERROR_BYTES = 4096;
+
+function boundedError(text: string): string {
+	if (Buffer.byteLength(text, "utf8") <= MAX_ERROR_BYTES) return text;
+	let end = MAX_ERROR_BYTES;
+	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > MAX_ERROR_BYTES) end--;
+	return text.slice(0, end);
+}
 
 /** Private fields `executeDelegated` accepts and strips before execution. */
 export interface BoundExecutionParams extends SubagentParamsLike {
@@ -176,7 +185,7 @@ export function projectBoundTerminal(record: BoundRunRecord, result: DelegatedRe
 	const usage = child?.usage;
 	return {
 		status,
-		...(error ? { error } : {}),
+		...(error ? { error: boundedError(error) } : {}),
 		...(details?.runId ? { runId: details.runId } : {}),
 		...(child?.agent ? { agent: child.agent } : {}),
 		...(child?.model ? { model: child.model } : {}),
@@ -235,7 +244,10 @@ export function createBoundExecutionPort(options: BoundExecutionPortOptions): Bo
 		const execution = (async (): Promise<DelegatedResult> => {
 			try { return await options.executeDelegated(launch.request.requestId, params, signal, relay, ctx); }
 			// A thrown executor still reports the run's evidence; without a child result it is `failed`.
-			catch { return emptyResult; }
+			catch (thrown) {
+				const reason = thrown instanceof Error ? thrown.message : String(thrown);
+				return reason ? { content: [{ type: "text", text: reason }], details: emptyResult.details } : emptyResult;
+			}
 		})();
 		// The record, and with it the run's privacy (T3), lives exactly as long as
 		// the executor does, even when the outcome was returned at the deadline.
@@ -252,6 +264,8 @@ export function createBoundExecutionPort(options: BoundExecutionPortOptions): Bo
 		const winner = await Promise.race([execution, deadline]);
 		if (timer) clearTimeout(timer);
 		if (startTimer) signal.removeEventListener("abort", startTimer);
+		// Before any dispose: a child the factory finishes later is refused and disposed there.
+		record.settled = true;
 		if (winner !== "deadline") return projectBoundTerminal(record, winner, signal.aborted);
 		try { await record.child?.dispose(); } catch { /* the outcome is cancelled either way */ }
 		return projectBoundTerminal(record, emptyResult, true);

@@ -7,11 +7,13 @@ import { BoundRunRegistryV1 } from "../../src/bound/bound-run-registry.ts";
 import type { BoundAuthorizedLaunch } from "../../src/bound/bound-runtime-service.ts";
 import { createDefaultChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createBoundFixture, type BoundFixture } from "../fixtures/bound/harness.ts";
-import { admitBoundLaunch, contractLaunch } from "../support/bound-launch.ts";
+import { admitBoundLaunch, contractLaunch, writeMcpFixture } from "../support/bound-launch.ts";
+import { expectedToolRegistryProjection } from "../../src/bound/bound-tool-registry-projection.ts";
 import { fakePi, type FailurePoint } from "../support/bound-fake-pi.ts";
+import { until } from "../support/bound-executor.ts";
 
 const ENV = "MCP_DIRECT_TOOLS";
-const FAILURE_POINTS: FailurePoint[] = ["reload", "refresh", "inheritProvider", "sessionManager", "resolveCliModel", "createAgentSession", "bindExtensions"];
+const FAILURE_POINTS: FailurePoint[] = ["reload", "getExtensions", "refresh", "inheritProvider", "sessionManager", "resolveCliModel", "createAgentSession", "bindExtensions"];
 
 let fixture: BoundFixture;
 let savedEnv: string | undefined;
@@ -42,7 +44,7 @@ test("create() returns the base factory's child, with the run hook first and the
 	const { pi, probe } = fakePi();
 	process.env[ENV] = "parent/value";
 	const before = envSnapshot();
-	const child = await factoryFor(registry, record.runId, pi).create({ ...launch, requiredExtensions: [{ path: "/host-required.ts" }] as never });
+	const child = await factoryFor(registry, record.runId, pi).create(launch);
 	assert.equal(envSnapshot(), before, "process.env is byte-equal after create()");
 	assert.equal(record.child, child, "the registry holds the returned child itself");
 	assert.deepEqual(Object.keys(child).sort(), ["abort", "dispose", "followUp", "hasQueuedMessages", "messages", "modelId", "prompt", "sessionFile", "sessionId", "steer", "subscribe"]);
@@ -55,25 +57,44 @@ test("create() returns the base factory's child, with the run hook first and the
 	assert.equal(record.registry.failure, undefined);
 });
 
-test("a host-required extension error cannot fail open(): the bound launch loads none", async () => {
+test("the base factory receives no required-extension paths, so a loader error for one cannot fail open()", async () => {
+	// A host with required child extensions is refused at preflight (bound-resolver.test.ts);
+	// here the decorator's own guarantee is checked: it hands none to the base factory.
 	const { registry, record, launch } = await setup();
 	const { pi } = fakePi({ requiredError: "/host-required.ts" });
-	await factoryFor(registry, record.runId, pi).create({ ...launch, requiredExtensions: [{ path: "/host-required.ts" }] as never });
+	await factoryFor(registry, record.runId, pi).create(launch);
 	assert.equal(record.registry.failure, undefined);
 });
 
-const mcpContract = (launch: BoundAuthorizedLaunch): BoundAuthorizedLaunch => ({
-	...launch,
-	contract: { ...launch.contract, mcpDirectTools: ["bsl-search"] },
-	agent: { ...launch.agent, mcpDirectTools: ["bsl/search"], definitionDigest: launch.contract.agent.definitionDigest },
-});
+/**
+ * A capability ceiling leaves one of the server's tools: the agent selects the
+ * whole `bsl-ws` server, the contract keeps only `bsl-ws_search`.
+ */
+const mcpContract = (launch: BoundAuthorizedLaunch): BoundAuthorizedLaunch => {
+	const required = ["bsl-ws_search", "read"];
+	return {
+		...launch,
+		contract: {
+			...launch.contract,
+			mcpDirectTools: ["bsl-ws_search"],
+			tools: { ...launch.contract.tools, effectiveAllowlist: required },
+			toolRegistry: { ...launch.contract.toolRegistry, projection: expectedToolRegistryProjection(required, [])! },
+		},
+		agent: { ...launch.agent, mcpDirectTools: ["bsl-ws"], definitionDigest: launch.contract.agent.definitionDigest },
+	};
+};
 
-test("an MCP leaf gets its selectors in the window and passes the D10 gate only at the leaf cwd", async () => {
+test("the MCP window carries only the effective selector; the leaf passes the D10 gate only at its cwd and reaches the provider", async () => {
+	writeMcpFixture(fixture, [["bsl-ws", "search"], ["bsl-ws", "graph"]]);
 	const { registry, record, launch } = await setup(mcpContract);
-	const { pi, probe } = fakePi();
+	const { pi, probe } = fakePi({ registerFromMcpWindow: true });
 	delete process.env[ENV];
-	await factoryFor(registry, record.runId, pi, { processCwd: () => record.launch.contract.canonicalCwd }).create(launch);
-	assert.deepEqual(probe.envAtReload, ["bsl/search"]);
+	const child = await factoryFor(registry, record.runId, pi, { processCwd: () => record.launch.contract.canonicalCwd }).create(launch);
+	assert.deepEqual(probe.envAtReload, ["bsl-ws/search"], "not the agent's whole-server selector");
+	assert.deepEqual([...probe.activeToolNames[0]!].sort(), ["bsl-ws_search", "read"]);
+	assert.equal(record.registry.failure, undefined, "the snapshot equals required");
+	await child.prompt("go");
+	assert.equal(probe.requests, 1);
 	assert.equal(process.env[ENV], undefined, "an absent variable is absent again");
 
 	const other = await setup(mcpContract);
@@ -81,6 +102,15 @@ test("an MCP leaf gets its selectors in the window and passes the D10 gate only 
 	await assert.rejects(factoryFor(other.registry, other.record.runId, refused.pi, { processCwd: () => "/elsewhere" }).create(other.launch), { message: BOUND_CHILD_REFUSED_TEXT });
 	assert.deepEqual(other.record.registry.failure, { status: "unavailable_context", toolRegistryError: "mcp_cwd_mismatch" });
 	assert.deepEqual(refused.probe.envAtReload, [], "no session work before the gate");
+});
+
+test("an effective MCP name that no longer resolves refuses the launch", async () => {
+	writeMcpFixture(fixture, [["bsl-ws", "graph"]]);
+	const { registry, record, launch } = await setup(mcpContract);
+	const { pi, probe } = fakePi();
+	await assert.rejects(factoryFor(registry, record.runId, pi, { processCwd: () => record.launch.contract.canonicalCwd }).create(launch), { message: BOUND_CHILD_REFUSED_TEXT });
+	assert.deepEqual(record.registry.failure, { status: "unavailable_context", toolRegistryError: "launch_contract_mismatch" });
+	assert.deepEqual(probe.envAtReload, []);
 });
 
 test("a launch that fails the recheck is refused before any session work", async () => {
@@ -132,13 +162,16 @@ test("positive control: without any restoration every failure point leaks the wi
 	}
 });
 
-test("a non-bound child queued right behind a failed bound launch sees the parent's value", async () => {
+test("a non-bound child queued behind a failed bound launch sees the parent's value (I4.6)", async () => {
 	const { registry, record, launch } = await setup();
 	const bound = fakePi({ fail: "createAgentSession" });
 	const plain = fakePi({ fail: "resolveCliModel" });
 	process.env[ENV] = "parent/value";
 	const failing = factoryFor(registry, record.runId, bound.pi).create(launch);
-	// Upstream serializes every open() of the process; this one runs next.
+	failing.catch(() => {});
+	// Deterministic order: the bound open() is already inside upstream's serialized
+	// window (its reload ran) before the non-bound launch queues behind it.
+	await until(() => bound.probe.envAtReload.length === 1, "bound window open");
 	const next = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => plain.pi }).create({ ...launch, hooks: [] });
 	await Promise.allSettled([failing, next]);
 	assert.deepEqual(plain.probe.envAtReload, ["parent/value"]);
@@ -152,4 +185,17 @@ test("positive control: without capturing the session the barrier cannot be inst
 	assert.deepEqual(record.registry.failure, { status: "native_tool_registry_mismatch", toolRegistryError: "barrier_unavailable" });
 	assert.equal(probe.disposed, 1, "the uncovered session is disposed");
 	assert.equal(probe.requests, 0);
+});
+
+test("two concurrent bound launches failing in getExtensions leave process.env byte-equal", async () => {
+	const first = await setup();
+	const second = await setup();
+	process.env[ENV] = "parent/value";
+	const before = envSnapshot();
+	const results = await Promise.allSettled([
+		factoryFor(first.registry, first.record.runId, fakePi({ fail: "getExtensions" }).pi).create(first.launch),
+		factoryFor(second.registry, second.record.runId, fakePi({ fail: "getExtensions" }).pi).create(second.launch),
+	]);
+	assert.deepEqual(results.map((result) => result.status), ["rejected", "rejected"]);
+	assert.equal(envSnapshot(), before);
 });

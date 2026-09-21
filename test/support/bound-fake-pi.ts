@@ -4,7 +4,7 @@ const ENV = "MCP_DIRECT_TOOLS";
 /** Builtins this stand's Pi exposes; `read` is the one the fixture agents allow. */
 const BUILTINS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
-export type FailurePoint = "reload" | "refresh" | "inheritProvider" | "sessionManager" | "resolveCliModel" | "createAgentSession" | "bindExtensions";
+export type FailurePoint = "reload" | "getExtensions" | "refresh" | "inheritProvider" | "sessionManager" | "resolveCliModel" | "createAgentSession" | "bindExtensions";
 
 export interface Probe {
 	envAtReload: Array<string | undefined>;
@@ -37,6 +37,10 @@ export interface FakePiOptions {
 	modelId?: string;
 	/** A prompt that passed the barrier calls the registered `structured_output` tool with this value. */
 	structuredValue?: unknown;
+	/** `reload()` takes this long, e.g. to let a cancel land while `create()` is still loading. */
+	reloadDelayMs?: number;
+	/** Stand-in for pi-mcp-adapter: register one `server_tool` per `server/tool` selector in the window. */
+	registerFromMcpWindow?: boolean;
 }
 
 interface Tool { name: string; execute?: (...args: unknown[]) => unknown }
@@ -78,12 +82,17 @@ export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; 
 		async reload() {
 			probe.envAtReload.push(process.env[ENV]);
 			if (options.fail === "reload") throw new Error("injected reload failure");
+			if (options.reloadDelayMs) await new Promise((resolve) => setTimeout(resolve, options.reloadDelayMs));
 			const api = inert({
 				on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => { this.handlers.set(event, [...(this.handlers.get(event) ?? []), handler]); },
 				registerTool: (tool: Tool) => { this.tools.set(tool.name, tool); },
 				getAllTools: () => [],
 				getActiveTools: () => [],
 			});
+			const window = process.env[ENV];
+			if (options.registerFromMcpWindow && window && window !== "__none__") {
+				for (const selector of window.split(",")) if (selector.includes("/")) this.tools.set(selector.replace("/", "_"), { name: selector.replace("/", "_") });
+			}
 			for (const hook of this.factories) {
 				probe.hookNames.push(hook.name);
 				// Pi records a throwing inline factory as a load error and goes on.
@@ -91,6 +100,7 @@ export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; 
 			}
 		}
 		getExtensions() {
+			if (options.fail === "getExtensions") throw new Error("injected getExtensions failure");
 			return {
 				extensions: [],
 				errors: options.requiredError ? [{ path: options.requiredError, error: "injected required failure" }] : [],

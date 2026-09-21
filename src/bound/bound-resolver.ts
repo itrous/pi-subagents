@@ -11,6 +11,7 @@ import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { canonicalSha256 } from "../shared/canonical-json.ts";
 import { AGENT_DEFINITION_PROJECTION_VERSION } from "../shared/launch-contract.ts";
 import { getSupportedThinkingLevels, type ModelInfo } from "../shared/model-info.ts";
+import { resolveRequiredChildExtensions } from "../shared/required-child-extensions.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { resolveChildMaxSubagentDepth, type ExtensionConfig } from "../shared/types.ts";
 import { resolveBoundAgent, type BoundAgentDiscoveryDeps, type BoundSkillEvidenceV1 } from "./bound-agent-discovery.ts";
@@ -184,6 +185,10 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		currentSessionId = resolveCurrentSessionId({ getSessionFile: () => parentSessionFile, getSessionId: () => piSessionId });
 	} catch { return failure("host_required"); }
 	if (!currentSessionId.trim() || !piSessionId?.trim()) return failure("host_required");
+	// A host that requires extensions in every child (registerRequiredChildExtensions)
+	// would have them appended to the leaf's launch, which the contract cannot
+	// describe: refuse here instead of at execution.
+	if (resolveRequiredChildExtensions(piSessionId).length > 0) return failure("unsupported_mode");
 
 	const rawBaseRoot = input.defaultSessionDir
 		? path.resolve((input.expandTilde ?? ((value: string) => value))(input.defaultSessionDir))
