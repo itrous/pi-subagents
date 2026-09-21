@@ -27,13 +27,21 @@ Every OneCPI **A1 (v1)** readiness probe still fails closed with
 the v2 client lands in A1R.6.
 
 **Platform limit.** The bound channel answers everywhere, but a launch contract
-is only issued on a Linux host: `resolveActiveRuntimeSourceIdentity`
-(`src/extension/source-identity.ts:277`) returns `unverified_source` on any
-non-Linux platform or without `/proc/self/fd`. On macOS and Windows the ping
-carries `sourceIdentityUnavailable`, `capabilities` is empty, preflight refuses
-with `unverified_source`, the self-check does not run, and the execution path is
-therefore inactive. Tests inject the identity through the `resolveSourceIdentity`
-seam and therefore stay green on every platform.
+is only issued on a verified host: Linux with `/proc/self/fd`, or macOS 15+
+(Darwin 24+) on arm64/x86_64. Both require a clean, detached Git checkout of this
+fork at a canonical (non-alias, non-symlink) package root and a trusted
+`/usr/bin/git`; a packaged copy without `.git` is not identified. On Darwin the
+tracked tree is verified by the pinned helper `native/source-identity-darwin`
+(source `native/source-identity-darwin.c`, universal executable, SHA256 pinned in
+`src/extension/source-identity-darwin.ts`, rebuilt and compared by
+`node scripts/build-source-identity-darwin.mjs --check`), which walks every entry
+with `openat`/`fstatat` from the held root descriptor; the runtime never compiles
+or downloads it. Any other platform, a missing or altered helper, or a failed
+check returns `unverified_source`: the ping carries `sourceIdentityUnavailable`,
+`capabilities` is empty, preflight refuses with `unverified_source`, the
+self-check does not run, and the execution path is therefore inactive. Tests
+inject the identity through the `resolveSourceIdentity` seam and therefore stay
+green on every platform.
 
 **A1R.5, installed probe on Linux.** `pi install git:…@<sha>` into a throwaway
 agent dir on a Linux host, real Pi 0.85.1, SDK parent, faux provider and fixture
@@ -89,9 +97,10 @@ source identity. The fork's lockfile is the fixed point of `npm install --omit=d
 `npm ci` and `npm install`. The tree tracks no symlink or gitlink, which the
 identity refuses as `unverified_source` (`test/unit/source-identity.test.ts`).
 
-The bound layer lives in `src/bound/` (entry `src/bound/index.ts`) and owns six
+The bound layer lives in `src/bound/` (entry `src/bound/index.ts`) and owns seven
 further modules outside it: `src/shared/canonical-json.ts`,
-`src/extension/source-identity.ts`, `src/runs/shared/core-runtime-tools.ts`,
+`src/extension/source-identity.ts`, `src/extension/source-identity-darwin.ts`,
+`src/runs/shared/core-runtime-tools.ts`,
 `src/runs/shared/package-tree-evidence.ts`, `src/api/launch-receipt.ts`,
 `src/slash/bound-identity-registry.ts`. That exact set is published in the
 contract as `toolRegistry.runtimeExtensions` and is checked against the import

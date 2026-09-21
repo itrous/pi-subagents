@@ -40,6 +40,7 @@ export const BOUND_LAYER_MODULES = [
 	"bound/index.ts",
 	"bound/pi-runtime-attestation.ts",
 	"api/launch-receipt.ts",
+	"extension/source-identity-darwin.ts",
 	"extension/source-identity.ts",
 	"runs/shared/core-runtime-tools.ts",
 	"runs/shared/package-tree-evidence.ts",

@@ -56,7 +56,7 @@ export interface BoundRuntimeServiceOptions {
 	waitToolEnabled: boolean;
 	resolveCapabilityCeiling: (sessionId: string) => ResolvedSubagentCapabilityCeiling | undefined;
 	expandTilde?: (value: string) => string;
-	/** Seam: source identity is Linux-only upstream, so every test supplies it here. */
+	/** Seam: source identity needs a verified Linux or macOS 15+ Git checkout, so every test supplies it here. */
 	resolveSourceIdentity?: () => ActiveRuntimeSourceIdentityResolution;
 	attestRuntime?: (expectedVersion?: string) => Promise<PiRuntimeAttestationResult>;
 	layerManifest?: () => BoundLayerManifestV2;

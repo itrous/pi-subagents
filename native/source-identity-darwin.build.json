@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "source": "native/source-identity-darwin.c",
+  "sourceSha256": "51f6d8882f3b295b0fd8c36c2b77b49c54ca39e7833cd3d51d9f512c5225390a",
+  "artifact": "native/source-identity-darwin",
+  "artifactSha256": "4bfb1b9d111c51f626d1631639e83ac8ed1d09e525d40f0d58948e1cf50b06e0",
+  "compiler": "Apple clang version 17.0.0 (clang-1700.6.4.2)",
+  "sdkVersion": "26.2",
+  "targets": [
+    "arm64-apple-macos15.0",
+    "x86_64-apple-macos15.0"
+  ],
+  "flags": [
+    "-std=c11",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-fno-common"
+  ]
+}

@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { type DarwinTreeEntry, type DarwinTreeVerifier, darwinHostSupported, openDarwinTreeVerifier } from "./source-identity-darwin.ts";
 
 export const ACTIVE_RUNTIME_SOURCE_IDENTITY_VERSION = 1;
 export const ACTIVE_RUNTIME_REPOSITORY = "https://github.com/itrous/pi-subagents.git";
@@ -111,8 +112,12 @@ const run=args=>new Promise(resolve=>{
 })().catch(()=>finish());
 `;
 
+function gitProbePlatform(): boolean {
+	return process.platform === "linux" || process.platform === "darwin";
+}
+
 function trustedSystemGitExecutable(): string | undefined {
-	if (process.platform !== "linux") return undefined;
+	if (!gitProbePlatform()) return undefined;
 	const executable = "/usr/bin/git";
 	try {
 		for (const [candidate, kind] of [["/", "directory"], ["/usr", "directory"], ["/usr/bin", "directory"], [executable, "file"]] as const) {
@@ -126,7 +131,7 @@ function trustedSystemGitExecutable(): string | undefined {
 
 /** Test seam for process-tree and limit probes; production identity never accepts this path from ambient input. */
 export const runGitProbeWithExecutable = (root: string, phase: "initial" | "final", commit: string | undefined, limits: { timeoutMs: number; outputBytes: number }, gitExecutable: string): GitProbeResult => {
-	if (process.platform !== "linux" || !path.isAbsolute(gitExecutable)) return { commands: [] };
+	if (!gitProbePlatform() || !path.isAbsolute(gitExecutable)) return { commands: [] };
 	const result = spawnSync(process.execPath, ["-e", PROBE_SCRIPT, Buffer.from(root).toString("base64url"), phase, commit ?? "", String(limits.timeoutMs), String(limits.outputBytes), gitExecutable], {
 		encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: limits.timeoutMs + 1_000,
 		killSignal: "SIGKILL", maxBuffer: PROBE_OUTPUT_LIMIT * 2, env: gitIdentityEnvironment(), windowsHide: true,
@@ -185,27 +190,53 @@ function verifyNamespace(rootFd: number, components: Buffer[], heldDirectoryStat
 	finally { for (const fd of reopened.reverse()) fs.closeSync(fd); }
 }
 
-function verifyTree(rootFd: number, tree: Buffer, deadline: number, onEntryReadForTest?: (relativePath: Buffer) => void): SourceIdentityUnavailableReason | undefined {
+interface TreeRecord { mode: "100644" | "100755"; blob: string; relative: Buffer; components: Buffer[] }
+interface TreeCounters { entries: number; pathBytes: number; componentCount: number }
+
+function parseTreeRecord(raw: string, counters: TreeCounters): TreeRecord | SourceIdentityUnavailableReason {
+	if (!raw) return "malformed_output";
+	if (++counters.entries > TRACKED_ENTRY_LIMIT) return "output_too_large";
+	const record = Buffer.from(raw, "latin1"), tab = record.indexOf(9);
+	if (tab < 0) return "malformed_output";
+	const match = /^(100644|100755|120000|160000) (blob|commit) ([0-9a-f]{40})$/.exec(record.subarray(0, tab).toString("ascii"));
+	if (!match) return "malformed_output";
+	if (match[1] === "120000" || match[1] === "160000") return "unverified_source";
+	const relative = record.subarray(tab + 1);
+	counters.pathBytes += relative.length;
+	if (counters.pathBytes > TRACKED_PATH_LIMIT || relative.length === 0 || relative[0] === 47) return "output_too_large";
+	const components = relative.toString("latin1").split("/").map((value) => Buffer.from(value, "latin1"));
+	counters.componentCount += components.length;
+	if (components.length > TRACKED_DEPTH_LIMIT || counters.componentCount > TRACKED_COMPONENT_LIMIT) return "output_too_large";
+	if (!components.every(validComponent)) return "malformed_output";
+	return { mode: match[1] as TreeRecord["mode"], blob: match[3]!, relative, components };
+}
+
+/** Darwin has no descriptor-relative path in Node: the pinned helper walks the parsed tree from the held root FD. */
+function verifyTreeDarwin(rootFd: number, records: string[], deadline: number, verifier: DarwinTreeVerifier): SourceIdentityUnavailableReason | undefined {
+	const counters: TreeCounters = { entries: 0, pathBytes: 0, componentCount: 0 };
+	const entries: DarwinTreeEntry[] = [];
+	for (const raw of records) {
+		if (Date.now() >= deadline) return "git_timeout";
+		const parsed = parseTreeRecord(raw, counters);
+		if (typeof parsed === "string") return parsed;
+		entries.push({ executable: parsed.mode === "100755", blob: parsed.blob, path: parsed.relative });
+	}
+	return verifier.verify(rootFd, entries, deadline, TRACKED_CONTENT_LIMIT);
+}
+
+function verifyTree(rootFd: number, tree: Buffer, deadline: number, onEntryReadForTest?: (relativePath: Buffer) => void, darwin?: DarwinTreeVerifier): SourceIdentityUnavailableReason | undefined {
 	if (tree.length > 0 && tree.at(-1) !== 0) return "malformed_output";
 	if (tree.length === 0) return undefined;
-	let entries = 0, pathBytes = 0, contentBytes = 0, componentCount = 0;
+	const records = tree.subarray(0, tree.length - 1).toString("latin1").split("\0");
+	if (darwin) return verifyTreeDarwin(rootFd, records, deadline, darwin);
+	const counters: TreeCounters = { entries: 0, pathBytes: 0, componentCount: 0 };
+	let contentBytes = 0;
 	const verifiedEntries: Array<{ components: Buffer[]; directoryStats: fs.Stats[]; finalStat: fs.Stats }> = [];
-	for (const raw of tree.subarray(0, tree.length - 1).toString("latin1").split("\0")) {
+	for (const raw of records) {
 		if (Date.now() >= deadline) return "git_timeout";
-		if (!raw) return "malformed_output";
-		if (++entries > TRACKED_ENTRY_LIMIT) return "output_too_large";
-		const record = Buffer.from(raw, "latin1"), tab = record.indexOf(9);
-		if (tab < 0) return "malformed_output";
-		const match = /^(100644|100755|120000|160000) (blob|commit) ([0-9a-f]{40})$/.exec(record.subarray(0, tab).toString("ascii"));
-		if (!match) return "malformed_output";
-		if (match[1] === "120000" || match[1] === "160000") return "unverified_source";
-		const relative = record.subarray(tab + 1);
-		pathBytes += relative.length;
-		if (pathBytes > TRACKED_PATH_LIMIT || relative.length === 0 || relative[0] === 47) return "output_too_large";
-		const components = relative.toString("latin1").split("/").map((value) => Buffer.from(value, "latin1"));
-		componentCount += components.length;
-		if (components.length > TRACKED_DEPTH_LIMIT || componentCount > TRACKED_COMPONENT_LIMIT) return "output_too_large";
-		if (!components.every(validComponent)) return "malformed_output";
+		const parsed = parseTreeRecord(raw, counters);
+		if (typeof parsed === "string") return parsed;
+		const { mode, blob, relative, components } = parsed;
 		const opened: number[] = [], heldDirectoryStats: fs.Stats[] = [];
 		let parentFd = rootFd;
 		try {
@@ -219,13 +250,13 @@ function verifyTree(rootFd: number, tree: Buffer, deadline: number, onEntryReadF
 			const fd = fs.openSync(finalPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
 			try {
 				const before = fs.fstatSync(fd); finalStat = before;
-				if (!before.isFile() || Boolean(before.mode & 0o100) !== (match[1] === "100755")) return "dirty";
+				if (!before.isFile() || Boolean(before.mode & 0o100) !== (mode === "100755")) return "dirty";
 				if (before.size > TRACKED_CONTENT_LIMIT - contentBytes) return "output_too_large";
 				bytesRead = fs.readFileSync(fd);
 				if (!sameStat(before, fs.fstatSync(fd)) || bytesRead.length !== before.size) return "dirty";
 			} finally { fs.closeSync(fd); }
 			contentBytes += bytesRead.length;
-			if (contentBytes > TRACKED_CONTENT_LIMIT || gitBlobHash(bytesRead) !== match[3]) return "dirty";
+			if (contentBytes > TRACKED_CONTENT_LIMIT || gitBlobHash(bytesRead) !== blob) return "dirty";
 			onEntryReadForTest?.(Buffer.from(relative));
 			if (Date.now() >= deadline) return "git_timeout";
 			if (!verifyNamespace(rootFd, components, heldDirectoryStats, finalStat, deadline)) return Date.now() >= deadline ? "git_timeout" : "dirty";
@@ -271,10 +302,11 @@ function parseMetadata(commands: ProbeCommandResult[], packageRoot: string, comm
 export function resolveActiveRuntimeSourceIdentity(options: {
 	packageRoot?: string;
 	runProbe?: GitProbeRunner;
-	/** Test-only race seam, invoked after anchored bytes are read and before namespace recheck. */
+	/** Test-only race seam, invoked after anchored bytes are read and before namespace recheck. Linux only: on Darwin the helper process walks the tree and the seam is never invoked. */
 	onEntryReadForTest?: (relativePath: Buffer) => void;
 } = {}): ActiveRuntimeSourceIdentityResolution {
-	if (process.platform !== "linux" || !fs.existsSync("/proc/self/fd")) return unavailable("unverified_source");
+	const linux = process.platform === "linux" && fs.existsSync("/proc/self/fd");
+	if (!linux && !darwinHostSupported()) return unavailable("unverified_source");
 	const lexicalRoot = path.resolve(options.packageRoot ?? PACKAGE_ROOT);
 	let packageRoot: string;
 	try { packageRoot = fs.realpathSync.native(lexicalRoot); } catch { return unavailable("package_root_unavailable"); }
@@ -285,8 +317,14 @@ export function resolveActiveRuntimeSourceIdentity(options: {
 	let rootFd: number;
 	try { rootFd = fs.openSync(packageRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
 	catch { return unavailable("package_root_unavailable"); }
+	let darwin: DarwinTreeVerifier | undefined;
 	try {
 		const rootStat = fs.fstatSync(rootFd), runner = options.runProbe ?? runGitProbe, startedAt = Date.now();
+		if (!linux) {
+			if (!options.runProbe && !trustedSystemGitExecutable()) return unavailable("unverified_source");
+			darwin = openDarwinTreeVerifier();
+			if (!darwin) return unavailable("unverified_source");
+		}
 		let usedOutput = 0;
 		const remaining = () => ({ timeoutMs: Math.max(1, PROBE_TIMEOUT_MS - (Date.now() - startedAt)), outputBytes: Math.max(0, PROBE_OUTPUT_LIMIT - usedOutput) });
 		let initial: GitProbeResult;
@@ -294,6 +332,8 @@ export function resolveActiveRuntimeSourceIdentity(options: {
 		let failure = probeFailure(initial, 7, PROBE_OUTPUT_LIMIT - usedOutput);
 		if (failure) return unavailable(failure);
 		usedOutput += initial.outputBytes ?? initial.commands.reduce((n, c) => n + c.stdout.length, 0);
+		// Git reports "not a repository" as 128; the Darwin /usr/bin/git shim exits otherwise when its toolchain is unusable.
+		if (darwin && initial.commands[0]!.status !== 0 && initial.commands[0]!.status !== 128) return unavailable("git_failed");
 		const initialMetadata = parseMetadata(initial.commands, packageRoot);
 		if (typeof initialMetadata === "string") return unavailable(initialMetadata);
 		const initialStatus = initial.commands[5]!;
@@ -301,7 +341,7 @@ export function resolveActiveRuntimeSourceIdentity(options: {
 		if (initialStatus.stdout.length !== 0) return unavailable("dirty");
 		const tree = initial.commands[6]!;
 		if (tree.status !== 0) return unavailable("git_failed");
-		const treeFailure = verifyTree(rootFd, tree.stdout, startedAt + PROBE_TIMEOUT_MS, options.onEntryReadForTest);
+		const treeFailure = verifyTree(rootFd, tree.stdout, startedAt + PROBE_TIMEOUT_MS, options.onEntryReadForTest, darwin);
 		if (treeFailure) return unavailable(treeFailure);
 		if (Date.now() - startedAt >= PROBE_TIMEOUT_MS) return unavailable("git_timeout");
 		let final: GitProbeResult;
@@ -316,11 +356,11 @@ export function resolveActiveRuntimeSourceIdentity(options: {
 		if (finalStatus.stdout.length !== 0) return unavailable("dirty");
 		// Metadata commands consume time during which the worktree can change.
 		// Re-read the anchored HEAD tree after that probe before publishing identity.
-		const finalTreeFailure = verifyTree(rootFd, tree.stdout, startedAt + PROBE_TIMEOUT_MS);
+		const finalTreeFailure = verifyTree(rootFd, tree.stdout, startedAt + PROBE_TIMEOUT_MS, undefined, darwin);
 		if (finalTreeFailure) return unavailable(finalTreeFailure);
 		let freshRoot: fs.Stats;
 		try { freshRoot = fs.lstatSync(packageRoot); } catch { return unavailable("wrong_root"); }
 		if (!freshRoot.isDirectory() || freshRoot.isSymbolicLink() || freshRoot.dev !== rootStat.dev || freshRoot.ino !== rootStat.ino) return unavailable("wrong_root");
 		return { available: true, sourceIdentity: createSourceIdentity(initialMetadata.commit) };
-	} finally { fs.closeSync(rootFd); }
+	} finally { darwin?.dispose(); fs.closeSync(rootFd); }
 }

@@ -51,6 +51,7 @@
     "skills/**/*",
     "prompts/**/*",
     "docs/**/*",
+    "native/**/*",
     "README.md",
     "CHANGELOG.md"
   ],
