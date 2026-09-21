@@ -311,3 +311,12 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 		} finally { repo.cleanup(); }
 	});
 });
+
+describe("fork checkout", () => {
+	it("tracks no symlink or gitlink: source identity refuses either as unverified_source", () => {
+		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
+		const modes = git(root, ["ls-files", "-s", "-z"]).split("\0").filter(Boolean).map((entry) => entry.split(" ")[0]);
+		assert.ok(modes.length > 0);
+		assert.deepEqual(modes.filter((mode) => mode === "120000" || mode === "160000"), []);
+	});
+});
