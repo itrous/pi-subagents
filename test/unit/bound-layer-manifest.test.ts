@@ -14,11 +14,12 @@ const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".
 
 /**
  * Modules of the A1 delta the fork still owns outside `src/bound/`.
- * `src/api/active-bound-environment.ts` was removed in this stage (decision D6),
- * so there are six of them.
+ * `src/api/active-bound-environment.ts` was removed in this stage (decision D6);
+ * the Darwin source-identity wrapper joined them, so there are seven of them.
  */
 const KEPT_A1_MODULES = [
 	"api/launch-receipt.ts",
+	"extension/source-identity-darwin.ts",
 	"extension/source-identity.ts",
 	"runs/shared/core-runtime-tools.ts",
 	"runs/shared/package-tree-evidence.ts",

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { openDarwinTreeVerifier } from "../../src/extension/source-identity-darwin.ts";
 import {
 	ACTIVE_RUNTIME_REPOSITORY,
 	canonicalSourceIdentityProjection,
@@ -23,8 +24,9 @@ function git(cwd: string, args: string[]): string {
 	return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
-function fixture(): { root: string; commit: string; cleanup: () => void } {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-source-identity-"));
+function fixture(): { root: string; lexicalRoot: string; commit: string; cleanup: () => void } {
+	const lexicalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-source-identity-"));
+	const root = fs.realpathSync.native(lexicalRoot);
 	git(root, ["init", "-q"]);
 	git(root, ["config", "user.name", "Identity Test"]);
 	git(root, ["config", "user.email", "identity@example.test"]);
@@ -36,14 +38,14 @@ function fixture(): { root: string; commit: string; cleanup: () => void } {
 	git(root, ["commit", "-q", "-m", "base"]);
 	const commit = git(root, ["rev-parse", "HEAD"]);
 	git(root, ["checkout", "-q", "--detach", commit]);
-	return { root, commit, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+	return { root, lexicalRoot, commit, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
 function reason(result: ActiveRuntimeSourceIdentityResolution): string | undefined {
 	return result.available ? undefined : result.sourceIdentityUnavailable.reasonCode;
 }
 
-describe("active runtime source identity", { skip: process.platform !== "linux" }, () => {
+describe("active runtime source identity", { skip: process.platform !== "linux" && process.platform !== "darwin" }, () => {
 	it("matches the canonical digest vector and exact remote normalization", () => {
 		const commit = "0123456789abcdef0123456789abcdef01234567";
 		const projection = `{"version":1,"kind":"git","repository":"${ACTIVE_RUNTIME_REPOSITORY}","commit":"${commit}"}`;
@@ -52,6 +54,31 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 		assert.equal(normalizeForkRemote("git@github.com:itrous/pi-subagents.git"), ACTIVE_RUNTIME_REPOSITORY);
 		assert.equal(normalizeForkRemote("ssh://git@github.com/itrous/pi-subagents.git"), ACTIVE_RUNTIME_REPOSITORY);
 		assert.equal(normalizeForkRemote("https://github.com/other/pi-subagents.git"), undefined);
+	});
+
+	it("resolves a clean detached checkout through the real platform backend", () => {
+		const repo = fixture();
+		try {
+			const result = resolveActiveRuntimeSourceIdentity({ packageRoot: repo.root });
+			assert.equal(result.available, true);
+			if (result.available) assert.deepEqual(result.sourceIdentity, createSourceIdentity(repo.commit));
+		} finally { repo.cleanup(); }
+	});
+
+	it("accepts a canonical root and rejects an alias to the same checkout", () => {
+		const repo = fixture();
+		let alias = repo.lexicalRoot;
+		try {
+			if (alias === repo.root) {
+				alias = `${repo.root}-alias`;
+				fs.symlinkSync(repo.root, alias, "dir");
+			}
+			assert.equal(reason(resolveActiveRuntimeSourceIdentity({ packageRoot: alias })), "package_root_symlink");
+			assert.equal(resolveActiveRuntimeSourceIdentity({ packageRoot: repo.root }).available, true);
+		} finally {
+			if (alias !== repo.lexicalRoot) fs.rmSync(alias, { force: true });
+			repo.cleanup();
+		}
 	});
 
 	it("rejects non-ignored untracked files but permits ignored dependency state", () => {
@@ -124,7 +151,6 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 	});
 
 	it("uses owner execute semantics and rejects FIFO without blocking", () => {
-		if (process.platform !== "linux") return;
 		const repo = fixture();
 		try {
 			fs.chmodSync(path.join(repo.root, "src", "tracked.txt"), 0o654);
@@ -187,22 +213,45 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 		} finally { repo.cleanup(); }
 	});
 
-	it("rejects child-directory namespace swap after anchored read", () => {
+	it("rejects child-directory namespace swap after anchored read", async () => {
 		const repo = fixture();
-		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-swap-"));
+		const outside = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-swap-")));
 		let swapped = false;
 		try {
 			fs.writeFileSync(path.join(outside, "tracked.txt"), "base\n");
-			const result = resolveActiveRuntimeSourceIdentity({
-				packageRoot: repo.root,
-				onEntryReadForTest(relative) {
-					if (swapped || relative.toString() !== "src/tracked.txt") return;
-					swapped = true;
-					fs.renameSync(path.join(repo.root, "src"), path.join(repo.root, "src-held"));
-					fs.symlinkSync(outside, path.join(repo.root, "src"), "dir");
-				},
-			});
-			assert.equal(reason(result), "dirty");
+			if (process.platform === "darwin") {
+				const verifier = openDarwinTreeVerifier();
+				assert.ok(verifier, "the pinned Darwin helper must be available");
+				const bytes = Buffer.alloc(48 * 1024 * 1024, 0x61);
+				fs.writeFileSync(path.join(repo.root, "src", "tracked.txt"), bytes);
+				const blob = createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+				const rootFd = fs.openSync(repo.root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+				const mutator = spawn(process.execPath, ["-e", [
+					"const fs=require('node:fs');",
+					"setTimeout(()=>{",
+					`fs.renameSync(${JSON.stringify(path.join(repo.root, "src"))},${JSON.stringify(path.join(repo.root, "src-held"))});`,
+					`fs.symlinkSync(${JSON.stringify(outside)},${JSON.stringify(path.join(repo.root, "src"))},'dir');`,
+					"},10);",
+				].join("")], { stdio: "ignore" });
+				try {
+					assert.equal(verifier.verify(rootFd, [{ executable: false, blob, path: Buffer.from("src/tracked.txt") }], Date.now() + 2_000, 64 * 1024 * 1024), "dirty");
+				} finally {
+					fs.closeSync(rootFd);
+					verifier.dispose();
+					await new Promise<void>((resolve) => mutator.once("exit", () => resolve()));
+				}
+			} else {
+				const result = resolveActiveRuntimeSourceIdentity({
+					packageRoot: repo.root,
+					onEntryReadForTest(relative) {
+						if (swapped || relative.toString() !== "src/tracked.txt") return;
+						swapped = true;
+						fs.renameSync(path.join(repo.root, "src"), path.join(repo.root, "src-held"));
+						fs.symlinkSync(outside, path.join(repo.root, "src"), "dir");
+					},
+				});
+				assert.equal(reason(result), "dirty");
+			}
 		} finally { repo.cleanup(); fs.rmSync(outside, { recursive: true, force: true }); }
 	});
 
@@ -233,18 +282,29 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 		try {
 			const result = resolveActiveRuntimeSourceIdentity({
 				packageRoot: repo.root,
-				onEntryReadForTest() {
-					if (delayed) return;
-					delayed = true;
-					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_050);
-				},
+				...(process.platform === "darwin" ? {
+					runProbe(root: string, phase: "initial" | "final", commit: string | undefined, limits: { timeoutMs: number; outputBytes: number }) {
+						const probe = runGitProbe(root, phase, commit, limits);
+						if (!delayed) {
+							delayed = true;
+							Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_050);
+						}
+						return probe;
+					},
+				} : {
+					onEntryReadForTest() {
+						if (delayed) return;
+						delayed = true;
+						Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_050);
+					},
+				}),
 			});
+			assert.equal(delayed, true);
 			assert.equal(reason(result), "git_timeout");
 		} finally { repo.cleanup(); }
 	});
 
 	it("ignores an ambient PATH Git wrapper in the production probe", () => {
-		if (process.platform !== "linux") return;
 		const repo = fixture();
 		const bin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-fake-path-git-"));
 		const oldPath = process.env.PATH;
@@ -260,7 +320,6 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 	});
 
 	it("kills descendants left by an earlier completed Git command", async () => {
-		if (process.platform !== "linux") return;
 		const repo = fixture();
 		const bin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-git-orphan-"));
 		const pidFile = path.join(bin, "pid");
@@ -290,7 +349,6 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 	});
 
 	it("bounds the whole Git process tree", () => {
-		if (process.platform !== "linux") return;
 		const bin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-git-wrapper-"));
 		const oldPath = process.env.PATH;
 		try {
