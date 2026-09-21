@@ -51,6 +51,13 @@ function within(root: string, target: string): boolean {
 function safeRelative(value: string): boolean {
 	return value.startsWith("./") && !value.split(/[\\/]/u).some((part) => part === "..") && !path.isAbsolute(value);
 }
+/**
+ * Upstream discovery resolves a `./` ref against the agent file (`agents.ts:2047`);
+ * the contract keeps the relative spelling, which `recheckBoundLaunch` resolves back.
+ */
+function contractRef(ref: string, agentFilePath: string): string {
+	return path.isAbsolute(ref) ? `./${path.relative(path.dirname(agentFilePath), ref).split(path.sep).join("/")}` : ref;
+}
 function safeManifestEntry(value: string, root: string): boolean {
 	return value.length > 0 && !path.isAbsolute(value) && within(root, path.resolve(root, value));
 }
@@ -146,8 +153,9 @@ export function resolveBoundPackageExtensions(agent: AgentConfig, passCache?: Bo
 		const cached = treeDigestByRoot.get(cacheKey); if (cached) return cached;
 		const measured = packageTreeDigest(entry, evidenceRoot, owner.rootPath); treeDigestByRoot.set(cacheKey, measured); return measured;
 	};
-	for (const ref of refs) {
-		if (typeof ref !== "string") throw new Error("Invalid bound extension ref.");
+	for (const rawRef of refs) {
+		if (typeof rawRef !== "string") throw new Error("Invalid bound extension ref.");
+		const ref = contractRef(rawRef, agent.filePath);
 		if (safeRelative(ref)) {
 			const entry = regularCanonicalFile(path.resolve(path.dirname(agent.filePath), ref), owner.rootPath);
 			const evidenceRoot = packageEvidenceRoot(owner.rootPath);
