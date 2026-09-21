@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
 	ACTIVE_RUNTIME_REPOSITORY,
@@ -314,7 +315,7 @@ describe("active runtime source identity", { skip: process.platform !== "linux" 
 
 describe("fork checkout", () => {
 	it("tracks no symlink or gitlink: source identity refuses either as unverified_source", () => {
-		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
+		const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 		const modes = git(root, ["ls-files", "-s", "-z"]).split("\0").filter(Boolean).map((entry) => entry.split(" ")[0]);
 		assert.ok(modes.length > 0);
 		assert.deepEqual(modes.filter((mode) => mode === "120000" || mode === "160000"), []);
