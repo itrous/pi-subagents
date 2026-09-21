@@ -12,6 +12,7 @@ import { resolveBoundLaunchContract, type BoundLaunchContractV2, type BoundResol
 import { attestPiRuntime, type PiRuntimeAttestationResult } from "./pi-runtime-attestation.ts";
 import { BOUND_CHANNEL_VERSION, parseBoundBindingProof, type BoundBindingV2 } from "./channel.ts";
 import type { AgentConfig } from "../agents/agents.ts";
+import type { BoundResolvedPackageExtensions } from "./bound-package-extensions.ts";
 
 export const BOUND_PREFLIGHT_VERSION = BOUND_CHANNEL_VERSION;
 const DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000;
@@ -40,6 +41,8 @@ export interface BoundAuthorizedLaunch {
 	contract: BoundLaunchContractV2;
 	agent: AgentConfig;
 	packageExtensionPaths: string[];
+	/** Private entry evidence the child factory re-measures before loading; never published. */
+	packageAttestations: BoundResolvedPackageExtensions["attestations"];
 }
 
 export type BoundAdmissionResult =
@@ -223,7 +226,7 @@ export function createBoundRuntimeService(options: BoundRuntimeServiceOptions): 
 				|| resolved.launchContractDigest !== binding.expectedLaunchContractDigest) return { ok: false, code: "invalid_request" };
 			return {
 				ok: true,
-				launch: { request: parsed.request, contract: resolved.contract, agent: resolved.agent, packageExtensionPaths: resolved.packageExtensionPaths },
+				launch: { request: parsed.request, contract: resolved.contract, agent: resolved.agent, packageExtensionPaths: resolved.packageExtensionPaths, packageAttestations: resolved.packageAttestations },
 			};
 		},
 		// Семантика A1: TTL receipt ограничивает окно приёма, а не срок жизни принятой

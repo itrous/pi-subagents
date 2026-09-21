@@ -772,6 +772,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		waitToolEnabled: waitToolConfig.enabled,
 		resolveCapabilityCeiling: (sessionId) => resolveCurrentSubagentCapabilityCeiling(sessionId),
 		expandTilde,
+		executeDelegated: executor.executeDelegated,
 	});
 
 	const parameters = createSubagentParamsSchema();

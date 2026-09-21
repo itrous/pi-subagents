@@ -5,9 +5,10 @@ import type { ResolvedSubagentCapabilityCeiling } from "../runs/shared/capabilit
 import type { ActiveRuntimeSourceIdentityResolution } from "../extension/source-identity.ts";
 import type { ExtensionConfig } from "../shared/types.ts";
 import { BoundAttemptCoordinator, getBoundAttemptCoordinator } from "./bound-attempt-coordinator.ts";
-import { createBoundExecutionPort, type BoundExecuteDelegated, type BoundExecutionPortHandle } from "./bound-execution-port.ts";
+import { createBoundExecutionPort, type BoundExecuteDelegated, type BoundExecutionPortHandle, type BoundExecutionProofs } from "./bound-execution-port.ts";
 import { registerBoundLaunchBridge, type BoundExecutionPort } from "./bound-launch-bridge.ts";
 import { createBoundRuntimeService, type BoundRuntimeService, type BoundRuntimeServiceOptions } from "./bound-runtime-service.ts";
+import { boundForegroundLeafCapability, runBoundSelfCheck, type BoundSelfCheckResult } from "./bound-self-check.ts";
 import { installBoundedChildShutdown, type BoundedChildShutdownOptions } from "./bounded-child-shutdown.ts";
 import {
 	BOUND_CHANNEL_EVENTS, BOUND_CHANNEL_VERSION, BOUND_METHODS, BOUND_READY_EVENT, BOUND_REQUEST_EVENT,
@@ -57,8 +58,9 @@ export interface RegisterBoundControlPlaneOptions {
 	executionPort?: BoundExecutionPort;
 	/** Executor entry the layer builds its own execution port from; an explicit `executionPort` wins. */
 	executeDelegated?: BoundExecuteDelegated;
-	/** Passed to the built port; see `BoundExecutionPortOptions.childFactoryWired`. */
-	childFactoryWired?: () => boolean;
+	/** Test seams for the capability canaries: the built port's collectors and the Pi field self-check. */
+	proofs?: BoundExecutionProofs;
+	selfCheck?: () => Promise<BoundSelfCheckResult>;
 	childShutdown?: BoundedChildShutdownOptions | false;
 	store?: Record<string, unknown>;
 }
@@ -82,15 +84,15 @@ function sessionProjection(ctx: ExtensionContext | null): BoundSessionProjection
 	};
 }
 
-export function buildBoundPing(serverInstanceId: string, identity: ActiveRuntimeSourceIdentityResolution, ctx: ExtensionContext | null): BoundPingV2 {
-	// D5: `activeRuntimeIdentity` only with a verified checkout; `boundForegroundLeaf`
-	// is not announced at all until the end of A1R.4.
+export function buildBoundPing(serverInstanceId: string, identity: ActiveRuntimeSourceIdentityResolution, ctx: ExtensionContext | null, leafCapability: Record<string, unknown> = {}): BoundPingV2 {
+	// D5: `activeRuntimeIdentity` only with a verified checkout; the leaf capability
+	// is computed by `boundForegroundLeafCapability`, which requires it as well.
 	return {
 		serverInstanceId,
 		...(identity.available ? { sourceIdentity: identity.sourceIdentity } : { sourceIdentityUnavailable: identity.sourceIdentityUnavailable }),
 		version: BOUND_CHANNEL_VERSION,
 		methods: [...BOUND_METHODS],
-		capabilities: identity.available ? { activeRuntimeIdentity: { version: 2 } } : {},
+		capabilities: identity.available ? { activeRuntimeIdentity: { version: 2 }, ...leafCapability } : {},
 		events: { ...BOUND_CHANNEL_EVENTS },
 		session: sessionProjection(ctx),
 	};
@@ -130,10 +132,22 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 			executeDelegated: options.executeDelegated,
 			getContext: contextForReply,
 			config: options.config,
-			...(options.childFactoryWired ? { childFactoryWired: options.childFactoryWired } : {}),
+			...(options.proofs ? { proofs: options.proofs } : {}),
 		})
 		: undefined;
 	const executionPort = options.executionPort ?? builtPort;
+	// Filled once per generation by the self-check; until then the capability is absent.
+	let selfCheck: BoundSelfCheckResult | undefined;
+	const leafCapability = (identity: ActiveRuntimeSourceIdentityResolution): Record<string, unknown> => boundForegroundLeafCapability({
+		identityAvailable: identity.available,
+		selfCheck,
+		port: executionPort !== undefined,
+		proofs: builtPort?.proofs,
+	});
+	const ping = (): BoundPingV2 => {
+		const identity = service.sourceIdentity();
+		return buildBoundPing(serverInstanceId, identity, contextForReply(), leafCapability(identity));
+	};
 	const bridge = registerBoundLaunchBridge({
 		events: options.events,
 		service,
@@ -152,7 +166,7 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 			// An unparseable envelope has no addressable requestId: stay silent.
 			if (!request) return;
 			if (request.method === "ping") {
-				reply({ version: BOUND_CHANNEL_VERSION, requestId: request.requestId, method: "ping", success: true, data: buildBoundPing(serverInstanceId, service.sourceIdentity(), contextForReply()) });
+				reply({ version: BOUND_CHANNEL_VERSION, requestId: request.requestId, method: "ping", success: true, data: ping() });
 				return;
 			}
 			const outcome = await service.preflight(request.params);
@@ -197,6 +211,11 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 	coordinator.activateSink(runtimeId, bridge.sink);
 	if (options.childShutdown !== false) installBoundedChildShutdown(options.childShutdown ?? {});
 	published = true;
+	// The self-check runs only when it can change the answer: without identity,
+	// a port, or both collectors the capability is absent whatever Pi looks like.
+	if (service.sourceIdentity().available && builtPort && builtPort.proofs.toolRegistry && builtPort.proofs.deniedTools) {
+		void (options.selfCheck ?? (() => runBoundSelfCheck()))().then((result) => { if (!stopped) selfCheck = result; }, () => {});
+	}
 
 	// Registered from T1, before the upstream handlers: `session_start` (:1162)
 	// assigns `state.lastUiContext`, so the ready payload takes the context from
@@ -204,13 +223,15 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 	options.pi.on("session_start", (_event, ctx) => {
 		if (stopped) return;
 		currentContext = ctx ?? null;
-		options.events.emit(BOUND_READY_EVENT, buildBoundPing(serverInstanceId, service.sourceIdentity(), currentContext));
+		options.events.emit(BOUND_READY_EVENT, ping());
 	});
 
 	options.pi.on("session_shutdown", () => {
-		// The time limit lives in the child-session factory wrapper, so this handler
-		// never awaits `abort()`; it only stops intake and settles live attempts.
+		// Live attempts are aborted; each bound run settles within the port's hard
+		// timer plus the bound child shutdown bound (D3), so waiting here is bounded.
+		// Non-bound children keep the factory wrapper's own deadline.
 		stop({ keepSink: true });
+		return builtPort?.whenIdle();
 	});
 
 	return generation;

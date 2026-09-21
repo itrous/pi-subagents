@@ -6,6 +6,7 @@ import { resolveAsyncRunLocation } from "../runs/background/async-resume.ts";
 import { deliverStopRequest } from "../runs/background/control-channel.ts";
 import { reconcileAsyncRun } from "../runs/background/stale-run-reconciler.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
+import { isPrivateBoundRun, maskPrivateBoundTarget } from "../bound/bound-run-registry.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import {
 	type AsyncJobStep,
@@ -197,7 +198,7 @@ function buildFleetStatus(
 		if (candidates.length < MAX_FLEET_CANDIDATES) candidates.push(candidate);
 	};
 	for (const control of state.foregroundControls.values()) {
-		if (control.sessionId !== authoritativeSessionId) continue;
+		if (control.sessionId !== authoritativeSessionId || isPrivateBoundRun(control.runId)) continue;
 		if (control.activeChildren?.size) {
 			for (const child of control.activeChildren.values()) addCandidate({
 				internalKey: `foreground:${control.runId}:${child.index}`,
@@ -483,6 +484,22 @@ async function executeChecked(
 	return dataFromToolResult(result);
 }
 
+/** Targeted status/steer/interrupt/resume: a live bound run answers like an unknown id. */
+async function executeCheckedPublicTarget(
+	options: RegisterSubagentRpcBridgeOptions,
+	ctx: ExtensionContext,
+	requestId: string,
+	method: SubagentRpcMethod,
+	params: SubagentParamsLike,
+): Promise<{ text: string; details?: Details; isError?: boolean }> {
+	const masked = maskPrivateBoundTarget(params);
+	try {
+		return masked.unmask(await executeChecked(options, ctx, requestId, method, masked.params));
+	} catch (error) {
+		throw masked.unmaskError(error);
+	}
+}
+
 function manageParams(params: unknown): SubagentParamsLike {
 	const input = assertRecordParams(params, "manage");
 	if (typeof input.action !== "string" || !(SUBAGENT_RPC_MANAGEMENT_ACTIONS as readonly string[]).includes(input.action)) {
@@ -735,7 +752,7 @@ async function handleRequest(
 				};
 			}
 		}
-		const status = await executeChecked(
+		const status = await executeCheckedPublicTarget(
 			options,
 			ctx,
 			request.requestId,
@@ -754,16 +771,16 @@ async function handleRequest(
 		};
 	}
 	if (request.method === "steer") {
-		return executeChecked(options, ctx, request.requestId, request.method, steerParams(request.params));
+		return executeCheckedPublicTarget(options, ctx, request.requestId, request.method, steerParams(request.params));
 	}
 	if (request.method === "interrupt") {
-		return executeChecked(options, ctx, request.requestId, request.method, { action: "interrupt", ...normalizeTargetParams(request.params, "interrupt") });
+		return executeCheckedPublicTarget(options, ctx, request.requestId, request.method, { action: "interrupt", ...normalizeTargetParams(request.params, "interrupt") });
 	}
 	if (request.method === "stop") {
 		return stopAsyncRun(request.params, options, ctx);
 	}
 	if (request.method === "resume") {
-		return executeChecked(options, ctx, request.requestId, request.method, resumeParams(request.params));
+		return executeCheckedPublicTarget(options, ctx, request.requestId, request.method, resumeParams(request.params));
 	}
 	throw new SubagentRpcError("unsupported_method", `Unsupported subagent RPC method: ${String(request.method)}`);
 }

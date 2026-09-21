@@ -5,6 +5,7 @@ import { canonicalSha256 } from "../shared/canonical-json.ts";
 import type { Details, ExtensionConfig, SingleResult } from "../shared/types.ts";
 import { BOUND_BINDINGS_NAMESPACE, projectBoundBindings } from "./bound-bindings.ts";
 import { cloneJsonWithinByteLimit } from "./bound-json.ts";
+import { BOUND_CHILD_FACTORY_PROOFS } from "./bound-child-factory.ts";
 import type { BoundExecutionPort } from "./bound-launch-bridge.ts";
 import { getBoundRunRegistry, markBoundRunParams, type BoundRunRecord, type BoundRunRegistryV1, type BoundToolRegistryError } from "./bound-run-registry.ts";
 import type { BoundAuthorizedLaunch } from "./bound-runtime-service.ts";
@@ -13,6 +14,12 @@ export type BoundExecuteDelegated = ReturnType<typeof createSubagentExecutor>["e
 type DelegatedResult = Awaited<ReturnType<BoundExecuteDelegated>>;
 type PortOutcome = Awaited<ReturnType<BoundExecutionPort["run"]>>;
 
+/**
+ * After a cancellation the port waits at most this long for the executor, then
+ * disposes the child itself. The deadline promised for a `cancelled` terminal is
+ * this value plus `BOUND_CHILD_SHUTDOWN_TIMEOUT_MS`.
+ */
+export const BOUND_CANCEL_HARD_TIMER_MS = 3_000;
 const MAX_RESULT_BYTES = 1024 * 1024;
 const MAX_CURRENT_TOOL_BYTES = 128;
 
@@ -26,19 +33,25 @@ export interface BoundExecutionPortOptions {
 	executeDelegated: BoundExecuteDelegated;
 	getContext: () => ExtensionContext | null;
 	config: ExtensionConfig;
-	/**
-	 * Step Sh2 slot: true only when T2 routes a marked run to the bound
-	 * child-session factory (`bound-child-factory.ts`). Without it the executor
-	 * would run the leaf without the recheck and the barrier, so the port refuses
-	 * closed before any session exists.
-	 */
-	childFactoryWired?: () => boolean;
 	registry?: BoundRunRegistryV1;
+	/** Test seam; production uses `BOUND_CANCEL_HARD_TIMER_MS`. */
+	hardTimerMs?: number;
+	/** Test seam for the capability canaries; production takes the child factory's collectors. */
+	proofs?: BoundExecutionProofs;
+}
+
+export interface BoundExecutionProofs {
+	toolRegistry: boolean;
+	deniedTools: boolean;
 }
 
 export interface BoundExecutionPortHandle extends BoundExecutionPort {
 	/** Generation stop: no new run starts and no update of a live run is relayed. */
 	dispose(): void;
+	/** Settles once every run this port started has returned its outcome. */
+	whenIdle(): Promise<void>;
+	/** Collectors wired into every run by the bound child factory (T2 routes marked runs there). */
+	readonly proofs: Readonly<BoundExecutionProofs>;
 }
 
 function refused(toolRegistryError?: BoundToolRegistryError): PortOutcome {
@@ -197,38 +210,67 @@ export function projectBoundTerminal(record: BoundRunRecord, result: DelegatedRe
  */
 export function createBoundExecutionPort(options: BoundExecutionPortOptions): BoundExecutionPortHandle {
 	const registry = options.registry ?? getBoundRunRegistry();
+	const hardTimerMs = options.hardTimerMs ?? BOUND_CANCEL_HARD_TIMER_MS;
+	const inFlight = new Set<Promise<unknown>>();
 	let disposed = false;
+
+	const execute = async ({ launch, signal, onUpdate }: Parameters<BoundExecutionPort["run"]>[0]): Promise<PortOutcome> => {
+		if (disposed) return refused();
+		// D15: the executor falls back to the host budget and no value switches it
+		// off, while the contract fixes `usageBudget: false`.
+		if (options.config.usageBudget !== undefined) return refused("policy_mismatch");
+		const ctx = options.getContext();
+		if (!ctx) return refused();
+		const params = buildBoundExecutionParams(launch);
+		if (!params) return refused("launch_contract_mismatch");
+		const record = registry.open(launch);
+		if (!record) return refused();
+		markBoundRunParams(params, record.runId);
+		const relay = (update: DelegatedResult): void => {
+			if (disposed || signal.aborted || registry.get(record.runId) !== record) return;
+			const projected = projectBoundUpdate(update);
+			if (Object.keys(projected).length > 0) onUpdate(projected);
+		};
+		const emptyResult: DelegatedResult = { content: [], details: { mode: "single", results: [] } };
+		const execution = (async (): Promise<DelegatedResult> => {
+			try { return await options.executeDelegated(launch.request.requestId, params, signal, relay, ctx); }
+			// A thrown executor still reports the run's evidence; without a child result it is `failed`.
+			catch { return emptyResult; }
+		})();
+		// The record, and with it the run's privacy (T3), lives exactly as long as
+		// the executor does, even when the outcome was returned at the deadline.
+		void execution.finally(() => registry.close(record.runId));
+		// Cancellation never waits for `prompt()` or `abort()` (fact S5): after the
+		// hard timer the port disposes the child itself and settles.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let startTimer: (() => void) | undefined;
+		const deadline = new Promise<"deadline">((resolve) => {
+			startTimer = () => { timer = setTimeout(() => resolve("deadline"), hardTimerMs); };
+			if (signal.aborted) startTimer();
+			else signal.addEventListener("abort", startTimer, { once: true });
+		});
+		const winner = await Promise.race([execution, deadline]);
+		if (timer) clearTimeout(timer);
+		if (startTimer) signal.removeEventListener("abort", startTimer);
+		if (winner !== "deadline") return projectBoundTerminal(record, winner, signal.aborted);
+		try { await record.child?.dispose(); } catch { /* the outcome is cancelled either way */ }
+		return projectBoundTerminal(record, emptyResult, true);
+	};
+
 	return {
-		async run({ launch, signal, onUpdate }) {
-			if (disposed) return refused();
-			// D15: the executor falls back to the host budget and no value switches it
-			// off, while the contract fixes `usageBudget: false`.
-			if (options.config.usageBudget !== undefined) return refused("policy_mismatch");
-			if (options.childFactoryWired?.() !== true) return refused();
-			const ctx = options.getContext();
-			if (!ctx) return refused();
-			const params = buildBoundExecutionParams(launch);
-			if (!params) return refused("launch_contract_mismatch");
-			const record = registry.open(launch);
-			if (!record) return refused();
-			markBoundRunParams(params, record.runId);
-			const relay = (update: DelegatedResult): void => {
-				if (disposed || signal.aborted || registry.get(record.runId) !== record) return;
-				const projected = projectBoundUpdate(update);
-				if (Object.keys(projected).length > 0) onUpdate(projected);
-			};
-			try {
-				let result: DelegatedResult;
-				try { result = await options.executeDelegated(launch.request.requestId, params, signal, relay, ctx); }
-				// A thrown executor still reports the run's evidence; without a child result it is `failed`.
-				catch { result = { content: [], details: { mode: "single", results: [] } }; }
-				return projectBoundTerminal(record, result, signal.aborted);
-			} finally {
-				registry.close(record.runId);
-			}
+		run(input) {
+			const running = execute(input);
+			inFlight.add(running);
+			const forget = (): void => { inFlight.delete(running); };
+			running.then(forget, forget);
+			return running;
 		},
 		dispose() {
 			disposed = true;
 		},
+		async whenIdle() {
+			await Promise.allSettled([...inFlight]);
+		},
+		proofs: Object.freeze({ ...(options.proofs ?? BOUND_CHILD_FACTORY_PROOFS) }),
 	};
 }

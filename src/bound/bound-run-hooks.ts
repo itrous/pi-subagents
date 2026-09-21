@@ -1,7 +1,7 @@
 import type { ChildHookExtension } from "../runs/shared/child-session.ts";
 import type { BoundRunRegistryV1 } from "./bound-run-registry.ts";
 
-export const BOUND_RUN_HOOK_NAME = "<inline:pi-subagents:bound-run>";
+export const BOUND_RUN_HOOK_NAME = "pi-subagents:bound-run";
 export const BOUND_DENIED_TOOL_REASON = "pi-subagents bound leaf: the tool is not declared by the launch contract.";
 
 interface HookSessionContext {

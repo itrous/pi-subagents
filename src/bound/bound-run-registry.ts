@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ChildSession } from "../runs/shared/child-session.ts";
 import type { BoundBindingsV1 } from "./bound-bindings.ts";
 import type { BoundAuthorizedLaunch } from "./bound-runtime-service.ts";
@@ -29,7 +30,7 @@ export function boundRunIdOf(params: unknown): string | undefined {
 
 export type BoundToolRegistryError =
 	| "launch_contract_mismatch" | "compaction_forbidden" | "model_mismatch" | "package_bytes_drift"
-	| "package_load_error" | "package_mutation" | "policy_mismatch" | "barrier_unavailable";
+	| "package_load_error" | "package_mutation" | "policy_mismatch" | "barrier_unavailable" | "mcp_cwd_mismatch";
 
 /** First recorded failure wins; later ones are consequences of the first. */
 export interface BoundRunFailure {
@@ -126,6 +127,13 @@ export class BoundRunRegistryV1 {
 		return this.runs.has(runId);
 	}
 
+	/** The upstream resolver accepts unique prefixes, so a prefix of a live run names it too. */
+	names(target: string): boolean {
+		if (!target) return false;
+		for (const runId of this.runs.keys()) if (runId.startsWith(target)) return true;
+		return false;
+	}
+
 	attachChild(runId: string, child: ChildSession): boolean {
 		const record = this.runs.get(runId);
 		if (!record || record.child) return false;
@@ -180,4 +188,65 @@ export function getBoundRunRegistry(store: Record<string, unknown> = globalThis 
 /** T3 privacy check: a live bound run answers like an unknown id on every public surface. */
 export function isPrivateBoundRun(runId: string | undefined, store?: Record<string, unknown>): boolean {
 	return typeof runId === "string" && getBoundRunRegistry(store).has(runId);
+}
+
+/**
+ * Public view of the executor state for status reads (T2): every read of
+ * `foregroundControls` sees a map without live bound runs, and
+ * `lastForegroundControlId` reads undefined when it names one. Every other read
+ * and every write goes to the real object, so budget and session fields never
+ * diverge.
+ */
+export function publicBoundStatusState<T extends { foregroundControls: Map<string, unknown>; lastForegroundControlId?: string | null }>(state: T, store?: Record<string, unknown>): T {
+	const registry = getBoundRunRegistry(store);
+	return new Proxy(state, {
+		get(target, property, receiver) {
+			if (property === "foregroundControls") {
+				return new Map([...target.foregroundControls].filter(([runId]) => !registry.has(runId)));
+			}
+			if (property === "lastForegroundControlId") {
+				const latest = target.lastForegroundControlId;
+				return typeof latest === "string" && registry.has(latest) ? undefined : latest;
+			}
+			return Reflect.get(target, property, receiver);
+		},
+	});
+}
+
+function replaceStrings(value: unknown, from: string, to: string): unknown {
+	if (typeof value === "string") return value.replaceAll(from, to);
+	if (Array.isArray(value)) return value.map((entry) => replaceStrings(entry, from, to));
+	if (value && typeof value === "object" && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)) {
+		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, replaceStrings(entry, from, to)]));
+	}
+	return value;
+}
+
+/**
+ * T3: a request that targets a live bound run (by id, run id, or unique prefix)
+ * is executed against a fresh id nothing answers to, and that id is written back
+ * to the requested one in the reply. The public answer is therefore exactly the
+ * "unknown id" answer for the requested target, and the run is never touched.
+ */
+export function maskPrivateBoundTarget<T extends { id?: string; runId?: string }>(params: T, store?: Record<string, unknown>): {
+	params: T;
+	unmask<V>(value: V): V;
+	unmaskError(error: unknown): unknown;
+} {
+	const registry = getBoundRunRegistry(store);
+	const hidden = [params.id, params.runId].find((target): target is string => typeof target === "string" && registry.names(target));
+	if (hidden === undefined) return { params, unmask: (value) => value, unmaskError: (error) => error };
+	const standIn = randomUUID();
+	return {
+		params: {
+			...params,
+			...(params.id === hidden ? { id: standIn } : {}),
+			...(params.runId === hidden ? { runId: standIn } : {}),
+		},
+		unmask: (value) => replaceStrings(value, standIn, hidden) as typeof value,
+		unmaskError: (error) => {
+			if (error instanceof Error) error.message = error.message.replaceAll(standIn, hidden);
+			return error;
+		},
+	};
 }

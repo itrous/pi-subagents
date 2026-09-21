@@ -11,7 +11,7 @@ import type { BoundResolvedPackageExtensions } from "./bound-package-extensions.
 export type BoundPackageAttestation = BoundResolvedPackageExtensions["attestations"][number];
 export type BoundPackageFailureCode = "package_bytes_drift" | "package_load_error";
 
-export const BOUND_PACKAGE_HOOK_NAME = "<inline:pi-subagents:bound-packages>";
+export const BOUND_PACKAGE_HOOK_NAME = "pi-subagents:bound-packages";
 
 export interface BoundLoadedPackageFactory {
 	path: string;

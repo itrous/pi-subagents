@@ -60,6 +60,7 @@ import { createPrunedForkSessionWriter } from "../../shared/pruned-fork.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
+import { boundForegroundChildSessionFactory, boundForegroundRunId, isBoundForegroundLaunch, isPrivateBoundRun, publicBoundStatusState } from "../../bound/bound-child-factory.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
 import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
@@ -570,12 +571,13 @@ export function removeForegroundControlIfIdle(state: SubagentState, runId: strin
 
 function getForegroundControl(state: SubagentState, runId: string | undefined) {
 	if (runId) return state.foregroundControls.get(runId);
-	if (state.lastForegroundControlId) {
+	if (state.lastForegroundControlId && !isPrivateBoundRun(state.lastForegroundControlId)) {
 		const latest = state.foregroundControls.get(state.lastForegroundControlId);
 		if (latest) return latest;
 	}
 	let newest: (SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never) | undefined;
 	for (const control of state.foregroundControls.values()) {
+		if (isPrivateBoundRun(control.runId)) continue;
 		if (!newest || control.updatedAt > newest.updatedAt) newest = control;
 	}
 	return newest;
@@ -3979,7 +3981,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			effectivePrompt: task,
 			cwd: singleCwd,
 			outputPath,
-			rerun: { params: { ...params, task: authoredTask, async: params.async ?? false } },
+			rerun: isBoundForegroundLaunch(params) ? undefined : { params: { ...params, task: authoredTask, async: params.async ?? false } },
 			description: foregroundControl.description,
 			...(modelOverride ? { model: modelOverride } : {}),
 			...(thinking ? { thinking } : {}),
@@ -4024,6 +4026,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		: undefined;
 	try {
 		const launched = await runSync(ctx.cwd, agents, params.agent!, task, compactOptional<Parameters<typeof runSync>[4]>({
+			childSessionFactory: boundForegroundChildSessionFactory(params, { runId }),
 			machine: foregroundMachine,
 			parentProviderRegistry: ctx.modelRegistry,
 			remoteReads: foregroundMachine ? readsOverride : undefined,
@@ -4095,7 +4098,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 						await finalizeSingleWorktreeHandoff({ worktreeSetup, artifactsDir, runId, cwd: sourceCwd, agent: params.agent!, result, workflowKey: params.workflowKey, lane });
 					}
 					try {
-						updateRememberedForegroundChild(deps.state, { runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, index: 0, result, events: deps.pi.events, notify: true });
+						if (!isBoundForegroundLaunch(params)) updateRememberedForegroundChild(deps.state, { runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, index: 0, result, events: deps.pi.events, notify: true });
 					} catch {
 						// Remembered foreground state is best-effort; run history and cleanup must still complete.
 					}
@@ -4191,7 +4194,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		usageBudget: usageBudgetState(data.usageBudget, totalCost),
 		...(worktreeHandoff?.reference ? { parallelHandoff: worktreeHandoff.reference } : {}),
 	}));
-	rememberForegroundRun(deps.state, { modelResponseAliases, runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, results: details.results, params, effectiveOutput, effectiveOutputMode, extensionBindings: params.extensionBindings, requiredExtensions });
+	if (!isBoundForegroundLaunch(params)) rememberForegroundRun(deps.state, { modelResponseAliases, runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, results: details.results, params, effectiveOutput, effectiveOutputMode, extensionBindings: params.extensionBindings, requiredExtensions });
 
 	const suppressRoutineResultIntercom = shouldSuppressRoutineResultIntercom({ suppressRoutineResultIntercom: params.suppressRoutineResultIntercom, results: [r] });
 	if (!r.detached && !r.interrupted && !suppressRoutineResultIntercom) {
@@ -6561,6 +6564,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							: item),
 					};
 				};
+				// Status reads see no live bound run (I4.13); writes still reach deps.state.
+				const statusState = publicBoundStatusState(deps.state);
 				const nestedScope = nestedResolutionScopeForExecutor(deps);
 				const sessionRoots = trustedSessionRootsForStatus(ctx, deps);
 				if (action === "debug.run") {
@@ -6570,16 +6575,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					if (paramsWithResolvedCwd.view) {
 						return withBudget({ content: [{ type: "text", text: "action='debug.run' does not support status views." }], isError: true, details: { mode: "management", results: [] } });
 					}
-					return withBudget(inspectSubagentStatus(paramsWithResolvedCwd, omitUndefinedProperties({ state: deps.state, nested: nestedScope, sessionRoots, abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })));
+					return withBudget(inspectSubagentStatus(paramsWithResolvedCwd, omitUndefinedProperties({ state: statusState, nested: nestedScope, sessionRoots, abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })));
 				}
 				if (paramsWithResolvedCwd.view === "fleet" || paramsWithResolvedCwd.view === "transcript") {
-					return withBudget(inspectSubagentStatus(paramsWithResolvedCwd, omitUndefinedProperties({ state: deps.state, nested: nestedScope, sessionRoots, abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })));
+					return withBudget(inspectSubagentStatus(paramsWithResolvedCwd, omitUndefinedProperties({ state: statusState, nested: nestedScope, sessionRoots, abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })));
 				}
 				if (targetRunId) {
 					try {
-						const resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: deps.state, nested: nestedScope }));
+						const resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: statusState, nested: nestedScope }));
 						if (resolved?.kind === "foreground") {
-							const foreground = getForegroundControl(deps.state, resolved.id);
+							const foreground = getForegroundControl(statusState, resolved.id);
 							if (foreground) {
 								return withBudget(foregroundStatusResult(foreground));
 							}
@@ -6589,10 +6594,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						return withBudget({ content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } });
 					}
 				} else if (!hasDirectoryTarget) {
-					const foreground = getForegroundControl(deps.state, undefined);
+					const foreground = getForegroundControl(statusState, undefined);
 					if (foreground) return withBudget(foregroundStatusResult(foreground));
 				}
-				return withBudget(inspectSubagentStatus(paramsWithResolvedCwd, omitUndefinedProperties({ state: deps.state, nested: nestedScope, sessionRoots, abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })));
+				return withBudget(inspectSubagentStatus(paramsWithResolvedCwd, omitUndefinedProperties({ state: statusState, nested: nestedScope, sessionRoots, abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })));
 			}
 			if (action === "resume") {
 				return resumeAsyncRun(omitUndefinedProperties({ params: paramsWithResolvedCwd, requestCwd, ctx, deps, parentModel: requestParentModel, signal }));
@@ -7026,7 +7031,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				return toExecutionErrorResult(effectiveParams, error, contextPolicy.contextSummary);
 			}
 		}
-		const runId = randomUUID();
+		const runId = boundForegroundRunId(effectiveParams) ?? randomUUID();
 		const foregroundTimeout = resolveSingleAgentLaunchTimeout(
 			effectiveParams,
 			effectiveAsync,

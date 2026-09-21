@@ -87,7 +87,6 @@ function port(executeDelegated: BoundExecuteDelegated, overrides: Partial<BoundE
 		executeDelegated,
 		getContext: () => fixture.context() as never,
 		config: fixture.config,
-		childFactoryWired: () => true,
 		registry,
 		...overrides,
 	});
@@ -144,14 +143,6 @@ test("a host usageBudget refuses the run closed before the executor (D15); witho
 	const plain = port(executor);
 	await plain.handle.run({ launch, signal: new AbortController().signal, onUpdate: noUpdate });
 	assert.equal(calls, 1);
-});
-
-test("without the child factory slot the port refuses before any executor call", async () => {
-	const launch = await admittedLaunch();
-	let calls = 0;
-	const { handle } = port(async () => { calls++; return childResult(); }, { childFactoryWired: undefined });
-	assert.deepEqual(await handle.run({ launch, signal: new AbortController().signal, onUpdate: noUpdate }), { status: "unavailable_context" });
-	assert.equal(calls, 0);
 });
 
 test("updates carry exactly the keys the client reads", async () => {
@@ -322,7 +313,6 @@ test("the control plane builds its port from executeDelegated and silences it on
 		coordinator: new BoundAttemptCoordinator(),
 		childShutdown: false,
 		store,
-		childFactoryWired: () => true,
 		executeDelegated: async (_id, params, _signal, onUpdate) => {
 			relay = onUpdate;
 			recordEvidence(registry, params);

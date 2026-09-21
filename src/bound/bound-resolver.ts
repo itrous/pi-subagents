@@ -15,7 +15,7 @@ import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { resolveChildMaxSubagentDepth, type ExtensionConfig } from "../shared/types.ts";
 import { resolveBoundAgent, type BoundAgentDiscoveryDeps, type BoundSkillEvidenceV1 } from "./bound-agent-discovery.ts";
 import { projectBoundBindings, type BoundBindingsProjectionV1 } from "./bound-bindings.ts";
-import { resolveBoundPackageExtensions, type BoundPackageEvidenceCache, type BoundPackageExtensionProjectionV1 } from "./bound-package-extensions.ts";
+import { resolveBoundPackageExtensions, type BoundPackageEvidenceCache, type BoundPackageExtensionProjectionV1, type BoundResolvedPackageExtensions } from "./bound-package-extensions.ts";
 import { boundRequestDigest, type BoundRequestV2 } from "./bound-request.ts";
 import { expectedToolRegistryProjection, SUPPORTED_BOUND_MODEL_APIS, type RuntimeBuiltinProjectionV1, type ToolRegistryProjectionV1 } from "./bound-tool-registry-projection.ts";
 import type { BoundLayerManifestV2 } from "./bound-layer-manifest.ts";
@@ -77,7 +77,7 @@ export type BoundResolutionErrorCode =
 	| "missing_skill" | "unsupported_mode" | "unavailable_model" | "restricted_agent";
 
 export type ResolveBoundLaunchContractResult =
-	| { ok: true; contract: BoundLaunchContractV2; requestDigest: string; launchContractDigest: string; activeSessionDigest: string; canonicalCwd: string; agent: AgentConfig; packageExtensionPaths: string[] }
+	| { ok: true; contract: BoundLaunchContractV2; requestDigest: string; launchContractDigest: string; activeSessionDigest: string; canonicalCwd: string; agent: AgentConfig; packageExtensionPaths: string[]; packageAttestations: BoundResolvedPackageExtensions["attestations"] }
 	| { ok: false; code: BoundResolutionErrorCode };
 
 export interface ResolveBoundLaunchContractInput {
@@ -386,5 +386,6 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		canonicalCwd: requestCwd,
 		agent,
 		packageExtensionPaths: packageExtensions.paths,
+		packageAttestations: packageExtensions.attestations,
 	};
 }

@@ -34,13 +34,16 @@ const KEPT_A1_MODULES = [
  * visible decision rather than transitive upstream noise.
  */
 const EXPECTED_UPSTREAM_DEPENDENCIES = [
+	"@earendil-works/pi-agent-core",
 	"@earendil-works/pi-coding-agent",
 	"agents/agent-refinements.ts",
 	"agents/agents.ts",
 	"agents/skills.ts",
 	"api/delegation.ts",
+	"jiti/static",
 	"runs/foreground/subagent-executor.ts",
 	"runs/shared/capability-ceiling.ts",
+	"runs/shared/child-launch.ts",
 	"runs/shared/child-session.ts",
 	"runs/shared/child-tool-plan.ts",
 	"runs/shared/model-scope.ts",
@@ -50,6 +53,7 @@ const EXPECTED_UPSTREAM_DEPENDENCIES = [
 	"shared/model-info.ts",
 	"shared/session-identity.ts",
 	"shared/types.ts",
+	"shared/utils.ts",
 ] as const;
 
 const IMPORT_SPECIFIER = /(?:^|[\s;{(])(?:import|export)\s*(?:type\s*)?(?:[^'"()]*?\bfrom\s*)?["']([^"']+)["']/gm;
