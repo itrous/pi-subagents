@@ -133,8 +133,14 @@ export class BoundRunRegistryV1 {
 		this.runs.set(runId, record);
 		this.privateRunIds.delete(runId);
 		this.privateRunIds.add(runId);
-		// Insertion order: the oldest id is evicted first.
-		while (this.privateRunIds.size > BOUND_PRIVATE_RUN_IDS_CAPACITY) this.privateRunIds.delete(this.privateRunIds.values().next().value!);
+		// Insertion order: the oldest id whose execution record is closed is evicted
+		// first; a run that is still executing never loses its privacy.
+		if (this.privateRunIds.size > BOUND_PRIVATE_RUN_IDS_CAPACITY) {
+			for (const candidate of this.privateRunIds) {
+				if (this.privateRunIds.size <= BOUND_PRIVATE_RUN_IDS_CAPACITY) break;
+				if (!this.runs.has(candidate)) this.privateRunIds.delete(candidate);
+			}
+		}
 		return record;
 	}
 
@@ -200,7 +206,8 @@ export function getBoundRunRegistry(store: Record<string, unknown> = globalThis 
 		const marker = Object.getOwnPropertyDescriptor(existing, "contractVersion");
 		if (!marker || !("value" in marker) || marker.value !== 1 || marker.writable !== false || marker.configurable !== false
 			|| typeof (existing as BoundRunRegistryV1).open !== "function"
-			|| typeof (existing as BoundRunRegistryV1).close !== "function") throw new Error("Incompatible process-global bound run registry.");
+			|| typeof (existing as BoundRunRegistryV1).close !== "function"
+			|| typeof (existing as BoundRunRegistryV1).isPrivate !== "function") throw new Error("Incompatible process-global bound run registry.");
 		return existing as BoundRunRegistryV1;
 	}
 	const registry = new BoundRunRegistryV1();

@@ -110,3 +110,21 @@ test("privacy outlives the execution record, and only the oldest id is evicted b
 	assert.equal(registry.isPrivate("run-first"), false, "the oldest id is evicted first");
 	assert.equal(registry.isPrivate(`run-${BOUND_PRIVATE_RUN_IDS_CAPACITY - 1}`), true);
 });
+
+test("a run that is still executing is never evicted from the private ids", async () => {
+	const { BOUND_PRIVATE_RUN_IDS_CAPACITY } = await import("../../src/bound/bound-run-registry.ts");
+	const registry = new BoundRunRegistryV1();
+	assert.ok(registry.open(launch("run-live", {})));
+	for (let index = 0; index < BOUND_PRIVATE_RUN_IDS_CAPACITY; index++) { registry.open(launch(`run-${index}`, {})); registry.close(`run-${index}`); }
+	assert.equal(registry.has("run-live"), true);
+	assert.equal(registry.isPrivate("run-live"), true, "the live run keeps its privacy");
+	assert.equal(registry.names("run-liv"), true);
+	assert.equal(registry.isPrivate("run-0"), false, "the oldest closed id is evicted instead");
+});
+
+test("a process-global registry without isPrivate is refused as incompatible", async () => {
+	const { BOUND_RUN_REGISTRY_GLOBAL_KEY, getBoundRunRegistry } = await import("../../src/bound/bound-run-registry.ts");
+	const legacy = { open: () => undefined, close: () => undefined };
+	Object.defineProperty(legacy, "contractVersion", { value: 1, enumerable: false, configurable: false, writable: false });
+	assert.throws(() => getBoundRunRegistry({ [BOUND_RUN_REGISTRY_GLOBAL_KEY]: legacy }), /Incompatible process-global bound run registry/);
+});

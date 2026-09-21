@@ -210,6 +210,10 @@ test("an executor exception settles as failed with the run's evidence", async ()
 	assert.ok(Buffer.byteLength(cut, "utf8") <= 4096);
 	const tail = cut.charCodeAt(cut.length - 1);
 	assert.ok(!(tail >= 0xd800 && tail <= 0xdbff), "no dangling high surrogate");
+	const run = port(async () => { throw new Error(`${"a".repeat(4090)}\uD800\uD800\uD800`); });
+	const runCut = String((await run.handle.run({ launch: await admittedLaunch(), signal: new AbortController().signal, onUpdate: noUpdate })).error);
+	const runTail = runCut.charCodeAt(runCut.length - 1);
+	assert.ok(!(runTail >= 0xd800 && runTail <= 0xdbff), "no dangling high surrogate after a run of them");
 	for (const [label, rejection] of [["a plain object", {}], ["no value", undefined], ["a string", "plain string reason"]] as const) {
 		const odd = port(async () => { throw rejection; });
 		const outcome = await odd.handle.run({ launch: await admittedLaunch(), signal: new AbortController().signal, onUpdate: noUpdate });

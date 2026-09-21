@@ -29,9 +29,8 @@ function boundedError(text: string): string {
 	if (Buffer.byteLength(text, "utf8") <= MAX_ERROR_BYTES) return text;
 	let end = MAX_ERROR_BYTES;
 	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > MAX_ERROR_BYTES) end--;
-	// Never end on the high half of a surrogate pair.
-	const last = text.charCodeAt(end - 1);
-	if (end > 0 && last >= 0xd800 && last <= 0xdbff) end--;
+	// Never end on a high surrogate, however many of them precede the cut.
+	while (end > 0 && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end--;
 	return text.slice(0, end);
 }
 
