@@ -131,7 +131,8 @@ and the barrier sit (`LANDING-A1R.4-spikes.md`, adapter 2.26.1 and 2.34.0). Gate
 D10 therefore stays: a leaf with MCP direct tools and
 `process.cwd() !== contract.canonicalCwd` is refused before any session work
 (`unavailable_context`, `mcp_cwd_mismatch`). The measured alternative — passing
-the adapter its config path explicitly — is fork B1 and awaits a human decision.
+the adapter its config path explicitly — is fork B1; by human decision
+(2026-09-21) D10 stays and B1 moves to A1R.6.
 A1R.5 repeated the measurement on Linux with the installed adapter: without the
 explicit path the set is incomplete on a cold metadata cache and complete on a warm
 one; with it, complete on both. The bound layer does not pass the path, so D10
