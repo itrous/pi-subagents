@@ -72,6 +72,8 @@ const NOOP_METHODS = new Set([
 const SAFE_PACKAGE_METHODS = new Set(["getFlag", "getActiveTools", "getAllTools", "getCommands", "getSessionName", "getThinkingLevel"]);
 const POST_BARRIER_MUTATORS = new Set(["unregisterTool", "setActiveTools"]);
 const SAFE_CONTEXT_METHODS = new Set(["isIdle", "isProjectTrusted", "hasPendingMessages", "getContextUsage", "getSystemPrompt", "getSystemPromptOptions"]);
+/** The child's own session id lets a package read its bindings; no other session method is reachable. */
+const SAFE_SESSION_MANAGER_METHODS = new Set(["getSessionId"]);
 
 function immutableDetachedView(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
 	if (!value || typeof value !== "object") return value;
@@ -108,10 +110,20 @@ export function createBoundPackageApi(pi: ExtensionAPI, ownership: BoundPackageT
 		preventExtensions: () => deny("preventExtensions"),
 	}) as T;
 
+	const restrictedSessionManager = (sessionManager: object): object => opaqueFacade(sessionManager, (property) => {
+		const value = Reflect.get(sessionManager, property);
+		if (typeof value === "function") return typeof property === "string" && SAFE_SESSION_MANAGER_METHODS.has(property) ? value.bind(sessionManager) : () => deny(`ctx.sessionManager.${String(property)}`);
+		return immutableDetachedView(value);
+	});
+
 	const restrictedContext = (ctx: ExtensionContext): ExtensionContext => {
 		const deniedRegistry = opaqueFacade(Object.create(null) as object, () => () => deny("modelRegistry"));
 		return opaqueFacade(ctx, (property) => {
 			if (property === "modelRegistry") return deniedRegistry;
+			if (property === "sessionManager") {
+				const sessionManager = Reflect.get(ctx, property);
+				return sessionManager && typeof sessionManager === "object" ? restrictedSessionManager(sessionManager) : sessionManager;
+			}
 			if (property === "model" || property === "scopedModels") return immutableDetachedView(Reflect.get(ctx, property));
 			if (property === "getModel") return () => immutableDetachedView((ctx as ExtensionContext & { getModel?: () => unknown }).getModel?.());
 			const value = Reflect.get(ctx, property);

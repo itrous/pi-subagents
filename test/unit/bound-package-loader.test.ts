@@ -200,3 +200,44 @@ test("package factories of one run share a private events bus; the host bus stay
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(received, []);
 });
+
+test("the facade opens only the current child's read-only ctx.sessionManager.getSessionId()", async () => {
+	class ChildSessionManager {
+		sessionId = "child-session-1";
+		leafId: string | null = "leaf-1";
+		getSessionId() { return this.sessionId; }
+		getSessionFile() { return "/child.jsonl"; }
+		getEntries() { return []; }
+		appendMessage() { this.leafId = "leaf-2"; return "leaf-2"; }
+		newSession() { this.sessionId = "replaced"; }
+	}
+	const sessionManager = new ChildSessionManager();
+	const ctx = { cwd: "/work", sessionManager };
+	const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
+	const tools: Array<{ execute: (...args: unknown[]) => Promise<unknown> }> = [];
+	const pi = {
+		on(_event: string, handler: (event: unknown, ctx: unknown) => unknown) { handlers.push(handler); },
+		registerTool(tool: { execute: (...args: unknown[]) => Promise<unknown> }) { tools.push(tool); },
+	} as unknown as ExtensionAPI;
+	const violations: BoundPackageViolation[] = [];
+	const api = createBoundPackageApi(pi, createBoundPackageToolOwnership([], []), { barrierCommitted: () => false, onViolation: (violation) => violations.push(violation) });
+	const seen: unknown[] = [];
+	api.on("session_start", (_event, facadeCtx) => { seen.push(facadeCtx.sessionManager); });
+	api.registerTool({ name: "bsl-bindings", label: "b", description: "b", parameters: {}, execute: async (_id, _params, _signal, _update, facadeCtx) => { seen.push(facadeCtx.sessionManager); return { content: [], details: {} }; } } as never);
+	await handlers[0]!({}, ctx);
+	await tools[0]!.execute("call-1", {}, undefined, undefined, ctx);
+	assert.equal(seen.length, 2);
+	for (const facade of seen as ChildSessionManager[]) {
+		assert.notEqual(facade, sessionManager);
+		assert.equal(facade.getSessionId(), "child-session-1");
+		for (const method of ["getSessionFile", "getEntries", "appendMessage", "newSession"] as const) {
+			assert.throws(() => (facade[method] as () => unknown)(), (error: unknown) => error instanceof BoundPackageViolation && error.operation === `ctx.sessionManager.${method}`);
+		}
+		assert.throws(() => { facade.sessionId = "forged"; }, BoundPackageViolation);
+		assert.throws(() => { (facade as unknown as Record<string, unknown>).getSessionId = () => "forged"; }, BoundPackageViolation);
+		assert.equal(facade.getSessionId(), "child-session-1");
+	}
+	assert.equal(violations.length, 12);
+	assert.equal(sessionManager.sessionId, "child-session-1");
+	assert.equal(sessionManager.leafId, "leaf-1");
+});
