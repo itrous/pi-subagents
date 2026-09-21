@@ -5,7 +5,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createJiti } from "jiti/static";
 import type { ChildHookExtension } from "../runs/shared/child-session.ts";
 import { packageTreeEvidence } from "../runs/shared/package-tree-evidence.ts";
-import { createBoundPackageApi, createBoundPackageToolOwnership, type BoundPackageViolation } from "./bound-package-api.ts";
+import { createBoundPackageApi, createBoundPackageEventBus, createBoundPackageToolOwnership, type BoundPackageViolation } from "./bound-package-api.ts";
 import type { BoundResolvedPackageExtensions } from "./bound-package-extensions.ts";
 
 export type BoundPackageAttestation = BoundResolvedPackageExtensions["attestations"][number];
@@ -149,17 +149,19 @@ export interface BoundPackageHookOptions {
 	onFactoryError: (entry: string, error: unknown) => void;
 }
 
-/** Inline hook that calls each loaded factory with its own facade over one shared ownership map. */
+/** Inline hook that calls each loaded factory with its own facade over one shared ownership map and one private bus. */
 export function boundPackageFactoriesHook(factories: readonly BoundLoadedPackageFactory[], options: BoundPackageHookOptions): ChildHookExtension {
 	return {
 		name: BOUND_PACKAGE_HOOK_NAME,
 		factory: async (pi) => {
 			const ownership = createBoundPackageToolOwnership(options.runtimeBuiltins, options.internalTools);
+			const events = createBoundPackageEventBus();
 			for (const loaded of factories) {
 				const api = createBoundPackageApi(pi, ownership, {
 					barrierCommitted: options.barrierCommitted,
 					onViolation: options.onViolation,
 					allowInputRegistrationNoop: loaded.allowInputRegistrationNoop,
+					events,
 				});
 				try { await loaded.factory(api); }
 				catch (error) {

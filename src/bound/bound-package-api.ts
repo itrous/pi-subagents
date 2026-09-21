@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ACTIVE_BOUND_INTERNAL_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from "../runs/shared/core-runtime-tools.ts";
 
@@ -24,6 +25,29 @@ export interface BoundPackageApiOptions {
 	onViolation: (violation: BoundPackageViolation) => void;
 	/** A1 parity for pi-mcp-adapter: its `input` handler is dropped instead of refused before the barrier. */
 	allowInputRegistrationNoop?: boolean;
+	/** The run's private `pi.events` (`createBoundPackageEventBus`); without it the facade exposes no bus methods. */
+	events?: ExtensionAPI["events"];
+}
+
+/**
+ * Private `pi.events` shared by the package factories of one run; the host bus
+ * stays unreachable. A1 parity: the child process had a bus of its own.
+ * pi-mcp-adapter emits a tool-approval request on it before every MCP call.
+ * Same semantics as Pi's `createEventBus`.
+ */
+export function createBoundPackageEventBus(): ExtensionAPI["events"] {
+	const emitter = new EventEmitter();
+	return {
+		emit: (channel, data) => { emitter.emit(channel, data); },
+		on: (channel, handler) => {
+			const safeHandler = async (data: unknown) => {
+				try { await handler(data); }
+				catch (error) { console.error(`Event handler error (${channel}):`, error); }
+			};
+			emitter.on(channel, safeHandler);
+			return () => { emitter.off(channel, safeHandler); };
+		},
+	};
 }
 
 /**
@@ -112,6 +136,7 @@ export function createBoundPackageApi(pi: ExtensionAPI, ownership: BoundPackageT
 
 	return opaqueFacade(pi, (property) => {
 		if (typeof property !== "string") return undefined;
+		if (property === "events" && options.events) return options.events;
 		if (ALWAYS_DENIED_METHODS.has(property)) return () => deny(property);
 		if (NOOP_METHODS.has(property)) return () => undefined;
 		if (property === "on") return (event: string, handler: (...args: unknown[]) => unknown) => {

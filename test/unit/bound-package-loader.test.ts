@@ -175,3 +175,28 @@ test("the facade refuses an occupied name, a foreign package's name, and any reg
 	assert.deepEqual(host.handlers, ["session_start"]);
 	assert.equal(violations.length, 9);
 });
+
+test("package factories of one run share a private events bus; the host bus stays unreachable", async () => {
+	const host = fakePi();
+	const hostBus: string[] = [];
+	(host.pi as unknown as { events: unknown }).events = { emit: () => hostBus.push("emit"), on: () => { hostBus.push("on"); return () => {}; } };
+	const received: unknown[] = [];
+	const factories = [
+		{ path: "/listener.ts", allowInputRegistrationNoop: false, factory: (pi: ExtensionAPI) => { pi.events.on("mcp:approval", (data) => { received.push(data); }); } },
+		// pi-mcp-adapter emits its tool-approval request on `pi.events` before every MCP call.
+		{ path: "/emitter.ts", allowInputRegistrationNoop: false, factory: (pi: ExtensionAPI) => { pi.events.emit("mcp:approval", { tool: "bsl-ws_search" }); } },
+	];
+	const hook = boundPackageFactoriesHook(factories, {
+		runtimeBuiltins: ["read"], internalTools: [], barrierCommitted: () => false, onViolation: () => {}, onFactoryError: () => {},
+	});
+	await hook.factory(host.pi);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(received, [{ tool: "bsl-ws_search" }]);
+	assert.deepEqual(hostBus, []);
+	// A second run gets a bus of its own.
+	received.length = 0;
+	const lone = boundPackageFactoriesHook([factories[1]!], { runtimeBuiltins: ["read"], internalTools: [], barrierCommitted: () => false, onViolation: () => {}, onFactoryError: () => {} });
+	await lone.factory(host.pi);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(received, []);
+});
