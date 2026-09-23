@@ -16,6 +16,7 @@ import { getBoundIdentityRegistry } from "../../src/slash/bound-identity-registr
 import { createBoundFixture, FIXTURE_LAYER_MANIFEST, FIXTURE_PI_RUNTIME, FIXTURE_RUNTIME_BUILTINS, FIXTURE_SERVER_INSTANCE_ID, fixtureSourceIdentity, type BoundFixture } from "../fixtures/bound/harness.ts";
 import { fakePi } from "../support/bound-fake-pi.ts";
 import { admitBoundLaunch, boundBindingOf, contractLaunch } from "../support/bound-launch.ts";
+import { TEST_TRANSCRIPT_API } from "../support/bound-transcript.ts";
 
 type DelegatedResult = Awaited<ReturnType<BoundExecuteDelegated>>;
 
@@ -52,7 +53,7 @@ function hangingExecutor(registry: BoundRunRegistryV1, authorized: Map<string, B
 			created = await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi }).create(launch);
 			registry.attachChild(runId, created);
 		} else {
-			created = await createBoundChildSessionFactory({ runId, expectedRunId: runId }, { registry, loadPiCodingAgent: async () => pi, processCwd: () => fixture.project, shutdownTimeoutMs: SHUTDOWN_MS }).create(launch);
+			created = await createBoundChildSessionFactory({ runId, expectedRunId: runId }, { registry, loadPiCodingAgent: async () => pi, processCwd: () => fixture.project, shutdownTimeoutMs: SHUTDOWN_MS, transcriptApi: TEST_TRANSCRIPT_API }).create(launch);
 		}
 		await gate;
 		return { content: [], details: { mode: "single", results: [] } } as unknown as DelegatedResult;
@@ -232,7 +233,7 @@ for (const [label, timing] of [
 		const executeDelegated: BoundExecuteDelegated = async (_id, params) => {
 			const runId = boundRunIdOf(params)!;
 			await sleep(timing.createAfterMs);
-			created = createBoundChildSessionFactory({ runId, expectedRunId: runId }, { registry, loadPiCodingAgent: async () => pi, processCwd: () => fixture.project, shutdownTimeoutMs: SHUTDOWN_MS })
+			created = createBoundChildSessionFactory({ runId, expectedRunId: runId }, { registry, loadPiCodingAgent: async () => pi, processCwd: () => fixture.project, shutdownTimeoutMs: SHUTDOWN_MS, transcriptApi: TEST_TRANSCRIPT_API })
 				.create(contractLaunch(fixture, launch));
 			await created.catch(() => {});
 			return { content: [], details: { mode: "single", results: [] } } as unknown as DelegatedResult;

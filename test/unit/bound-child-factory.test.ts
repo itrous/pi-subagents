@@ -11,6 +11,7 @@ import { admitBoundLaunch, contractLaunch, writeMcpFixture } from "../support/bo
 import { expectedToolRegistryProjection } from "../../src/bound/bound-tool-registry-projection.ts";
 import { fakePi, type FailurePoint } from "../support/bound-fake-pi.ts";
 import { until } from "../support/bound-executor.ts";
+import { TEST_TRANSCRIPT_API } from "../support/bound-transcript.ts";
 
 const ENV = "MCP_DIRECT_TOOLS";
 const FAILURE_POINTS: FailurePoint[] = ["reload", "getExtensions", "refresh", "inheritProvider", "sessionManager", "resolveCliModel", "createAgentSession", "bindExtensions"];
@@ -36,7 +37,7 @@ async function setup(authorizedOverride?: (launch: BoundAuthorizedLaunch) => Bou
 }
 
 function factoryFor(registry: BoundRunRegistryV1, runId: string, pi: PiCodingAgentModule, extra: Partial<BoundChildSessionFactoryOptions> = {}) {
-	return createBoundChildSessionFactory({ runId, expectedRunId: runId }, { registry, loadPiCodingAgent: async () => pi, processCwd: () => fixture.project, ...extra });
+	return createBoundChildSessionFactory({ runId, expectedRunId: runId }, { registry, loadPiCodingAgent: async () => pi, processCwd: () => fixture.project, transcriptApi: TEST_TRANSCRIPT_API, ...extra });
 }
 
 test("create() returns the base factory's child, with the run hook first and the env window restored", async () => {

@@ -1,4 +1,5 @@
 import type { PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
+import { transcriptContext, transcriptTool } from "./bound-transcript.ts";
 
 const ENV = "MCP_DIRECT_TOOLS";
 /** Builtins this stand's Pi exposes; `read` is the one the fixture agents allow. */
@@ -41,9 +42,11 @@ export interface FakePiOptions {
 	reloadDelayMs?: number;
 	/** Stand-in for pi-mcp-adapter: register one `server_tool` per `server/tool` selector in the window. */
 	registerFromMcpWindow?: boolean;
+	/** `getAllTools()` reports the builtin for these names although a package registered them. */
+	builtinWins?: string[];
 }
 
-interface Tool { name: string; execute?: (...args: unknown[]) => unknown }
+interface Tool { name: string; description?: string; parameters?: unknown; execute?: (...args: unknown[]) => unknown }
 type Listener = (event: Record<string, unknown>) => void;
 
 /**
@@ -162,6 +165,12 @@ export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; 
 				messages,
 				sessionFile: undefined,
 				sessionId: loader.sessionId,
+				getAllTools: () => [
+					...[...BUILTINS].filter((name) => !loader.tools.has(name) || options.builtinWins?.includes(name))
+						.map((name) => ({ ...transcriptTool(name), sourceInfo: { source: "builtin", path: `<builtin:${name}>` } })),
+					...[...loader.tools.values()].filter((tool) => !options.builtinWins?.includes(tool.name))
+						.map((tool) => ({ name: tool.name, description: tool.description ?? tool.name, parameters: tool.parameters ?? {}, sourceInfo: { source: "local", path: "<inline>" } })),
+				],
 				getActiveToolNames: () => {
 					const names = active();
 					probe.activeToolNames[index] = [...names];
@@ -185,7 +194,15 @@ export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; 
 					}
 					let refusal: string | undefined;
 					// Pi turns a stream-function failure into an error message, never a rejected prompt.
-					try { agent.streamFunction(model, { tools: active().map((name) => ({ name })) }); }
+					try {
+						// The provider is shown each active tool's own declaration, as Pi 0.87 does.
+						agent.streamFunction(model, transcriptContext(active().map((name) => {
+							const tool = loader.tools.get(name);
+							return tool?.description !== undefined && !options.builtinWins?.includes(name)
+								? { name, description: tool.description, parameters: (tool.parameters ?? {}) as object }
+								: name;
+						})));
+					}
 					catch (error) { refusal = error instanceof Error ? error.message : String(error); }
 					if (!refusal && options.structuredValue !== undefined) {
 						emitEvent({ type: "tool_execution_start", toolName: "structured_output", args: { value: options.structuredValue } });

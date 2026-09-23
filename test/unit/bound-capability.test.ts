@@ -7,6 +7,8 @@ import { afterEach, beforeEach, test } from "node:test";
 import { BoundAttemptCoordinator } from "../../src/bound/bound-attempt-coordinator.ts";
 import type { BoundExecuteDelegated } from "../../src/bound/bound-execution-port.ts";
 import { runBoundSelfCheck, type BoundSelfCheckResult } from "../../src/bound/bound-self-check.ts";
+import { verifiedBoundTranscriptApi, type BoundTranscriptModules } from "../../src/bound/bound-transcript.ts";
+import { TEST_TRANSCRIPT_API } from "../support/bound-transcript.ts";
 import { BOUND_CHANNEL_VERSION, BOUND_REQUEST_EVENT, boundReplyEvent } from "../../src/bound/channel.ts";
 import { registerBoundControlPlane, type RegisterBoundControlPlaneOptions } from "../../src/bound/index.ts";
 import type { PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
@@ -16,7 +18,7 @@ let fixture: BoundFixture;
 beforeEach(() => { fixture = createBoundFixture(); });
 afterEach(() => { fixture.cleanup(); });
 
-const PASSED: BoundSelfCheckResult = { agent: true, streamFunction: true, getActiveToolNames: true, loaded: true };
+const PASSED: BoundSelfCheckResult = { agent: true, streamFunction: true, getActiveToolNames: true, loaded: true, transcriptApi: true, transcriptContext: true };
 const neverExecutes: BoundExecuteDelegated = async () => { throw new Error("not executed in this test"); };
 
 async function capabilities(overrides: Partial<RegisterBoundControlPlaneOptions> = {}): Promise<Record<string, unknown>> {
@@ -53,8 +55,13 @@ async function capabilities(overrides: Partial<RegisterBoundControlPlaneOptions>
 	} finally { plane.stop(); }
 }
 
-test("the full configuration announces boundForegroundLeaf v2", async () => {
-	assert.deepEqual(await capabilities(), { activeRuntimeIdentity: { version: 2 }, boundForegroundLeaf: { version: 2 } });
+const FULL = {
+	activeRuntimeIdentity: { version: 2 }, boundForegroundLeaf: { version: 2 },
+	boundSessionBindings: { version: 1 }, boundToolShadowing: { version: 1 }, boundMcpConfig: { version: 1 },
+};
+
+test("the full configuration announces boundForegroundLeaf v2 with its feature keys", async () => {
+	assert.deepEqual(await capabilities(), FULL);
 });
 
 const REMOVALS: Array<[string, Partial<RegisterBoundControlPlaneOptions>]> = [
@@ -65,6 +72,8 @@ const REMOVALS: Array<[string, Partial<RegisterBoundControlPlaneOptions>]> = [
 	["AgentSession.agent", { selfCheck: async () => ({ ...PASSED, agent: false }) }],
 	["loader.loaded", { selfCheck: async () => ({ ...PASSED, loaded: false }) }],
 	["getActiveToolNames", { selfCheck: async () => ({ ...PASSED, getActiveToolNames: false }) }],
+	["the runtime transcript API", { selfCheck: async () => ({ ...PASSED, transcriptApi: false }) }],
+	["the transcript context probe", { selfCheck: async () => ({ ...PASSED, transcriptContext: false }) }],
 	["a settled self-check", { selfCheck: () => new Promise<BoundSelfCheckResult>(() => {}) }],
 	["source identity", { resolveSourceIdentity: () => fixtureSourceIdentity(false) }],
 ];
@@ -72,17 +81,59 @@ const REMOVALS: Array<[string, Partial<RegisterBoundControlPlaneOptions>]> = [
 for (const [label, override] of REMOVALS) {
 	test(`removing ${label} removes the capability`, async () => {
 		const announced = await capabilities(override);
-		assert.equal(Object.hasOwn(announced, "boundForegroundLeaf"), false);
+		for (const key of ["boundForegroundLeaf", "boundSessionBindings", "boundToolShadowing", "boundMcpConfig"]) assert.equal(Object.hasOwn(announced, key), false, key);
 	});
 }
 
 test("positive control: removing an unrelated condition keeps the capability", async () => {
-	assert.deepEqual(await capabilities({ waitToolEnabled: true, getContext: () => null }), { activeRuntimeIdentity: { version: 2 }, boundForegroundLeaf: { version: 2 } });
+	assert.deepEqual(await capabilities({ waitToolEnabled: true, getContext: () => null }), FULL);
 });
 
+const sharedUuid = () => "uuid";
+
+/**
+ * Tier-1 stand-in for pi-agent-core 0.87: `prompt` declares the loadout delta on
+ * a system message and hands the stream function `{ messages }`, like the real
+ * `declareToolChanges`. `legacy` hands `{ tools }` instead, like Pi 0.85.
+ */
+function transcriptModules(variant: "transcript" | "legacy" = "transcript"): BoundTranscriptModules {
+	type ProbeTool = { name: string; description: string; parameters: unknown };
+	const declaration = (tool: ProbeTool) => JSON.stringify([tool.name, tool.description, tool.parameters]);
+	class Agent {
+		state: { tools: ProbeTool[] };
+		private readonly messages: Array<Record<string, unknown>> = [];
+		private declared = new Map<string, ProbeTool>();
+		private readonly streamFn: (model: unknown, context: unknown) => unknown;
+		constructor(options: { initialState: { tools: ProbeTool[] }; streamFn: (model: unknown, context: unknown) => unknown }) {
+			this.state = { tools: [...options.initialState.tools] };
+			this.streamFn = options.streamFn;
+		}
+		async prompt(text: string) {
+			const next = new Map(this.state.tools.map((tool) => [tool.name, { name: tool.name, description: tool.description, parameters: tool.parameters }]));
+			const toolsRemoved = [...this.declared.values()].filter((tool) => !next.has(tool.name) || declaration(next.get(tool.name)!) !== declaration(tool));
+			const toolsAdded = [...next.values()].filter((tool) => !this.declared.has(tool.name) || declaration(this.declared.get(tool.name)!) !== declaration(tool));
+			this.declared = next;
+			this.messages.push({ role: "system", content: "", ...(toolsAdded.length ? { toolsAdded } : {}), ...(toolsRemoved.length ? { toolsRemoved } : {}), timestamp: 0 });
+			this.messages.push({ role: "user", content: [{ type: "text", text }], timestamp: 0 });
+			try { this.streamFn({}, variant === "legacy" ? { tools: [...next.values()] } : { messages: [...this.messages] }); }
+			catch { this.messages.push({ role: "assistant", content: [], stopReason: "error", timestamp: 0 }); }
+		}
+	}
+	return { ai: { getCurrentTools: TEST_TRANSCRIPT_API.getCurrentTools, uuidv7: sharedUuid }, core: { Agent, uuidv7: sharedUuid } };
+}
+
+type SelfCheckGap = "agent" | "streamFunction" | "loaded" | "getActiveToolNames" | "foreignAgent";
+
 /** Tier-1 module for the self-check itself: one member can be removed at a time. */
-function selfCheckModule(missing?: "agent" | "streamFunction" | "loaded" | "getActiveToolNames"): { pi: PiCodingAgentModule; disposed: () => number } {
+function selfCheckModule(modules: BoundTranscriptModules, missing?: SelfCheckGap): { pi: PiCodingAgentModule; disposed: () => number } {
 	let disposed = 0;
+	const RuntimeAgent = (modules.core as { Agent: new (options: unknown) => Record<string, unknown> }).Agent;
+	const sessionAgent = () => {
+		if (missing === "foreignAgent") return { streamFunction: () => ({}) };
+		const agent = new RuntimeAgent({ initialState: { tools: [] }, streamFn: () => ({}) });
+		if (missing !== "streamFunction") agent.streamFunction = () => ({});
+		return agent;
+	};
 	const pi = {
 		ModelRuntime: { create: async () => ({}) },
 		SettingsManager: { create: () => ({}) },
@@ -90,7 +141,7 @@ function selfCheckModule(missing?: "agent" | "streamFunction" | "loaded" | "getA
 		SessionManager: { inMemory: () => ({}) },
 		createAgentSession: async () => ({
 			session: {
-				...(missing === "agent" ? {} : { agent: missing === "streamFunction" ? {} : { streamFunction: () => ({}) } }),
+				...(missing === "agent" ? {} : { agent: sessionAgent() }),
 				...(missing === "getActiveToolNames" ? {} : { getActiveToolNames: () => ["read"] }),
 				dispose() { disposed += 1; },
 			},
@@ -99,22 +150,52 @@ function selfCheckModule(missing?: "agent" | "streamFunction" | "loaded" | "getA
 	return { pi: pi as unknown as PiCodingAgentModule, disposed: () => disposed };
 }
 
-test("the self-check reads all four Pi fields and disposes its session", async () => {
-	const full = selfCheckModule();
-	assert.deepEqual(await runBoundSelfCheck({ loadPiCodingAgent: async () => full.pi }), PASSED);
+test("the self-check reads every Pi field, probes the transcript, and disposes its session", async () => {
+	const modules = transcriptModules();
+	const full = selfCheckModule(modules);
+	assert.deepEqual(await runBoundSelfCheck({ loadPiCodingAgent: async () => full.pi, loadTranscriptModules: async () => modules }), PASSED);
 	assert.equal(full.disposed(), 1);
-	for (const missing of ["agent", "streamFunction", "loaded", "getActiveToolNames"] as const) {
-		const module = selfCheckModule(missing);
-		const result = await runBoundSelfCheck({ loadPiCodingAgent: async () => module.pi });
-		assert.equal(result[missing], false, missing);
-		assert.equal(Object.values(result).filter((value) => !value).length, missing === "agent" ? 2 : 1, missing);
+	assert.equal(verifiedBoundTranscriptApi()?.getCurrentTools, TEST_TRANSCRIPT_API.getCurrentTools, "a passed check records the verified API");
+	const expectations: Array<[SelfCheckGap, Array<keyof BoundSelfCheckResult>]> = [
+		["agent", ["agent", "streamFunction", "transcriptApi", "transcriptContext"]],
+		["streamFunction", ["streamFunction"]],
+		["loaded", ["loaded"]],
+		["getActiveToolNames", ["getActiveToolNames"]],
+		// The session runs another agent-core than the one the barrier would read with.
+		["foreignAgent", ["transcriptApi", "transcriptContext"]],
+	];
+	for (const [missing, failed] of expectations) {
+		const module = selfCheckModule(modules, missing);
+		const result = await runBoundSelfCheck({ loadPiCodingAgent: async () => module.pi, loadTranscriptModules: async () => modules });
+		assert.deepEqual(Object.entries(result).filter(([, value]) => !value).map(([key]) => key).sort(), [...failed].sort(), missing);
+		assert.equal(verifiedBoundTranscriptApi(), undefined, `${missing}: a failed check leaves no verified API`);
 	}
 });
 
+test("the self-check refuses a pre-0.87 stream context and a pi-ai copy the agent loop does not use", async () => {
+	const legacy = transcriptModules("legacy");
+	const legacyModule = selfCheckModule(legacy);
+	const legacyResult = await runBoundSelfCheck({ loadPiCodingAgent: async () => legacyModule.pi, loadTranscriptModules: async () => legacy });
+	assert.deepEqual([legacyResult.transcriptApi, legacyResult.transcriptContext], [true, false]);
+	const modules = transcriptModules();
+	const foreignAi = { ...modules, ai: { ...(modules.ai as object), uuidv7: () => "other copy" } };
+	const module = selfCheckModule(modules);
+	const foreign = await runBoundSelfCheck({ loadPiCodingAgent: async () => module.pi, loadTranscriptModules: async () => foreignAi });
+	assert.deepEqual([foreign.transcriptApi, foreign.transcriptContext], [false, false]);
+	assert.equal(verifiedBoundTranscriptApi(), undefined);
+});
+
 const sdkRoot = process.env.PI_SUBAGENTS_NATIVE_SDK;
-test("the self-check passes on the installed Pi without a provider call", { skip: !sdkRoot && "Set PI_SUBAGENTS_NATIVE_SDK to the isolated 0.85.1 SDK root" }, async () => {
-	const entry = execFileSync(process.execPath, ["--input-type=module", "-e", "console.log(import.meta.resolve('@earendil-works/pi-coding-agent'))"], { cwd: sdkRoot, encoding: "utf8" }).trim();
-	const pi = await import(entry) as PiCodingAgentModule;
+const resolveInSdk = (specifier: string): string => execFileSync(process.execPath, ["--input-type=module", "-e", `console.log(import.meta.resolve(${JSON.stringify(specifier)}))`], { cwd: sdkRoot, encoding: "utf8" }).trim();
+
+test("the self-check passes on the installed Pi without a provider call", { skip: !sdkRoot && "Set PI_SUBAGENTS_NATIVE_SDK to the isolated Pi SDK root" }, async () => {
+	const pi = await import(resolveInSdk("@earendil-works/pi-coding-agent")) as PiCodingAgentModule;
+	const sdkModules = async (): Promise<BoundTranscriptModules> => ({
+		ai: await import(resolveInSdk("@earendil-works/pi-ai")),
+		core: await import(resolveInSdk("@earendil-works/pi-agent-core")),
+	});
+	// The fork's own dev copy of pi-ai is not the one the SDK's agent loop runs.
+	const devCopy = async (): Promise<BoundTranscriptModules> => ({ ai: await import("@earendil-works/pi-ai"), core: (await sdkModules()).core });
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "bound-self-check-agent-"));
 	const previous = process.env.PI_CODING_AGENT_DIR;
 	const previousFetch = globalThis.fetch;
@@ -122,7 +203,11 @@ test("the self-check passes on the installed Pi without a provider call", { skip
 	globalThis.fetch = (async () => { fetches += 1; throw new Error("no network in the self-check"); }) as typeof fetch;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	try {
-		assert.deepEqual(await runBoundSelfCheck({ loadPiCodingAgent: async () => pi, cwd: agentDir }), PASSED);
+		assert.deepEqual(await runBoundSelfCheck({ loadPiCodingAgent: async () => pi, loadTranscriptModules: sdkModules, cwd: agentDir }), PASSED);
+		assert.ok(verifiedBoundTranscriptApi());
+		const foreign = await runBoundSelfCheck({ loadPiCodingAgent: async () => pi, loadTranscriptModules: devCopy, cwd: agentDir });
+		assert.deepEqual([foreign.transcriptApi, foreign.transcriptContext], [false, false]);
+		assert.equal(verifiedBoundTranscriptApi(), undefined);
 		assert.equal(fetches, 0);
 	} finally {
 		globalThis.fetch = previousFetch;

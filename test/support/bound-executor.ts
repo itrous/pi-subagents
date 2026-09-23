@@ -10,6 +10,7 @@ import type { ExtensionConfig, SubagentState } from "../../src/shared/types.ts";
 import type { BoundFixture } from "../fixtures/bound/harness.ts";
 import { registerSubagentRpcBridge, SUBAGENT_RPC_REQUEST_EVENT } from "../../src/extension/rpc.ts";
 import { fakePi, type FakePiOptions } from "./bound-fake-pi.ts";
+import { TEST_TRANSCRIPT_API } from "./bound-transcript.ts";
 
 export const STAND_SESSION_ID = "parent-session-id";
 
@@ -72,7 +73,7 @@ export function createExecutorStand(fixture: BoundFixture, host: Partial<Extensi
 		async dispose() {},
 	});
 	const bound = fakePi(stand.fake ?? { promptGate: gate });
-	setBoundForegroundChildSessionFactoryOptions({ loadPiCodingAgent: async () => bound.pi, processCwd: () => fs.realpathSync(fixture.project) });
+	setBoundForegroundChildSessionFactoryOptions({ loadPiCodingAgent: async () => bound.pi, processCwd: () => fs.realpathSync(fixture.project), transcriptApi: TEST_TRANSCRIPT_API });
 
 	const run = (params: SubagentParamsLike, signal = new AbortController().signal) => executor.executeDelegated(`stand-${Math.random()}`, params, signal, undefined, ctx as never);
 	return {
