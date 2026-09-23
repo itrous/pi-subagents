@@ -7,6 +7,8 @@ import type { ChildHookExtension } from "../runs/shared/child-session.ts";
 import { packageTreeEvidence } from "../runs/shared/package-tree-evidence.ts";
 import { createBoundPackageApi, createBoundPackageEventBus, createBoundPackageToolOwnership, type BoundPackageViolation } from "./bound-package-api.ts";
 import type { BoundResolvedPackageExtensions } from "./bound-package-extensions.ts";
+import { installBoundSessionBindingsResponder, type BoundSessionBindingsEntry } from "./bound-session-bindings.ts";
+import type { BoundToolShadowingGrant } from "./bound-tool-shadowing.ts";
 
 export type BoundPackageAttestation = BoundResolvedPackageExtensions["attestations"][number];
 export type BoundPackageFailureCode = "package_bytes_drift" | "package_load_error";
@@ -15,6 +17,8 @@ export const BOUND_PACKAGE_HOOK_NAME = "pi-subagents:bound-packages";
 
 export interface BoundLoadedPackageFactory {
 	path: string;
+	/** Attested entry bytes; the shadowing grant goes only to the factory whose bytes the contract names. */
+	contentDigest?: string;
 	factory: (pi: ExtensionAPI) => unknown;
 	allowInputRegistrationNoop: boolean;
 }
@@ -85,7 +89,7 @@ export function verifyBoundPackageAttestations(attestations: readonly BoundPacka
  * No global resolver patch is installed, so the parent and sibling sessions
  * are untouched.
  */
-export function createBoundPackageImporter(roots: readonly string[]): { import(entry: string): Promise<unknown> } {
+export function createBoundPackageImporter(roots: readonly string[]): { import(entry: string): Promise<unknown>; importNamespace(entry: string): Promise<unknown> } {
 	const transformer = createJiti(import.meta.url, { moduleCache: false });
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false,
@@ -97,7 +101,7 @@ export function createBoundPackageImporter(roots: readonly string[]): { import(e
 			return { code: transformer.transform(options) };
 		},
 	});
-	return { import: (entry) => jiti.import(entry, { default: true }) };
+	return { import: (entry) => jiti.import(entry, { default: true }), importNamespace: (entry) => jiti.import(entry) };
 }
 
 function packageNameForEntry(entry: string, evidenceRoot: string): string | undefined {
@@ -115,8 +119,18 @@ function packageNameForEntry(entry: string, evidenceRoot: string): string | unde
 	return undefined;
 }
 
+export interface BoundPackageLoadOptions {
+	/**
+	 * Attested MCP configuration (sub-stage 4): the factory of the extension with
+	 * this contract ref is built as `createMcpAdapter({ config })` from its
+	 * attested entry's namespace instead of its default export, so the adapter
+	 * discovers no configuration file at all.
+	 */
+	mcpConfig?: { ref: string; config: Record<string, unknown> };
+}
+
 /** Verify, then import every attested factory in execution order. Nothing is invoked yet. */
-export async function loadBoundPackageFactories(attestations: readonly BoundPackageAttestation[]): Promise<
+export async function loadBoundPackageFactories(attestations: readonly BoundPackageAttestation[], options: BoundPackageLoadOptions = {}): Promise<
 	{ ok: true; factories: BoundLoadedPackageFactory[] } | { ok: false; code: BoundPackageFailureCode }
 > {
 	const verified = verifyBoundPackageAttestations(attestations);
@@ -128,11 +142,18 @@ export async function loadBoundPackageFactories(attestations: readonly BoundPack
 		// above takes seconds on a real closure.
 		if (!entryMatches(attestation)) return { ok: false, code: "package_bytes_drift" };
 		let factory: unknown;
-		try { factory = await importer.import(attestation.path); }
+		try {
+			if (options.mcpConfig && attestation.ref === options.mcpConfig.ref) {
+				const namespace = await importer.importNamespace(attestation.path) as { createMcpAdapter?: unknown } | undefined;
+				const create = namespace && typeof namespace === "object" ? namespace.createMcpAdapter : undefined;
+				factory = typeof create === "function" ? (create as (input: { config: Record<string, unknown> }) => unknown)({ config: structuredClone(options.mcpConfig.config) }) : undefined;
+			} else factory = await importer.import(attestation.path);
+		}
 		catch { return { ok: false, code: "package_load_error" }; }
 		if (typeof factory !== "function") return { ok: false, code: "package_load_error" };
 		factories.push({
 			path: attestation.path,
+			contentDigest: attestation.contentDigest,
 			factory: factory as (pi: ExtensionAPI) => unknown,
 			allowInputRegistrationNoop: packageNameForEntry(attestation.path, attestation.evidenceRoot) === "pi-mcp-adapter",
 		});
@@ -147,6 +168,10 @@ export interface BoundPackageHookOptions {
 	onViolation: (violation: BoundPackageViolation) => void;
 	/** A factory that threw; Pi only records the load error, so the run is closed through this callback. */
 	onFactoryError: (entry: string, error: unknown) => void;
+	/** Bindings of a child session published for this run only (sub-stage 2); absent means no responder. */
+	sessionBindings?: (sessionId: string) => BoundSessionBindingsEntry | undefined;
+	/** Shadowing grant (sub-stage 3) and the attested entry path it belongs to. */
+	shadowing?: { path: string; contentDigest: string; grant: BoundToolShadowingGrant };
 }
 
 /** Inline hook that calls each loaded factory with its own facade over one shared ownership map and one private bus. */
@@ -156,12 +181,17 @@ export function boundPackageFactoriesHook(factories: readonly BoundLoadedPackage
 		factory: async (pi) => {
 			const ownership = createBoundPackageToolOwnership(options.runtimeBuiltins, options.internalTools);
 			const events = createBoundPackageEventBus();
+			// Subscribed before any factory runs, so every package of the run reaches it.
+			if (options.sessionBindings) installBoundSessionBindingsResponder(events, options.sessionBindings);
 			for (const loaded of factories) {
+				const owner = options.shadowing !== undefined && loaded.path === options.shadowing.path
+					&& loaded.contentDigest === options.shadowing.contentDigest;
 				const api = createBoundPackageApi(pi, ownership, {
 					barrierCommitted: options.barrierCommitted,
 					onViolation: options.onViolation,
 					allowInputRegistrationNoop: loaded.allowInputRegistrationNoop,
 					events,
+					...(owner ? { shadowing: options.shadowing!.grant } : {}),
 				});
 				try { await loaded.factory(api); }
 				catch (error) {

@@ -1,6 +1,8 @@
 import { EventEmitter } from "node:events";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ACTIVE_BOUND_INTERNAL_RESERVED_TOOLS, CORE_RUNTIME_OWNED_TOOLS } from "../runs/shared/core-runtime-tools.ts";
+import type { BoundToolShadowingGrant } from "./bound-tool-shadowing.ts";
+import { toolDeclarationDigest } from "./bound-transcript.ts";
 
 /** Thrown for every forbidden facade operation; the caller closes the run. */
 export class BoundPackageViolation extends Error {
@@ -27,6 +29,11 @@ export interface BoundPackageApiOptions {
 	allowInputRegistrationNoop?: boolean;
 	/** The run's private `pi.events` (`createBoundPackageEventBus`); without it the facade exposes no bus methods. */
 	events?: ExtensionAPI["events"];
+	/**
+	 * Only on the facade of the one factory the contract names as shadowing owner
+	 * (sub-stage 3): it may register each granted builtin name exactly once.
+	 */
+	shadowing?: BoundToolShadowingGrant;
 }
 
 /**
@@ -162,6 +169,18 @@ export function createBoundPackageApi(pi: ExtensionAPI, ownership: BoundPackageT
 			if (options.barrierCommitted()) return deny("registerTool:after-barrier");
 			const name = tool && typeof tool === "object" ? (tool as { name?: unknown }).name : undefined;
 			if (typeof name !== "string" || !name) return deny("registerTool:unnamed");
+			const grant = options.shadowing;
+			if (grant?.tools.has(name)) {
+				if (grant.registered.has(name) || ownership.packageToolOwners.has(name)) return deny(`registerTool:${name}:again`);
+				const declaration = toolDeclarationDigest(tool);
+				const base = toolDeclarationDigest(tool, { base: true });
+				if (!declaration || !base) return deny(`registerTool:${name}:declaration`);
+				const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(tool));
+				grant.registered.set(name, { declaration, base });
+				ownership.occupiedToolNames.add(name);
+				ownership.packageToolOwners.set(name, owner);
+				return result;
+			}
 			if (ownership.occupiedToolNames.has(name) && ownership.packageToolOwners.get(name) !== owner) return deny(`registerTool:${name}`);
 			const result = (pi.registerTool as unknown as (value: unknown) => unknown)(wrapTool(tool));
 			ownership.occupiedToolNames.add(name);

@@ -51,6 +51,28 @@ exact-ten MCP, cancel, reload, privacy and the closed canaries pass
 (`LANDING-A1R.5-installed-probe.md`, `spikes/A1R.5/`). The probe found four defects
 the seams hid; their fixes are listed below.
 
+**A1R.6 producer, Pi 0.87.1** (`PLAN-A1R.6-producer.md`; decisions Q1–Q6 of the
+OneCPI plan `docs/plans/bound-v2-native-migration.md` at onecpi `41438fe5`). Pi 0.87
+hands the stream function a transcript (`{ messages }`) whose system messages carry
+`toolsAdded`/`toolsRemoved`; the barrier now reads each call's tool set as the replay
+of those deltas through `getCurrentTools` of the pi-ai the runtime itself runs (the
+module Pi's extension loader maps `@earendil-works/pi-ai` to; its identity is proven
+by pi-agent-core re-exporting the same `uuidv7` and by `session.agent instanceof
+Agent`), refuses any other context shape (`context_unsupported`), pins the
+declarations of the first admitted call (`tool_definition_mismatch`), and is not
+installed without the API a passed self-check verified. The self-check drives the
+runtime's own `Agent` with a throwing stream function (no provider) and requires the
+replay to follow additions, removals and a definition replacement. Three
+features, each announced as its own capability key beside `boundForegroundLeaf`:
+`boundSessionBindings` (a child's own bindings and cwd on the run's private package
+bus), `boundToolShadowing` (an attested owner extension replaces `find`/`grep`/`ls`/
+`read`, verified against the active definitions and enforced by the barrier) and
+`boundMcpConfig` (B1: pi-mcp-adapter built as `createMcpAdapter({ config })` from a
+measured configuration file, so no file source and no `process.cwd()` feeds the
+adapter; D10 applies only without it). Request fields `toolShadowing` and
+`mcpConfig` are optional; a request or contract without them is byte-identical to
+before (`test/fixtures/bound/contract-v2.golden.json`).
+
 Migration plan and accepted decisions: `PLAN-A1R-inprocess-upstream-migration.md`;
 spike results: `LANDING-A1R.0-spikes.md`; plan review rounds and the executor
 checklist: `LANDING-A1R-plan-review.md`. The published A1 pin
@@ -129,7 +151,8 @@ and listed in the manifest: `bound-execution-port`, `bound-run-registry`,
 `bound-child-factory`, `bound-launch-recheck`, `bound-stream-barrier`,
 `bound-run-hooks` (bindings plus the denial collector that replaces
 `denied-tool-proof`), `bound-package-loader`, `bound-package-api`,
-`bound-self-check`.
+`bound-self-check`. A1R.6 adds four more, also in the manifest: `bound-transcript`,
+`bound-session-bindings`, `bound-tool-shadowing`, `bound-mcp-config`.
 
 ### Probe P1: MCP and cwd (outcome B)
 
@@ -148,6 +171,12 @@ one; with it, complete on both. The bound layer does not pass the path, so D10
 refuses such a leaf even when the host was started with `--mcp-config`.
 Side fact for A1R.6: adapter 2.34.0 with `PI_MCP_CONFIG_MODE=exclusive` collapses
 config sources to the global one and disables project `.pi/mcp.json` entirely.
+A1R.6 implements B1 without argv, env or `chdir`: the adapter receives the attested
+object through its programmatic entry, which bypasses every file source on both its
+early and its session-start path. The upstream executor still names the selectors
+from the files it discovers in the leaf cwd and from the metadata cache, so preflight,
+the window and the final recheck require both resolutions to agree
+(`PLAN-A1R.6-producer.md`, sub-stage 4).
 
 ### Accepted weaknesses (decisions R4, R6)
 
@@ -186,6 +215,12 @@ refined through `toolRegistryError`:
 | `barrier_unavailable` | `native_tool_registry_mismatch` | the barrier could not be installed, or a run completed without a registry snapshot |
 | `compaction_forbidden` | `native_tool_registry_mismatch` | a model call without tools (compaction, branch summary) was refused |
 | `model_mismatch` | `native_tool_registry_mismatch` | a model call used another model or api |
+| `context_unsupported` | `native_tool_registry_mismatch` | a model call's context is not the exact Pi 0.87 transcript shape, or the runtime replay disagrees with the fork's |
+| `tool_definition_mismatch` | `native_tool_registry_mismatch` | a declaration differs from the pinned one or from an attested replacement |
+| `shadowing_incomplete` | `native_tool_registry_mismatch` | the attested owner did not register every granted replacement |
+| `shadowing_mismatch` | `native_tool_registry_mismatch` | an active definition of a granted name is the builtin or not the owner's |
+| `shadowing_unverified` | `native_tool_registry_mismatch` | a run under a shadowing contract completed without replacement evidence |
+| `mcp_config_drift` | `unavailable_context` | the attested MCP configuration's path, bytes or effective config changed after preflight |
 
 A registry that differs from the contract gives `native_tool_registry_mismatch`
 with `toolsMissing`/`toolsExtra` and no `toolRegistryError`.
@@ -237,10 +272,12 @@ npm run typecheck
 LC_ALL=C npm run test:unit
 LC_ALL=C npm run test:integration -- --test-concurrency=2
 node --experimental-strip-types --test test/unit/source-identity.test.ts
-# Tier 2 is mandatory: the same suites against the installed Pi 0.85.1. Without
-# the variable its tests are skipped and prove nothing about the real Pi fields.
-PI_SUBAGENTS_NATIVE_SDK=/opt/homebrew/Cellar/pi-coding-agent/0.85.1/libexec/lib LC_ALL=C npm run test:unit
-PI_SUBAGENTS_NATIVE_SDK=/opt/homebrew/Cellar/pi-coding-agent/0.85.1/libexec/lib LC_ALL=C npm run test:integration -- --test-concurrency=2
+# Tier 2 is mandatory: the same suites against an isolated Pi 0.87.1 SDK
+# (`npm install --prefix <sdk> --ignore-scripts @earendil-works/pi-coding-agent@0.87.1`)
+# and an owner package with pi-mcp-adapter 2.26.1 installed. Without the variables
+# their tests are skipped and prove nothing about the real Pi fields.
+PI_SUBAGENTS_NATIVE_SDK=<sdk> PI_SUBAGENTS_MCP_OWNER=<owner> LC_ALL=C npm run test:unit
+PI_SUBAGENTS_NATIVE_SDK=<sdk> PI_SUBAGENTS_MCP_OWNER=<owner> LC_ALL=C npm run test:integration -- --test-concurrency=2
 # Fork edit surface: exactly seven upstream src files (T1-T3 plus four carries),
 # and every added src path lives in src/bound/.
 git diff --name-only --diff-filter=MD 8bd275bba0dc13273eff366e348378d41ad5535e -- src

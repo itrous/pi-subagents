@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ChildSession } from "../runs/shared/child-session.ts";
 import type { BoundBindingsV1 } from "./bound-bindings.ts";
+import type { BoundSessionBindingsEntry } from "./bound-session-bindings.ts";
+import type { BoundToolShadowingEvidenceV1 } from "./bound-tool-shadowing.ts";
 import type { BoundAuthorizedLaunch } from "./bound-runtime-service.ts";
 import type { ToolRegistryProjectionV1 } from "./bound-tool-registry-projection.ts";
 
@@ -32,7 +34,9 @@ export function boundRunIdOf(params: unknown): string | undefined {
 
 export type BoundToolRegistryError =
 	| "launch_contract_mismatch" | "compaction_forbidden" | "model_mismatch" | "package_bytes_drift"
-	| "package_load_error" | "package_mutation" | "policy_mismatch" | "barrier_unavailable" | "mcp_cwd_mismatch";
+	| "package_load_error" | "package_mutation" | "policy_mismatch" | "barrier_unavailable" | "mcp_cwd_mismatch"
+	| "context_unsupported" | "tool_definition_mismatch"
+	| "shadowing_incomplete" | "shadowing_mismatch" | "shadowing_unverified" | "mcp_config_drift";
 
 /** First recorded failure wins; later ones are consequences of the first. */
 export interface BoundRunFailure {
@@ -45,9 +49,15 @@ export interface BoundRunFailure {
 export class BoundRegistryCollector {
 	projection: ToolRegistryProjectionV1 | undefined;
 	failure: BoundRunFailure | undefined;
+	/** Q3 evidence: the verified replacements, only when the contract grants shadowing. */
+	shadowing: BoundToolShadowingEvidenceV1 | undefined;
 
 	recordProjection(projection: ToolRegistryProjectionV1): void {
 		this.projection ??= projection;
+	}
+
+	recordShadowing(evidence: BoundToolShadowingEvidenceV1): void {
+		this.shadowing ??= { version: evidence.version, tools: [...evidence.tools], declarations: { ...evidence.declarations } };
 	}
 
 	fail(failure: BoundRunFailure): void {
@@ -187,6 +197,14 @@ export class BoundRunRegistryV1 {
 
 	sessionBindingsFor(sessionId: string): Readonly<BoundBindingsV1> | undefined {
 		return this.sessionBindings.get(sessionId)?.bindings;
+	}
+
+	/** A session's entry only when that session is published for exactly this live run. */
+	sessionBindingsForRun(sessionId: string, runId: string): BoundSessionBindingsEntry | undefined {
+		const entry = this.sessionBindings.get(sessionId);
+		const record = this.runs.get(runId);
+		if (!entry || entry.runId !== runId || !record) return undefined;
+		return { cwd: record.launch.contract.canonicalCwd, bindings: entry.bindings, valuesDigest: record.launch.contract.bindings.valuesDigest };
 	}
 
 	unpublishSessionBindings(sessionId: string, runId: string): void {

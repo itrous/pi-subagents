@@ -35,7 +35,7 @@ export interface BoundResolvedPackageExtensions {
 	paths: string[];
 	projection: BoundPackageExtensionProjectionV1[];
 	/** Private path/digest pairs in factory execution order; never published in the contract. */
-	attestations: Array<{ path: string; contentDigest: string; evidenceRoot: string; evidenceRootDigest: string; packageTreeDigest: string }>;
+	attestations: Array<{ ref: string; path: string; contentDigest: string; evidenceRoot: string; evidenceRootDigest: string; packageTreeDigest: string }>;
 }
 
 function digest(bytes: Buffer | string): string {
@@ -145,6 +145,7 @@ export function resolveBoundPackageExtensions(agent: AgentConfig, passCache?: Bo
 	}
 	if (refs.length > MAX_REFS || new Set(refs).size !== refs.length) throw new Error("Invalid bound extension refs.");
 	const paths: string[] = []; const projection: BoundPackageExtensionProjectionV1[] = []; const evidenceRootByPath = new Map<string, string>();
+	const refByPath = new Map<string, string>();
 	const treeDigestByRoot = passCache ?? new Map<string, string>();
 	const treeDigest = (entry: string, evidenceRoot: string): string => {
 		const relative = path.relative(evidenceRoot, entry);
@@ -159,7 +160,7 @@ export function resolveBoundPackageExtensions(agent: AgentConfig, passCache?: Bo
 		if (safeRelative(ref)) {
 			const entry = regularCanonicalFile(path.resolve(path.dirname(agent.filePath), ref), owner.rootPath);
 			const evidenceRoot = packageEvidenceRoot(owner.rootPath);
-			paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot);
+			paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); refByPath.set(entry.path, ref);
 			projection.push({ kind: "relative", ref, owner: publicIdentity(owner), entryDigest: digest(ref), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 			continue;
 		}
@@ -173,7 +174,7 @@ export function resolveBoundPackageExtensions(agent: AgentConfig, passCache?: Bo
 		if (!Array.isArray(entries) || entries.length !== 1 || typeof entries[0] !== "string" || !safeManifestEntry(entries[0], dependency.identity.rootPath)) throw new Error("Ambiguous bound dependency extension entry.");
 		const entry = regularCanonicalFile(path.resolve(dependency.identity.rootPath, entries[0]), dependency.identity.rootPath);
 		const evidenceRoot = packageEvidenceRoot(owner.rootPath);
-		paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot);
+		paths.push(entry.path); evidenceRootByPath.set(entry.path, evidenceRoot); refByPath.set(entry.path, ref);
 		projection.push({ kind: "package", ref, owner: publicIdentity(owner), package: publicIdentity(dependency.identity), entryDigest: digest(entries[0]), contentDigest: digest(entry.bytes), evidenceRootDigest: digest(evidenceRoot), packageTreeDigest: treeDigest(entry.path, evidenceRoot) });
 	}
 	if (new Set(paths).size !== paths.length) throw new Error("Duplicate bound extension entry.");
@@ -181,7 +182,7 @@ export function resolveBoundPackageExtensions(agent: AgentConfig, passCache?: Bo
 		const projected = projection[index]!; const evidenceRoot = evidenceRootByPath.get(entry)!;
 		return [entry, { contentDigest: projected.contentDigest, evidenceRoot, evidenceRootDigest: projected.evidenceRootDigest, packageTreeDigest: projected.packageTreeDigest }];
 	}));
-	const attestations = paths.map((entry) => ({ path: entry, ...evidenceByPath.get(entry)! }));
+	const attestations = paths.map((entry) => ({ ref: refByPath.get(entry)!, path: entry, ...evidenceByPath.get(entry)! }));
 	if (Buffer.byteLength(JSON.stringify(attestations), "utf8") > 48 * 1024) throw new Error("Bound package evidence policy is too large.");
 	return {
 		paths,

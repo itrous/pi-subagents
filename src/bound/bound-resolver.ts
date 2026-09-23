@@ -17,7 +17,9 @@ import { resolveChildMaxSubagentDepth, type ExtensionConfig } from "../shared/ty
 import { resolveBoundAgent, type BoundAgentDiscoveryDeps, type BoundSkillEvidenceV1 } from "./bound-agent-discovery.ts";
 import { projectBoundBindings, type BoundBindingsProjectionV1 } from "./bound-bindings.ts";
 import { resolveBoundPackageExtensions, type BoundPackageEvidenceCache, type BoundPackageExtensionProjectionV1, type BoundResolvedPackageExtensions } from "./bound-package-extensions.ts";
+import { resolveBoundMcpConfig, type BoundMcpConfigContractV1 } from "./bound-mcp-config.ts";
 import { boundRequestDigest, type BoundRequestV2 } from "./bound-request.ts";
+import { resolveBoundToolShadowing, type BoundToolShadowingContractV1 } from "./bound-tool-shadowing.ts";
 import { expectedToolRegistryProjection, SUPPORTED_BOUND_MODEL_APIS, type RuntimeBuiltinProjectionV1, type ToolRegistryProjectionV1 } from "./bound-tool-registry-projection.ts";
 import type { BoundLayerManifestV2 } from "./bound-layer-manifest.ts";
 import type { PiRuntimeAttestationV1 } from "./pi-runtime-attestation.ts";
@@ -50,6 +52,8 @@ export interface BoundLaunchContractV2 {
 	packageExtensionsDigest: string;
 	tools: { effectiveAllowlist: string[]; requiredChildTools: string[]; disableAmbientExtensions: boolean; capabilityCeiling?: ResolvedSubagentCapabilityCeiling };
 	mcpDirectTools: string[];
+	/** Present only when the request asked for an attested MCP configuration (subplan A1R.6, sub-stage 4). */
+	mcpConfig?: BoundMcpConfigContractV1;
 	toolRegistry: {
 		modelApi: string;
 		piRuntime: PiRuntimeAttestationV1;
@@ -57,6 +61,8 @@ export interface BoundLaunchContractV2 {
 		projection: ToolRegistryProjectionV1;
 		runtimeExtensions: BoundLayerManifestV2;
 		runtimeBuiltins: RuntimeBuiltinProjectionV1;
+		/** Present only when the request asked for attested shadowing (subplan A1R.6, sub-stage 3). */
+		shadowing?: BoundToolShadowingContractV1;
 		digest: string;
 	};
 	roots: { baseRootPathDigest: string; baseRootIdentityDigest?: string; baseRootParentIdentityDigest?: string; sessionRootDigest: string; sessionDirDigest: string; sessionFileDigest: string; artifactRootDigest?: string };
@@ -219,7 +225,9 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 	if (!resolvedAgent.ok) return failure(externalCwd && (resolvedAgent.code === "missing_agent" || resolvedAgent.code === "ambiguous_agent") ? "invalid_cwd" : resolvedAgent.code);
 	const { agent, definitionDigest, fileContentDigest, skillNames, skills, discovered } = resolvedAgent.resolution;
 	if (externalCwd && agent.source !== "package") return failure("invalid_cwd");
-	if (externalCwd && Boolean(agent.mcpDirectTools?.length)) return failure("unsupported_mode");
+	// D10: without an attested MCP configuration the adapter's early config
+	// follows `process.cwd()`, so an external cwd cannot carry MCP tools.
+	if (externalCwd && Boolean(agent.mcpDirectTools?.length) && !request.mcpConfig) return failure("unsupported_mode");
 	if (capabilityCeilingAgentRestrictionMessage(agent.name, input.capabilityCeiling)) return failure("restricted_agent");
 
 	const exactModel = input.availableModels.find((entry) => `${entry.provider}/${entry.id}` === request.model && (entry.fullId === undefined || entry.fullId === request.model));
@@ -258,7 +266,9 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 			extensions: [],
 			subagentOnlyExtensions: packageExtensions.paths,
 			...(agent.mcpDirectTools ? { mcpDirectTools: agent.mcpDirectTools } : {}),
-			cwd: discoveryCwd,
+			// B1: the executor names MCP selectors from discovery in the leaf cwd, so
+			// with an attested configuration the contract names come from there too.
+			cwd: request.mcpConfig ? requestCwd : discoveryCwd,
 			requireReadTool: skills.length > 0,
 			structuredOutput: request.result.kind === "structured",
 			...(input.capabilityCeiling ? { capabilityCeiling: input.capabilityCeiling } : {}),
@@ -286,12 +296,25 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 	if (!Number.isInteger(parentDepth) || parentDepth !== 0 || parentDepth >= runtimeMaxSubagentDepth) return failure("restricted_agent");
 	const effectiveMaxSubagentDepth = resolveChildMaxSubagentDepth(runtimeMaxSubagentDepth, agent.maxSubagentDepth);
 
+	const shadowing = request.toolShadowing
+		? resolveBoundToolShadowing(request.toolShadowing, { packageExtensions: packageExtensions.projection, runtimeBuiltins: input.runtimeBuiltins.names, effectiveAllowlist: toolPlan.effectiveToolAllowlist })
+		: undefined;
+	if (request.toolShadowing && (!shadowing || agent.source !== "package")) return failure("unsupported_mode");
+	const mcpConfig = request.mcpConfig
+		? resolveBoundMcpConfig(request.mcpConfig, {
+			packageExtensions: packageExtensions.projection, mcpDirectTools: toolPlan.effectiveMcpTools,
+			selectors: agent.mcpDirectTools ?? [], cwd: requestCwd,
+		})
+		: undefined;
+	if (request.mcpConfig && !mcpConfig) return failure("unsupported_mode");
+
 	const toolRegistryProjection = expectedToolRegistryProjection(toolPlan.effectiveToolAllowlist, toolPlan.internalTools);
 	if (!toolRegistryProjection) return failure("unsupported_mode");
 	const piRuntimeVersion = input.piRuntime.version;
 	if (!piRuntimeVersion || Buffer.byteLength(piRuntimeVersion, "utf8") > 128 || /[\0\r\n]/u.test(piRuntimeVersion)) return failure("unsupported_mode");
 	// `piRuntimeVersion` deliberately duplicates `piRuntime.version`: the v2 client
 	// keeps the exact v1 version check and reads the new sub-object beside it.
+	// A request without the new fields keeps the contract bytes it had before them.
 	const toolRegistry = {
 		modelApi: exactModel.api,
 		piRuntime: input.piRuntime,
@@ -299,9 +322,11 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		projection: toolRegistryProjection,
 		runtimeExtensions: input.layerManifest,
 		runtimeBuiltins: input.runtimeBuiltins,
+		...(shadowing ? { shadowing } : {}),
 		digest: canonicalSha256({
 			modelApi: exactModel.api, piRuntime: input.piRuntime, piRuntimeVersion,
 			projection: toolRegistryProjection, runtimeExtensions: input.layerManifest, runtimeBuiltins: input.runtimeBuiltins,
+			...(shadowing ? { shadowing } : {}),
 		}),
 	};
 
@@ -351,6 +376,8 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		roots, policy, result,
 		...(timeoutMs !== undefined ? { timeoutMs } : {}),
 		...(toolBudget ? { toolBudget } : {}),
+		...(shadowing ? { toolShadowing: shadowing } : {}),
+		...(mcpConfig ? { mcpConfig } : {}),
 	});
 	const base: Omit<BoundLaunchContractV2, "digest"> = {
 		version: BOUND_LAUNCH_CONTRACT_VERSION,
@@ -373,6 +400,7 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		packageExtensionsDigest: canonicalSha256(packageExtensions.projection),
 		tools,
 		mcpDirectTools: toolPlan.effectiveMcpTools,
+		...(mcpConfig ? { mcpConfig } : {}),
 		toolRegistry,
 		roots,
 		policy,

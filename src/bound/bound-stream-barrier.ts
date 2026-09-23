@@ -1,5 +1,6 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { sortToolRegistryNames, toolRegistryProjection, type ToolRegistryProjectionV1 } from "./bound-tool-registry-projection.ts";
+import { boundTranscriptTools, type BoundTranscriptApi } from "./bound-transcript.ts";
 
 /**
  * Fixed fork text (decision D11). It must not match any pi-ai retry pattern:
@@ -8,7 +9,9 @@ import { sortToolRegistryNames, toolRegistryProjection, type ToolRegistryProject
  */
 export const BOUND_BARRIER_ERROR_TEXT = "pi-subagents bound leaf: tool registry mismatch; the model call was refused before dispatch.";
 
-export type BoundBarrierRefusalReason = "tool_registry_mismatch" | "compaction_forbidden" | "model_mismatch";
+export type BoundBarrierRefusalReason =
+	| "tool_registry_mismatch" | "compaction_forbidden" | "model_mismatch"
+	| "context_unsupported" | "tool_definition_mismatch";
 
 export interface BoundBarrierRefusal {
 	reason: BoundBarrierRefusalReason;
@@ -23,6 +26,11 @@ export interface BoundBarrierExpectation {
 	model: string;
 	/** `contract.toolRegistry.modelApi`. */
 	api: string;
+	/**
+	 * Declarations that must reach the provider exactly as given (name → digest
+	 * of name/description/parameters), e.g. an attested shadowing definition.
+	 */
+	declarations?: ReadonlyMap<string, string>;
 }
 
 export interface BoundStreamBarrier {
@@ -71,28 +79,32 @@ export function snapshotBoundToolRegistry(
 	return { ok: true, names, projection };
 }
 
-function toolNamesOf(context: unknown): string[] | undefined {
-	if (!context || typeof context !== "object") return undefined;
-	const tools = (context as { tools?: unknown }).tools;
-	if (!Array.isArray(tools)) return undefined;
-	return tools.map((tool) => (tool && typeof tool === "object" && typeof (tool as { name?: unknown }).name === "string" ? (tool as { name: string }).name : ""));
-}
-
 /**
  * Wraps `agent.streamFunction` (fact S1). Every model call is checked before the
- * original stream function runs: the exact tool-name set, `provider/id`, and
- * `api`. A call without tools (compaction, branch summary) is refused (D7).
- * Returns undefined when the field is not a function: the barrier cannot be
- * installed, and the caller must close the run.
+ * original stream function runs, on the tool set the call itself declares: the
+ * replay of the transcript's system-message deltas through the runtime's own
+ * pi-ai (`boundTranscriptTools`), never an expected list standing in for the
+ * measurement. Refused in this order: a context that is not the exact transcript
+ * shape (`context_unsupported`); a call that declares no tools (compaction,
+ * branch summary, D7); a name set other than the contract's or a duplicate
+ * (`tool_registry_mismatch`); another model or api; a declaration that differs
+ * from a pinned one (`tool_definition_mismatch`). The declarations of the first
+ * admitted call are pinned: the registry is frozen after the barrier, so a later
+ * definition replacement under the same name is drift, not a new loadout.
+ * Returns undefined when the field is not a function or no verified transcript
+ * API is at hand: the barrier cannot be installed, and the caller must close the run.
  */
 export function installBoundStreamBarrier(
 	agent: BarrierAgent | undefined,
 	expectation: BoundBarrierExpectation,
 	onRefusal: (refusal: BoundBarrierRefusal) => void,
+	transcript: Pick<BoundTranscriptApi, "getCurrentTools"> | undefined,
 ): BoundStreamBarrier | undefined {
-	if (!agent || typeof agent.streamFunction !== "function") return undefined;
+	if (!agent || typeof agent.streamFunction !== "function" || !transcript || typeof transcript.getCurrentTools !== "function") return undefined;
 	const original = agent.streamFunction;
 	const expectedNames = [...expectation.toolNames];
+	const required = expectation.declarations ? new Map(expectation.declarations) : undefined;
+	let pinned: Map<string, string> | undefined;
 	let forced: BoundBarrierRefusal | undefined;
 	const refuse = (refusal: BoundBarrierRefusal): never => {
 		onRefusal({ reason: refusal.reason, missing: [...refusal.missing], extra: [...refusal.extra] });
@@ -100,12 +112,20 @@ export function installBoundStreamBarrier(
 	};
 	const barrier: StreamFn = (model, context, options) => {
 		if (forced) return refuse(forced);
-		const names = toolNamesOf(context);
-		if (!names || names.length === 0) return refuse({ reason: "compaction_forbidden", missing: [...expectedNames], extra: [] });
+		const declared = boundTranscriptTools(context, transcript);
+		if (!declared.ok) return refuse({ reason: "context_unsupported", missing: [], extra: [] });
+		const names = declared.names;
+		if (names.length === 0) return refuse({ reason: "compaction_forbidden", missing: [...expectedNames], extra: [] });
 		const { missing, extra } = compareToolNames(expectedNames, names);
 		if (missing.length > 0 || extra.length > 0 || new Set(names).size !== names.length) return refuse({ reason: "tool_registry_mismatch", missing, extra });
 		const modelRef = model && typeof model === "object" ? `${String(model.provider)}/${String(model.id)}` : "";
 		if (modelRef !== expectation.model || !model || model.api !== expectation.api) return refuse({ reason: "model_mismatch", missing: [], extra: [] });
+		const changed = sortToolRegistryNames(names.filter((name) => {
+			const digest = declared.declarations.get(name);
+			return (required?.has(name) && required.get(name) !== digest) || (pinned !== undefined && pinned.get(name) !== digest);
+		}));
+		if (changed.length > 0) return refuse({ reason: "tool_definition_mismatch", missing: changed, extra: changed });
+		pinned ??= new Map(declared.declarations);
 		return original(model, context, options);
 	};
 	agent.streamFunction = barrier;

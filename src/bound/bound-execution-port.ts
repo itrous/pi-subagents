@@ -170,6 +170,11 @@ export function projectBoundTerminal(record: BoundRunRecord, result: DelegatedRe
 		status = "native_tool_registry_mismatch";
 		toolRegistryError = "barrier_unavailable";
 	}
+	// Q3: a contract that grants shadowing completes only with the verified replacements.
+	if (status === "completed" && record.launch.contract.toolRegistry.shadowing && !record.registry.shadowing) {
+		status = "native_tool_registry_mismatch";
+		toolRegistryError = "shadowing_unverified";
+	}
 	if (status === "completed") {
 		const kind = record.launch.contract.result.kind;
 		if (kind === "text") {
@@ -197,6 +202,7 @@ export function projectBoundTerminal(record: BoundRunRecord, result: DelegatedRe
 		...(typeof child?.exitCode === "number" ? { exitCode: child.exitCode } : {}),
 		launchContractDigest: record.launch.contract.digest,
 		...(record.registry.projection ? { toolRegistry: record.registry.projection } : {}),
+		...(record.registry.shadowing ? { toolShadowing: record.registry.shadowing } : {}),
 		...(failure?.toolsMissing ? { toolsMissing: [...failure.toolsMissing] } : {}),
 		...(failure?.toolsExtra ? { toolsExtra: [...failure.toolsExtra] } : {}),
 		...(toolRegistryError ? { toolRegistryError } : {}),

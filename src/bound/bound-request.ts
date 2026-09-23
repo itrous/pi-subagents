@@ -3,6 +3,8 @@ import { types as utilTypes } from "node:util";
 import { canonicalSha256 } from "../shared/canonical-json.ts";
 import { cloneJsonWithinByteLimit } from "./bound-json.ts";
 import { BOUND_BINDING_NAMES, parseBoundBindings, type BoundBindingsV1 } from "./bound-bindings.ts";
+import { parseBoundMcpConfigRequest, type BoundMcpConfigRequestV1 } from "./bound-mcp-config.ts";
+import { parseBoundToolShadowingRequest, type BoundToolShadowingRequestV1 } from "./bound-tool-shadowing.ts";
 import type {
 	SubagentDelegationJsonSchemaObject,
 	SubagentDelegationThinking,
@@ -18,6 +20,8 @@ const FIELDS = new Set([
 	"version", "targetServerInstanceId", "requestId", "ownerRunId", "nodeId", "prospectiveRunId",
 	"agent", "task", "cwd", "context", "model", "thinking", "timeoutMs", "toolBudget", "skill",
 	"bindings", "artifacts", "result",
+	// Subplan A1R.6: optional, and unknown to a producer without these features.
+	"toolShadowing", "mcpConfig",
 ]);
 const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_REQUEST_CLONE_BYTES = 8 * 1024 * 1024;
@@ -44,6 +48,8 @@ export interface BoundRequestV2 {
 	bindings?: BoundBindingsV1;
 	artifacts: boolean;
 	result: { kind: "text" } | { kind: "structured"; schema: SubagentDelegationJsonSchemaObject };
+	toolShadowing?: BoundToolShadowingRequestV1;
+	mcpConfig?: BoundMcpConfigRequestV1;
 }
 
 export type BoundRequestParseResult = { ok: true; request: BoundRequestV2 } | { ok: false; code: "invalid_request" };
@@ -166,6 +172,9 @@ export function parseBoundRequest(input: unknown): BoundRequestParseResult {
 	}
 	const parsedBindings = parseBoundBindings(value.bindings);
 	if (!parsedBindings.ok) return fail();
+	const toolShadowing = parseBoundToolShadowingRequest(value.toolShadowing);
+	const mcpConfig = parseBoundMcpConfigRequest(value.mcpConfig);
+	if (toolShadowing === null || mcpConfig === null) return fail();
 	if (!plainRecord(value.result)) return fail();
 	let result: BoundRequestV2["result"];
 	if (value.result.kind === "text" && exactFields(value.result, new Set(["kind"]))) result = { kind: "text" };
@@ -184,6 +193,8 @@ export function parseBoundRequest(input: unknown): BoundRequestParseResult {
 		...(skill !== undefined ? { skill } : {}),
 		...(Object.keys(parsedBindings.bindings).length ? { bindings: parsedBindings.bindings } : {}),
 		artifacts: value.artifacts as boolean, result,
+		...(toolShadowing ? { toolShadowing } : {}),
+		...(mcpConfig ? { mcpConfig } : {}),
 	}) };
 }
 
@@ -199,6 +210,8 @@ export function projectBoundRequest(request: BoundRequestV2): Record<string, unk
 		...(request.skill !== undefined ? { skill: request.skill } : {}),
 		...(request.bindings && Object.keys(request.bindings).length ? { bindings: { ...request.bindings } } : {}),
 		artifacts: request.artifacts, result: request.result,
+		...(request.toolShadowing !== undefined ? { toolShadowing: request.toolShadowing } : {}),
+		...(request.mcpConfig !== undefined ? { mcpConfig: request.mcpConfig } : {}),
 	};
 }
 
