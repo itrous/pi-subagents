@@ -74,10 +74,13 @@ test("an inherited export is not an own binding and refuses", () => {
 });
 
 // Positive control on the real bundle: the installed Pi's VIRTUAL_MODULES chunk.
+// A set variable with no chunk fails the test instead of skipping it: the control must run.
 const piRoot = process.env.PI_SUBAGENTS_BUNDLED_PI;
-const chunk = piRoot ? fs.readdirSync(path.join(piRoot, "dist", "bundle", "chunks")).find((name) => /^virtual-modules-.*\.js$/u.test(name)) : undefined;
-test("installed Pi bundle VIRTUAL_MODULES yield the transcript API", { skip: !chunk && "Set PI_SUBAGENTS_BUNDLED_PI to the installed @earendil-works/pi-coding-agent root" }, async () => {
-	const { VIRTUAL_MODULES } = await import(pathToFileURL(path.join(piRoot!, "dist", "bundle", "chunks", chunk!)).href) as { VIRTUAL_MODULES: Record<string, object> };
+test("installed Pi bundle VIRTUAL_MODULES yield the transcript API", { skip: !piRoot && "Set PI_SUBAGENTS_BUNDLED_PI to the installed @earendil-works/pi-coding-agent root" }, async () => {
+	const chunks = path.join(piRoot!, "dist", "bundle", "chunks");
+	const chunk = fs.readdirSync(chunks).find((name) => /^virtual-modules-.*\.js$/u.test(name));
+	assert.ok(chunk, `no virtual-modules chunk in ${chunks}`);
+	const { VIRTUAL_MODULES } = await import(pathToFileURL(path.join(chunks, chunk)).href) as { VIRTUAL_MODULES: Record<string, object> };
 	const ai = VIRTUAL_MODULES["@earendil-works/pi-ai"]!, core = VIRTUAL_MODULES["@earendil-works/pi-agent-core"]!;
 	assert.equal("value" in Object.getOwnPropertyDescriptor(ai, "getCurrentTools")!, false, "the bundle must expose getters, else this control tests nothing");
 	assert.ok(boundTranscriptApiOf({ ai, core }));

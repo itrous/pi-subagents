@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, test } from "node:test";
 import { attestPiRuntime, PI_RUNTIME_PACKAGE_NAME, resetPiRuntimeAttestationCache } from "../../src/bound/pi-runtime-attestation.ts";
 
@@ -88,4 +89,49 @@ test("the resolved entry decides the package root when no root is supplied", asy
 	const result = await attestPiRuntime({ resolveEntry: () => path.join(root, "dist", "marker.js") });
 	assert.equal(result.ok, true);
 	assert.equal(result.ok && result.runtime.packageRoot, root);
+});
+
+// Pi's `pi` command is an esbuild bundle: an extension there has only VIRTUAL_MODULES,
+// so `import.meta.resolve("@earendil-works/pi-coding-agent")` fails. The root then
+// comes from the loaded module's own getPackageDir(), still checked as a Pi package.
+const bundledEntryFails = () => { throw new Error("Failed to resolve module specifier"); };
+
+test("bundled Pi: the loaded module's getPackageDir decides the root when resolution fails", async () => {
+	const root = writePackage(path.join(tempRoot, "bundled"));
+	const result = await attestPiRuntime({ resolveEntry: bundledEntryFails, loadPiCodingAgent: async () => ({ getPackageDir: () => root }) });
+	assert.equal(result.ok, true);
+	assert.equal(result.ok && result.runtime.packageRoot, root);
+});
+
+test("bundled Pi fallback refuses closed without a usable getPackageDir", async () => {
+	const foreign = path.join(tempRoot, "foreign");
+	fs.mkdirSync(foreign, { recursive: true });
+	fs.writeFileSync(path.join(foreign, "package.json"), JSON.stringify({ name: "other", version: "1.0.0" }), "utf8");
+	for (const loaded of [{}, { getPackageDir: "x" }, { getPackageDir: () => "relative/dir" }, { getPackageDir: () => 42 }, { getPackageDir: () => { throw new Error("boom"); } }, { getPackageDir: () => foreign }]) {
+		resetPiRuntimeAttestationCache();
+		assert.deepEqual(await attestPiRuntime({ resolveEntry: bundledEntryFails, loadPiCodingAgent: async () => loaded }), { ok: false, code: "unverified_runtime" });
+	}
+	assert.deepEqual(await attestPiRuntime({ resolveEntry: bundledEntryFails, loadPiCodingAgent: async () => { throw new Error("no module"); } }), { ok: false, code: "unverified_runtime" });
+});
+
+test("bundled Pi fallback refuses an overridden PI_PACKAGE_DIR: it no longer names the loaded module", async () => {
+	const root = writePackage(path.join(tempRoot, "overridden"));
+	const saved = process.env.PI_PACKAGE_DIR;
+	process.env.PI_PACKAGE_DIR = root;
+	try {
+		assert.deepEqual(await attestPiRuntime({ resolveEntry: bundledEntryFails, loadPiCodingAgent: async () => ({ getPackageDir: () => root }) }), { ok: false, code: "unverified_runtime" });
+	} finally {
+		if (saved === undefined) delete process.env.PI_PACKAGE_DIR; else process.env.PI_PACKAGE_DIR = saved;
+	}
+});
+
+const bundledPiRoot = process.env.PI_SUBAGENTS_BUNDLED_PI;
+test("installed Pi bundle: getPackageDir of its VIRTUAL_MODULES attests the installed package", { skip: !bundledPiRoot && "Set PI_SUBAGENTS_BUNDLED_PI to the installed @earendil-works/pi-coding-agent root" }, async () => {
+	const chunks = path.join(bundledPiRoot!, "dist", "bundle", "chunks");
+	const chunk = fs.readdirSync(chunks).find((name) => /^virtual-modules-.*\.js$/u.test(name));
+	assert.ok(chunk, `no virtual-modules chunk in ${chunks}`);
+	const { VIRTUAL_MODULES } = await import(pathToFileURL(path.join(chunks, chunk)).href) as { VIRTUAL_MODULES: Record<string, unknown> };
+	const result = await attestPiRuntime({ resolveEntry: bundledEntryFails, loadPiCodingAgent: async () => VIRTUAL_MODULES["@earendil-works/pi-coding-agent"] });
+	assert.equal(result.ok, true);
+	assert.equal(result.ok && result.runtime.packageRoot, fs.realpathSync(bundledPiRoot!));
 });

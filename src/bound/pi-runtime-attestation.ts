@@ -40,6 +40,8 @@ export interface AttestPiRuntimeOptions {
 	expectedVersion?: string;
 	/** Test seam for the resolution of the loaded package entry. */
 	resolveEntry?: () => string;
+	/** Test seam for the loaded Pi module the bundled-Pi fallback asks for its package dir. */
+	loadPiCodingAgent?: () => Promise<unknown>;
 }
 
 const cache = new Map<string, PiRuntimeAttestation>();
@@ -112,6 +114,23 @@ function defaultEntry(): string {
 }
 
 /**
+ * Root of the Pi package this process loaded. Pi's `pi` command is an esbuild
+ * bundle: an extension there gets VIRTUAL_MODULES only, and resolving the package
+ * specifier fails. The loaded module itself then names its package dir. An
+ * overridden PI_PACKAGE_DIR no longer ties that dir to the loaded module: refused.
+ */
+async function loadedPackageRoot(options: AttestPiRuntimeOptions): Promise<string> {
+	try { return packageRootOf((options.resolveEntry ?? defaultEntry)()); } catch { /* bundled Pi: no resolution path */ }
+	if (process.env.PI_PACKAGE_DIR) throw new Error("PI_PACKAGE_DIR overrides the loaded Pi package dir.");
+	const pi = await (options.loadPiCodingAgent ?? (() => import(PI_RUNTIME_PACKAGE_NAME)))() as { getPackageDir?: unknown } | undefined;
+	const getPackageDir = pi?.getPackageDir;
+	if (typeof getPackageDir !== "function") throw new Error("Loaded Pi exposes no package dir.");
+	const dir: unknown = getPackageDir();
+	if (typeof dir !== "string" || !path.isAbsolute(dir)) throw new Error("Loaded Pi package dir is not absolute.");
+	return packageRootOf(path.join(dir, "package.json"));
+}
+
+/**
  * Decision R2: attest the Pi package this process actually loaded. The result is
  * cached per absolute package root, so production pays for it once.
  */
@@ -120,7 +139,7 @@ export async function attestPiRuntime(options: AttestPiRuntimeOptions = {}): Pro
 	try {
 		root = options.packageRoot !== undefined
 			? path.resolve(options.packageRoot)
-			: packageRootOf((options.resolveEntry ?? defaultEntry)());
+			: await loadedPackageRoot(options);
 	} catch { return { ok: false, code: "unverified_runtime" }; }
 	const cached = cache.get(root);
 	if (cached) {
