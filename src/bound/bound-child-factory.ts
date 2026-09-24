@@ -11,7 +11,11 @@ import { createBoundRunHook } from "./bound-run-hooks.ts";
 import { boundRunIdOf, getBoundRunRegistry, type BoundRunFailure, type BoundRunRecord, type BoundRunRegistryV1 } from "./bound-run-registry.ts";
 import { installBoundStreamBarrier, snapshotBoundToolRegistry, type BoundBarrierExpectation, type BoundBarrierRefusal, type BoundStreamBarrier } from "./bound-stream-barrier.ts";
 import { verifiedBoundTranscriptApi, type BoundTranscriptApi } from "./bound-transcript.ts";
-import { BOUND_MCP_CONFIG_EXTENSION, recheckBoundMcpConfig, resolveBoundMcpSelections } from "./bound-mcp-config.ts";
+import {
+	BOUND_MCP_CONFIG_EXTENSION, isBoundMcpConfigContractV2, isBoundMcpConfigFinal, measureBoundMcpConfig, recheckBoundMcpConfig,
+	resolveBoundMcpSelections, validBoundMcpBridgeConfig,
+} from "./bound-mcp-config.ts";
+import { createBoundMcpBridgeFactory, measureBoundMcpAdapter } from "./bound-mcp-direct-bridge.ts";
 import { createBoundToolShadowingGrant, verifyBoundToolShadowing } from "./bound-tool-shadowing.ts";
 
 /**
@@ -133,7 +137,8 @@ function boundPiModule(pi: PiCodingAgentModule, hooks: { restore(): void; onSess
  */
 function effectiveMcpWindow(record: BoundRunRecord, mcpConfig: Record<string, unknown> | undefined): string | undefined {
 	const { contract, agent } = record.launch;
-	if (contract.mcpDirectTools.length === 0) return "__none__";
+	// The bridge (S3 P2) registers the measured tools itself; no adapter reads the env.
+	if (contract.mcpDirectTools.length === 0 || isBoundMcpConfigContractV2(contract.mcpConfig)) return "__none__";
 	let selections: ReturnType<typeof resolveMcpDirectToolResolution>["selections"];
 	if (mcpConfig) {
 		// B1: the attested object, which must still agree with discovery in the leaf cwd.
@@ -154,6 +159,29 @@ function effectiveMcpWindow(record: BoundRunRecord, mcpConfig: Record<string, un
 function refusalFailure(refusal: BoundBarrierRefusal): BoundRunFailure {
 	if (refusal.reason === "tool_registry_mismatch") return { status: "native_tool_registry_mismatch", toolsMissing: refusal.missing, toolsExtra: refusal.extra };
 	return { status: "native_tool_registry_mismatch", toolRegistryError: refusal.reason };
+}
+
+/**
+ * S3 P2 final recheck of the v2 snapshot at the executor boundary: the run owns
+ * the preparation the contract names, the configuration bytes are still the
+ * snapshot's, the adapter's private entries still carry the pinned bytes, and
+ * no server announced a changed list since discovery.
+ */
+function recheckBoundMcpSnapshot(record: BoundRunRecord): boolean {
+	const { contract, request, mcp, packageAttestations } = record.launch;
+	if (!isBoundMcpConfigContractV2(contract.mcpConfig) || !mcp || !isBoundMcpConfigFinal(request.mcpConfig)) return false;
+	const preparation = mcp.preparation;
+	if (preparation.snapshotDigest !== contract.mcpConfig.snapshotDigest || request.mcpConfig.ticket !== preparation.ticket
+		|| request.mcpConfig.snapshotDigest !== preparation.snapshotDigest || preparation.discovery.invalidated()) return false;
+	const measured = measureBoundMcpConfig(request.mcpConfig.path);
+	if (!measured || !validBoundMcpBridgeConfig(measured.config) || measured.contentDigest !== contract.mcpConfig.contentDigest
+		|| measured.effectiveDigest !== contract.mcpConfig.effectiveDigest) return false;
+	const adapters = contract.packageExtensions.filter((entry) => entry.ref === BOUND_MCP_CONFIG_EXTENSION);
+	const attestations = packageAttestations.filter((entry) => entry.ref === BOUND_MCP_CONFIG_EXTENSION);
+	if (adapters.length !== 1 || attestations.length !== 1) return false;
+	const adapter = measureBoundMcpAdapter(adapters[0]!, attestations[0]!);
+	return adapter !== undefined && adapter.entryDigests["server-manager.ts"] === contract.mcpConfig.entryDigests["server-manager.ts"]
+		&& adapter.entryDigests["direct-tools.ts"] === contract.mcpConfig.entryDigests["direct-tools.ts"];
 }
 
 /** The upstream launch with the bound layer's edits; the recheck already passed on the original. */
@@ -204,8 +232,12 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 			try { cwd = processCwd(); } catch { cwd = undefined; }
 			if (contract.mcpDirectTools.length > 0 && !contract.mcpConfig && cwd !== contract.canonicalCwd) throw refuse(record, { status: "unavailable_context", toolRegistryError: "mcp_cwd_mismatch" });
 			let mcpConfig: Record<string, unknown> | undefined;
-			if (contract.mcpConfig) {
-				mcpConfig = recheckBoundMcpConfig(record.launch.request.mcpConfig, contract.mcpConfig);
+			const bridged = isBoundMcpConfigContractV2(contract.mcpConfig);
+			if (isBoundMcpConfigContractV2(contract.mcpConfig)) {
+				if (!recheckBoundMcpSnapshot(record)) throw refuse(record, { status: "unavailable_context", toolRegistryError: "mcp_config_drift" });
+			} else if (contract.mcpConfig) {
+				const request = record.launch.request.mcpConfig;
+				mcpConfig = request?.version === 1 ? recheckBoundMcpConfig(request, contract.mcpConfig) : undefined;
 				if (!mcpConfig) throw refuse(record, { status: "unavailable_context", toolRegistryError: "mcp_config_drift" });
 			}
 			const shadowing = contract.toolRegistry.shadowing;
@@ -214,9 +246,6 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 				: [];
 			if (shadowing && shadowOwner.length !== 1) throw refuse(record, { status: "unavailable_context", toolRegistryError: "launch_contract_mismatch" });
 			const grant = shadowing ? createBoundToolShadowingGrant(shadowing) : undefined;
-			const loaded = await loadBoundPackageFactories(record.launch.packageAttestations, mcpConfig ? { mcpConfig: { ref: BOUND_MCP_CONFIG_EXTENSION, config: mcpConfig } } : {});
-			if (!loaded.ok) throw refuse(record, { status: "unavailable_context", toolRegistryError: loaded.code });
-
 			let barrier: BoundStreamBarrier | undefined;
 			let committed = false;
 			let bindWrapped = false;
@@ -224,6 +253,23 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 				record.registry.fail(failure);
 				barrier?.refuseAlways({ reason: "tool_registry_mismatch", missing: [], extra: [] });
 			};
+			// One bridge over the run's own prepared connections; a changed server list
+			// closes the run at once, not only at its next call.
+			const invalidateMcp = (): void => closeRun({ status: "native_tool_registry_mismatch", toolRegistryError: "tool_definition_mismatch" });
+			const bridge = bridged && record.launch.mcp
+				? createBoundMcpBridgeFactory({
+					discovery: record.launch.mcp.preparation.discovery,
+					isRevoked: () => record.revoked,
+					onInvalidate: invalidateMcp,
+					signal: record.revocation.signal,
+					names: contract.mcpDirectTools,
+				})
+				: undefined;
+			if (bridge) record.launch.mcp!.preparation.discovery.onInvalidate(invalidateMcp);
+			const loaded = await loadBoundPackageFactories(record.launch.packageAttestations, bridge
+				? { mcpBridge: { ref: BOUND_MCP_CONFIG_EXTENSION, factory: bridge } }
+				: mcpConfig ? { mcpConfig: { ref: BOUND_MCP_CONFIG_EXTENSION, config: mcpConfig } } : {});
+			if (!loaded.ok) throw refuse(record, { status: "unavailable_context", toolRegistryError: loaded.code });
 			const expectation: BoundBarrierExpectation = {
 				toolNames: contract.toolRegistry.projection.required,
 				model: contract.model,
@@ -240,14 +286,24 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 				// provider will be shown; a builtin never stands in for a missing one.
 				const shadowCheck = shadowing && grant ? verifyBoundToolShadowing(session as { getAllTools?: () => unknown }, shadowing, grant) : undefined;
 				if (shadowCheck?.ok) record.registry.recordShadowing(shadowCheck.evidence);
+				// S3 P2: the bridged MCP declarations are pinned like attested replacements.
+				const pinned = new Map<string, string>([...(shadowCheck?.ok ? shadowCheck.declarations : []), ...(bridge?.declarations ?? [])]);
+				if (bridge && bridge.declarations.size !== contract.mcpDirectTools.length) {
+					record.registry.fail({ status: "native_tool_registry_mismatch", toolRegistryError: "tool_definition_mismatch" });
+				}
 				barrier = installBoundStreamBarrier(session.agent, {
 					...expectation,
-					...(shadowCheck?.ok ? { declarations: shadowCheck.declarations } : {}),
+					...(pinned.size > 0 ? { declarations: pinned } : {}),
 				}, (refusal) => record.registry.fail(refusalFailure(refusal)), options.transcriptApi ?? verifiedBoundTranscriptApi());
 				if (!barrier) {
 					record.registry.fail({ status: "native_tool_registry_mismatch", toolRegistryError: "barrier_unavailable" });
 					throw new Error(BOUND_CHILD_REFUSED_TEXT);
 				}
+				// D3: a cancellation revokes provider admission through this barrier; one
+				// that came while the session was being created applies right away.
+				const installed = barrier;
+				record.revokeBarrier = () => installed.revoke();
+				if (record.revoked) installed.revoke();
 				if (shadowCheck && !shadowCheck.ok) {
 					record.registry.fail({ status: "native_tool_registry_mismatch", toolRegistryError: shadowCheck.code });
 					barrier.refuseAlways({ reason: "tool_registry_mismatch", missing: [], extra: [] });
@@ -293,14 +349,17 @@ export function createBoundChildSessionFactory(input: { runId: string; expectedR
 				loadPiCodingAgent: async () => boundPiModule(await loadPi(), { restore: envWindow.restore, onSession }),
 				shutdownTimeoutMs: options.shutdownTimeoutMs ?? BOUND_CHILD_SHUTDOWN_TIMEOUT_MS,
 			});
-			// The pre-work above awaits; a run settled meanwhile gets no session at all.
-			if (record.settled || registry.get(record.runId) !== record) throw refuse(record, { status: "unavailable_context", toolRegistryError: "launch_contract_mismatch" });
+			// The pre-work above awaits; a run settled or revoked meanwhile gets no
+			// session at all. From here on the run's disposal handle covers the creation.
+			if (registry.get(record.runId) !== record || !registry.beginCreate(record.runId)) throw refuse(record, { status: "unavailable_context", toolRegistryError: "launch_contract_mismatch" });
 			let child: ChildSession;
 			try { child = await base.create(boundLaunch(launch, { hooks, processEnv: envWindow.processEnv, onExtensionError })); }
+			catch (error) { registry.failCreate(record.runId); throw error; }
 			// D2 (c): the last safety net; the window normally closed inside open().
 			finally { envWindow.restore(); }
 			if (!bindWrapped || !committed) {
 				record.registry.fail({ status: "native_tool_registry_mismatch", toolRegistryError: "barrier_unavailable" });
+				registry.failCreate(record.runId);
 				await child.dispose();
 				throw new Error(BOUND_CHILD_REFUSED_TEXT);
 			}

@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { types as utilTypes } from "node:util";
-import { resolveMcpDirectToolResolution, type McpDirectToolResolution } from "../runs/shared/mcp-direct-tool-allowlist.ts";
+import { loadMcpConfig, resolveMcpDirectToolResolution, type McpDirectToolResolution } from "../runs/shared/mcp-direct-tool-allowlist.ts";
+import { normalizeMcpToolPrefix } from "../runs/shared/mcp-direct-tool-grant.ts";
 import { canonicalSha256 } from "../shared/canonical-json.ts";
 import type { BoundPackageExtensionProjectionV1 } from "./bound-package-extensions.ts";
 
@@ -54,14 +55,67 @@ function compareCodeUnits(left: string, right: string): number {
 	return left < right ? -1 : left > right ? 1 : 0;
 }
 
-/** Undefined when absent, null when malformed. The value is already a strict JSON clone. */
-export function parseBoundMcpConfigRequest(value: unknown): BoundMcpConfigRequestV1 | undefined | null {
+/**
+ * Repair contract (S3 P2, D2/D4): the cold-safe discovery configuration. The
+ * prepare request carries no ticket; the final preflight/launch request carries
+ * the producer-owned ticket and the snapshot digest the prepare reply returned.
+ */
+export const BOUND_MCP_CONFIG_V2_VERSION = 2 as const;
+export const BOUND_MCP_BRIDGE_IMPLEMENTATION = "bound-direct/v1" as const;
+
+export interface BoundMcpConfigPrepareRequestV2 {
+	version: typeof BOUND_MCP_CONFIG_V2_VERSION;
+	path: string;
+	implementation: typeof BOUND_MCP_BRIDGE_IMPLEMENTATION;
+}
+
+export interface BoundMcpConfigFinalRequestV2 extends BoundMcpConfigPrepareRequestV2 {
+	ticket: string;
+	snapshotDigest: string;
+}
+
+export type BoundMcpConfigRequest = BoundMcpConfigRequestV1 | BoundMcpConfigPrepareRequestV2 | BoundMcpConfigFinalRequestV2;
+
+/** Which v2 shape a request may carry: the prepare request has no ticket, the final one must. */
+export type BoundMcpConfigRequestMode = "prepare" | "final";
+
+const TICKET = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const HEX_64 = /^[0-9a-f]{64}$/u;
+
+function canonicalAbsolutePath(target: unknown): target is string {
+	return typeof target === "string" && path.isAbsolute(target) && path.resolve(target) === target
+		&& !/[\0\r\n]/u.test(target) && Buffer.byteLength(target, "utf8") <= MAX_PATH_BYTES;
+}
+
+export function isBoundMcpConfigV2(value: BoundMcpConfigRequest | undefined): value is BoundMcpConfigPrepareRequestV2 | BoundMcpConfigFinalRequestV2 {
+	return value !== undefined && value.version === BOUND_MCP_CONFIG_V2_VERSION;
+}
+
+export function isBoundMcpConfigFinal(value: BoundMcpConfigRequest | undefined): value is BoundMcpConfigFinalRequestV2 {
+	return isBoundMcpConfigV2(value) && typeof (value as Partial<BoundMcpConfigFinalRequestV2>).ticket === "string";
+}
+
+/**
+ * Undefined when absent, null when malformed. The value is already a strict JSON
+ * clone. A v1 object keeps its exact closed shape; a v2 object is closed per mode
+ * (`mcpConfigV2PrepareRequest` / `mcpConfigV2FinalRequest` of D4).
+ */
+export function parseBoundMcpConfigRequest(value: unknown, mode: BoundMcpConfigRequestMode = "final"): BoundMcpConfigRequest | undefined | null {
 	if (value === undefined) return undefined;
-	if (!plainRecord(value) || Object.keys(value).sort().join(",") !== "path,version" || value.version !== BOUND_MCP_CONFIG_VERSION) return null;
-	const target = value.path;
-	if (typeof target !== "string" || !path.isAbsolute(target) || path.resolve(target) !== target
-		|| /[\0\r\n]/u.test(target) || Buffer.byteLength(target, "utf8") > MAX_PATH_BYTES) return null;
-	return { version: BOUND_MCP_CONFIG_VERSION, path: target };
+	if (!plainRecord(value)) return null;
+	const keys = Object.keys(value).sort().join(",");
+	if (value.version === BOUND_MCP_CONFIG_VERSION) {
+		if (mode !== "final" || keys !== "path,version" || !canonicalAbsolutePath(value.path)) return null;
+		return { version: BOUND_MCP_CONFIG_VERSION, path: value.path };
+	}
+	if (value.version !== BOUND_MCP_CONFIG_V2_VERSION || !canonicalAbsolutePath(value.path) || value.implementation !== BOUND_MCP_BRIDGE_IMPLEMENTATION) return null;
+	if (mode === "prepare") {
+		if (keys !== "implementation,path,version") return null;
+		return { version: BOUND_MCP_CONFIG_V2_VERSION, path: value.path, implementation: BOUND_MCP_BRIDGE_IMPLEMENTATION };
+	}
+	if (keys !== "implementation,path,snapshotDigest,ticket,version") return null;
+	if (typeof value.ticket !== "string" || !TICKET.test(value.ticket) || typeof value.snapshotDigest !== "string" || !HEX_64.test(value.snapshotDigest)) return null;
+	return { version: BOUND_MCP_CONFIG_V2_VERSION, path: value.path, implementation: BOUND_MCP_BRIDGE_IMPLEMENTATION, ticket: value.ticket, snapshotDigest: value.snapshotDigest };
 }
 
 /**
@@ -179,4 +233,86 @@ export function recheckBoundMcpConfig(request: BoundMcpConfigRequestV1 | undefin
 	if (!measured || measured.contentDigest !== contract.contentDigest || measured.effectiveDigest !== contract.effectiveDigest
 		|| measured.servers.join("\0") !== contract.servers.join("\0")) return undefined;
 	return measured.config;
+}
+
+/** The two private pinned entries of pi-mcp-adapter the bridge imports (D2); nothing else. */
+export const BOUND_MCP_PRIVATE_ENTRIES = ["server-manager.ts", "direct-tools.ts"] as const;
+export type BoundMcpPrivateEntry = typeof BOUND_MCP_PRIVATE_ENTRIES[number];
+export const BOUND_MCP_BRIDGE_RUNTIME_PATH = "bound/bound-mcp-direct-bridge.ts" as const;
+
+export interface BoundMcpConfigContractV2 {
+	version: typeof BOUND_MCP_CONFIG_V2_VERSION;
+	extension: typeof BOUND_MCP_CONFIG_EXTENSION;
+	sourcePathDigest: string;
+	contentDigest: string;
+	effectiveDigest: string;
+	servers: string[];
+	implementation: typeof BOUND_MCP_BRIDGE_IMPLEMENTATION;
+	snapshotDigest: string;
+	packageEvidenceDigest: string;
+	entryDigests: Record<BoundMcpPrivateEntry, string>;
+	bridge: { runtimePath: typeof BOUND_MCP_BRIDGE_RUNTIME_PATH; contentDigest: string };
+}
+
+export type BoundMcpConfigContract = BoundMcpConfigContractV1 | BoundMcpConfigContractV2;
+
+export function isBoundMcpConfigContractV2(value: BoundMcpConfigContract | undefined): value is BoundMcpConfigContractV2 {
+	return value !== undefined && value.version === BOUND_MCP_CONFIG_V2_VERSION;
+}
+
+/**
+ * Server keys the bound-direct bridge refuses (D1/D2): an HTTP or OAuth server
+ * reaches ambient credential storage and interactive auth; `trace` would switch
+ * off the metadata budget observer; `pluginDataDir` creates a directory during
+ * discovery. The production 1C servers are stdio servers without any of them.
+ */
+const BRIDGE_REFUSED_SERVER_KEYS = ["url", "auth", "oauth", "bearerToken", "bearerTokenEnv", "headers", "requestHeadersCommand", "httpTransport", "trace", "pluginDataDir"];
+
+/** The v1 closed shape plus the refusals of the bridge; every selected server must be a local stdio or socket server. */
+export function validBoundMcpBridgeConfig(config: unknown): config is Record<string, unknown> {
+	if (!validBoundMcpConfig(config)) return false;
+	const servers = config.mcpServers as Record<string, Record<string, unknown>>;
+	for (const server of Object.values(servers)) {
+		if (BRIDGE_REFUSED_SERVER_KEYS.some((key) => Object.hasOwn(server, key))) return false;
+		const transports = [server.command, server.socket].filter((value) => value !== undefined);
+		if (transports.length !== 1 || !transports.every((value) => typeof value === "string" && value.length > 0)) return false;
+	}
+	return true;
+}
+
+/**
+ * `server/tool` selectors only (D2): no whole-server selector, no wildcard, no
+ * duplicate; every named server is configured and not disabled.
+ */
+export function explicitBoundMcpSelectors(selectors: readonly string[], config: Record<string, unknown>): string[] | undefined {
+	const servers = config.mcpServers as Record<string, Record<string, unknown>>;
+	const seen = new Set<string>();
+	for (const selector of selectors) {
+		if (typeof selector !== "string" || seen.has(selector)) return undefined;
+		const parts = selector.split("/");
+		if (parts.length !== 2 || !SERVER_NAME.test(parts[0]!) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parts[1]!)) return undefined;
+		const server = Object.hasOwn(servers, parts[0]!) ? servers[parts[0]!] : undefined;
+		if (!server || server.disabled === true || server.enabled === false) return undefined;
+		seen.add(selector);
+	}
+	return seen.size > 0 ? [...seen] : undefined;
+}
+
+/**
+ * D2: the definitions upstream discovery finds in the leaf cwd must equal the
+ * attested ones for every selected server, and so must the tool prefix. No
+ * metadata cache is read here.
+ */
+export function boundMcpDefinitionsAgree(selectors: readonly string[], cwd: string, config: Record<string, unknown>): boolean {
+	try {
+		const discovered = loadMcpConfig(cwd);
+		const attested = config.mcpServers as Record<string, unknown>;
+		const settings = config.settings as { toolPrefix?: unknown } | undefined;
+		if (normalizeMcpToolPrefix(discovered.settings?.toolPrefix) !== normalizeMcpToolPrefix(settings?.toolPrefix)) return false;
+		for (const server of new Set(selectors.map((selector) => selector.split("/")[0]!))) {
+			const found = Object.hasOwn(discovered.mcpServers, server) ? discovered.mcpServers[server] : undefined;
+			if (!found || canonicalSha256(found) !== canonicalSha256(attested[server])) return false;
+		}
+		return true;
+	} catch { return false; }
 }

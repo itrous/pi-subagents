@@ -37,6 +37,7 @@ import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import type { ChildSessionLaunch, ChildSessionStorage } from "./child-session.ts";
 import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
 import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import { boundMcpSelectionsForRun } from "../../bound/bound-run-registry.ts";
 
 /** Environment variable pi-mcp-adapter reads for the tools a child may expose. */
 export const MCP_DIRECT_TOOLS_ENV = "MCP_DIRECT_TOOLS";
@@ -209,6 +210,8 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		agentName: input.childAgentName,
 		permissionRules: input.permissionRules,
 		runtimeSnapshotHost: input.runtimeSnapshotHost,
+		// Bound seam (S3 P2): a bound run resolves MCP names from its own snapshot.
+		boundMcpSelections: input.runId ? boundMcpSelectionsForRun(input.runId) : undefined,
 	});
 	toolPlan.capabilityCeiling = intersectSubagentCapabilityCeilings(toolPlan.capabilityCeiling, agentCapabilityCeiling);
 	if (toolPlan.capabilityAudit && toolPlan.capabilityCeiling) {

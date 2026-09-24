@@ -127,6 +127,13 @@ export interface BoundPackageLoadOptions {
 	 * discovers no configuration file at all.
 	 */
 	mcpConfig?: { ref: string; config: Record<string, unknown> };
+	/**
+	 * S3 P2 repair (`bound-direct/v1`): the one attested record with this ref is
+	 * consumed once and served by the measured bridge factory instead of the
+	 * adapter's default export or `createMcpAdapter`; the entry bytes are still
+	 * re-measured, and nothing of that entry is imported here.
+	 */
+	mcpBridge?: { ref: string; factory: (pi: ExtensionAPI) => unknown };
 }
 
 /** Verify, then import every attested factory in execution order. Nothing is invoked yet. */
@@ -135,6 +142,7 @@ export async function loadBoundPackageFactories(attestations: readonly BoundPack
 > {
 	const verified = verifyBoundPackageAttestations(attestations);
 	if (!verified.ok) return verified;
+	if (options.mcpBridge && (options.mcpConfig || attestations.filter((attestation) => attestation.ref === options.mcpBridge!.ref).length !== 1)) return { ok: false, code: "package_load_error" };
 	const importer = createBoundPackageImporter(verified.roots);
 	const factories: BoundLoadedPackageFactory[] = [];
 	for (const attestation of attestations) {
@@ -142,6 +150,10 @@ export async function loadBoundPackageFactories(attestations: readonly BoundPack
 		// above takes seconds on a real closure.
 		if (!entryMatches(attestation)) return { ok: false, code: "package_bytes_drift" };
 		let factory: unknown;
+		if (options.mcpBridge && attestation.ref === options.mcpBridge.ref) {
+			factories.push({ path: attestation.path, contentDigest: attestation.contentDigest, factory: options.mcpBridge.factory, allowInputRegistrationNoop: false });
+			continue;
+		}
 		try {
 			if (options.mcpConfig && attestation.ref === options.mcpConfig.ref) {
 				const namespace = await importer.importNamespace(attestation.path) as { createMcpAdapter?: unknown } | undefined;

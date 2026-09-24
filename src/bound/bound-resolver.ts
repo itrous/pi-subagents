@@ -17,14 +17,23 @@ import { resolveChildMaxSubagentDepth, type ExtensionConfig } from "../shared/ty
 import { resolveBoundAgent, type BoundAgentDiscoveryDeps, type BoundSkillEvidenceV1 } from "./bound-agent-discovery.ts";
 import { projectBoundBindings, type BoundBindingsProjectionV1 } from "./bound-bindings.ts";
 import { resolveBoundPackageExtensions, type BoundPackageEvidenceCache, type BoundPackageExtensionProjectionV1, type BoundResolvedPackageExtensions } from "./bound-package-extensions.ts";
-import { resolveBoundMcpConfig, type BoundMcpConfigContractV1 } from "./bound-mcp-config.ts";
-import { boundRequestDigest, type BoundRequestV2 } from "./bound-request.ts";
+import { isBoundMcpConfigFinal, resolveBoundMcpConfig, type BoundMcpConfigContract, type BoundMcpConfigContractV2 } from "./bound-mcp-config.ts";
+import type { BoundMcpSelectionsHandle } from "./bound-mcp-selections.ts";
+import { boundRequestDigest, type BoundRequestV2, type BoundSafetyV1 } from "./bound-request.ts";
 import { resolveBoundToolShadowing, type BoundToolShadowingContractV1 } from "./bound-tool-shadowing.ts";
 import { expectedToolRegistryProjection, SUPPORTED_BOUND_MODEL_APIS, type RuntimeBuiltinProjectionV1, type ToolRegistryProjectionV1 } from "./bound-tool-registry-projection.ts";
 import type { BoundLayerManifestV2 } from "./bound-layer-manifest.ts";
 import type { PiRuntimeAttestationV1 } from "./pi-runtime-attestation.ts";
 
 export const BOUND_LAUNCH_CONTRACT_VERSION = 2 as const;
+
+/**
+ * `cancellationPolicy` of the repair contract (D3/D4): the port's hard timer,
+ * the bound child's shutdown wait and the delivery grace the consumer adds.
+ * Fixed values; the consumer checks them exactly.
+ */
+export const BOUND_CANCELLATION_POLICY = Object.freeze({ version: 1 as const, hardTimerMs: 3_000, shutdownTimeoutMs: 2_000, deliveryGraceMs: 1_000 });
+export type BoundCancellationPolicyV1 = { version: 1; hardTimerMs: number; shutdownTimeoutMs: number; deliveryGraceMs: number };
 
 interface SessionManagerLike {
 	getSessionFile(): string | null | undefined;
@@ -52,8 +61,12 @@ export interface BoundLaunchContractV2 {
 	packageExtensionsDigest: string;
 	tools: { effectiveAllowlist: string[]; requiredChildTools: string[]; disableAmbientExtensions: boolean; capabilityCeiling?: ResolvedSubagentCapabilityCeiling };
 	mcpDirectTools: string[];
-	/** Present only when the request asked for an attested MCP configuration (subplan A1R.6, sub-stage 4). */
-	mcpConfig?: BoundMcpConfigContractV1;
+	/** Present only when the request asked for an attested MCP configuration (A1R.6 v1, or the S3 P2 v2 snapshot). */
+	mcpConfig?: BoundMcpConfigContract;
+	/** S3 P2 repair contract only: the request's `safety`, repeated. */
+	safety?: BoundSafetyV1;
+	/** S3 P2 repair contract only: the cancellation budgets (D3). */
+	cancellationPolicy?: BoundCancellationPolicyV1;
 	toolRegistry: {
 		modelApi: string;
 		piRuntime: PiRuntimeAttestationV1;
@@ -83,6 +96,18 @@ export type BoundResolutionErrorCode =
 	| "invalid_cwd" | "host_required" | "unverified_source" | "missing_agent" | "ambiguous_agent"
 	| "missing_skill" | "unsupported_mode" | "unavailable_model" | "restricted_agent";
 
+/**
+ * What `prepareMcp` needs from the resolution before it may connect anything
+ * (D2): every check up to the tool plan passed; nothing was created.
+ */
+export interface BoundMcpPreparationPlan {
+	agent: AgentConfig;
+	requestCwd: string;
+	activeSessionDigest: string;
+	selectors: string[];
+	packageExtensions: BoundResolvedPackageExtensions;
+}
+
 export type ResolveBoundLaunchContractResult =
 	| { ok: true; contract: BoundLaunchContractV2; requestDigest: string; launchContractDigest: string; activeSessionDigest: string; canonicalCwd: string; agent: AgentConfig; packageExtensionPaths: string[]; packageAttestations: BoundResolvedPackageExtensions["attestations"] }
 	| { ok: false; code: BoundResolutionErrorCode };
@@ -103,6 +128,11 @@ export interface ResolveBoundLaunchContractInput {
 	expandTilde?: (value: string) => string;
 	discoveryDeps?: BoundAgentDiscoveryDeps;
 	packageEvidenceCache?: BoundPackageEvidenceCache;
+	/**
+	 * S3 P2: the producer-owned snapshot of a final v2 MCP request, verified by the
+	 * preparation service against the ticket. Without it a v2 request refuses.
+	 */
+	mcpSnapshot?: { selections: BoundMcpSelectionsHandle; contract: BoundMcpConfigContractV2 };
 	runtimePolicy: {
 		foregroundTimeoutMs: number;
 		toolBudget?: ExtensionConfig["toolBudget"];
@@ -168,6 +198,18 @@ function absentPath(target: string): boolean {
  * subscription (invariant I3.4).
  */
 export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInput): ResolveBoundLaunchContractResult {
+	return resolveBound(input, false) as ResolveBoundLaunchContractResult;
+}
+
+/**
+ * `prepareMcp` (D2): the same resolution up to, and excluding, the tool plan;
+ * the request is the prepare request (v2 configuration without a ticket).
+ */
+export function resolveBoundMcpPreparationPlan(input: ResolveBoundLaunchContractInput): { ok: true; plan: BoundMcpPreparationPlan } | { ok: false; code: BoundResolutionErrorCode } {
+	return resolveBound(input, true) as { ok: true; plan: BoundMcpPreparationPlan } | { ok: false; code: BoundResolutionErrorCode };
+}
+
+function resolveBound(input: ResolveBoundLaunchContractInput, prepareOnly: boolean): ResolveBoundLaunchContractResult | { ok: true; plan: BoundMcpPreparationPlan } {
 	const request = input.request;
 	if (request.targetServerInstanceId !== input.serverInstanceId || !input.serverInstanceId.trim()
 		|| !/^[0-9a-f]{64}$/u.test(input.sourceIdentityDigest)) return failure("unverified_source");
@@ -258,6 +300,25 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		|| (packageProvidedTools.length > 0 && (agent.source !== "package" || packageExtensions.paths.length === 0
 			|| packageExtensions.paths.length !== packageExtensions.projection.length))) return failure("unsupported_mode");
 
+	// S3 P2 (D1): the repair contract carries MCP tools only through the v2
+	// snapshot; a v1 configuration or none is not the cold-safe contract.
+	const mcpSelectors = agent.mcpDirectTools ?? [];
+	if (prepareOnly) {
+		if (!request.safety || mcpSelectors.length === 0 || !request.mcpConfig || request.mcpConfig.version !== 2) return failure("unsupported_mode");
+		return {
+			ok: true,
+			plan: {
+				agent, requestCwd,
+				activeSessionDigest: canonicalSha256({ currentSessionId, piSessionId }),
+				selectors: [...mcpSelectors],
+				packageExtensions,
+			},
+		};
+	}
+	if (request.safety && mcpSelectors.length > 0 && !isBoundMcpConfigFinal(request.mcpConfig)) return failure("unsupported_mode");
+	if (isBoundMcpConfigFinal(request.mcpConfig) && (!input.mcpSnapshot || mcpSelectors.length === 0)) return failure("unsupported_mode");
+	const snapshot = isBoundMcpConfigFinal(request.mcpConfig) ? input.mcpSnapshot : undefined;
+
 	const boundTools = skills.length > 0 && !explicitAgentTools.includes("read") ? ["read", ...explicitAgentTools] : explicitAgentTools;
 	let toolPlan;
 	try {
@@ -273,6 +334,7 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 			structuredOutput: request.result.kind === "structured",
 			...(input.capabilityCeiling ? { capabilityCeiling: input.capabilityCeiling } : {}),
 			agentName: agent.name,
+			...(snapshot ? { boundMcpSelections: snapshot.selections } : {}),
 		});
 	} catch { return failure("restricted_agent"); }
 	if (packageProvidedTools.some((tool) => !toolPlan.effectiveToolAllowlist.includes(tool) || !toolPlan.requiredChildTools.includes(tool))) return failure("restricted_agent");
@@ -300,13 +362,17 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		? resolveBoundToolShadowing(request.toolShadowing, { packageExtensions: packageExtensions.projection, runtimeBuiltins: input.runtimeBuiltins.names, effectiveAllowlist: toolPlan.effectiveToolAllowlist })
 		: undefined;
 	if (request.toolShadowing && (!shadowing || agent.source !== "package")) return failure("unsupported_mode");
-	const mcpConfig = request.mcpConfig
-		? resolveBoundMcpConfig(request.mcpConfig, {
-			packageExtensions: packageExtensions.projection, mcpDirectTools: toolPlan.effectiveMcpTools,
-			selectors: agent.mcpDirectTools ?? [], cwd: requestCwd,
-		})
-		: undefined;
+	const mcpConfig: BoundMcpConfigContract | undefined = snapshot
+		? snapshot.contract
+		: request.mcpConfig && request.mcpConfig.version === 1
+			? resolveBoundMcpConfig(request.mcpConfig, {
+				packageExtensions: packageExtensions.projection, mcpDirectTools: toolPlan.effectiveMcpTools,
+				selectors: agent.mcpDirectTools ?? [], cwd: requestCwd,
+			})
+			: undefined;
 	if (request.mcpConfig && !mcpConfig) return failure("unsupported_mode");
+	const safety = request.safety ? { version: request.safety.version, cancellationProof: request.safety.cancellationProof } : undefined;
+	const cancellationPolicy = safety ? { ...BOUND_CANCELLATION_POLICY } : undefined;
 
 	const toolRegistryProjection = expectedToolRegistryProjection(toolPlan.effectiveToolAllowlist, toolPlan.internalTools);
 	if (!toolRegistryProjection) return failure("unsupported_mode");
@@ -378,6 +444,7 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		...(toolBudget ? { toolBudget } : {}),
 		...(shadowing ? { toolShadowing: shadowing } : {}),
 		...(mcpConfig ? { mcpConfig } : {}),
+		...(safety ? { safety, cancellationPolicy } : {}),
 	});
 	const base: Omit<BoundLaunchContractV2, "digest"> = {
 		version: BOUND_LAUNCH_CONTRACT_VERSION,
@@ -401,6 +468,7 @@ export function resolveBoundLaunchContract(input: ResolveBoundLaunchContractInpu
 		tools,
 		mcpDirectTools: toolPlan.effectiveMcpTools,
 		...(mcpConfig ? { mcpConfig } : {}),
+		...(safety ? { safety, cancellationPolicy } : {}),
 		toolRegistry,
 		roots,
 		policy,

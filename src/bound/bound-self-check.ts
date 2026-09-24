@@ -102,6 +102,17 @@ export const BOUND_LEAF_FEATURE_CAPABILITIES = Object.freeze({
 });
 
 /**
+ * S3 P2 repair capabilities (D1): the cold-safe MCP discovery (`prepareMcp`,
+ * `releaseMcp`, `mcpConfig.version=2`) and the cancellation proof. Advertised only
+ * beside the leaf itself and only when the port issues proofs from its own
+ * disposal lifecycle; `boundMcpConfig:1` stays for the legacy v1 configuration.
+ */
+export const BOUND_REPAIR_CAPABILITIES = Object.freeze({
+	boundMcpDiscovery: Object.freeze({ version: 1 }),
+	boundCancellationProof: Object.freeze({ version: 1 }),
+});
+
+/**
  * `boundForegroundLeaf: { version: 2 }` and the feature keys only when every
  * condition holds: a verified source identity, a passed self-check (including
  * the transcript checks), a connected execution port, and both proof
@@ -119,6 +130,9 @@ export function boundForegroundLeafCapability(input: {
 		? {
 			boundForegroundLeaf: { version: 2 },
 			...Object.fromEntries(Object.entries(BOUND_LEAF_FEATURE_CAPABILITIES).map(([key, value]) => [key, { ...value }])),
+			...(input.proofs?.cancellationProof === true
+				? Object.fromEntries(Object.entries(BOUND_REPAIR_CAPABILITIES).map(([key, value]) => [key, { ...value }]))
+				: {}),
 		}
 		: {};
 }

@@ -3,6 +3,7 @@ import type { BoundRunRegistryV1 } from "./bound-run-registry.ts";
 
 export const BOUND_RUN_HOOK_NAME = "pi-subagents:bound-run";
 export const BOUND_DENIED_TOOL_REASON = "pi-subagents bound leaf: the tool is not declared by the launch contract.";
+export const BOUND_REVOKED_TOOL_REASON = "pi-subagents bound leaf: the run was cancelled; no further tool call is admitted.";
 
 interface HookSessionContext {
 	sessionManager: { getSessionId(): string | null | undefined };
@@ -28,8 +29,11 @@ export function createBoundRunHook(input: {
 		factory: (pi) => {
 			let publishedSessionId: string | undefined;
 			pi.on("tool_call", (event) => {
+				const record = input.registry.get(input.runId);
+				// D3: after a cancellation no tool is admitted; this is the cut-off, not a contract denial.
+				if (!record || record.revoked) return { block: true, reason: BOUND_REVOKED_TOOL_REASON };
 				if (allowed.has(event.toolName)) return undefined;
-				input.registry.get(input.runId)?.denials.record(event.toolName);
+				record.denials.record(event.toolName);
 				return { block: true, reason: BOUND_DENIED_TOOL_REASON };
 			});
 			pi.on("session_start", (_event, ctx) => {

@@ -169,12 +169,16 @@ export function registerBoundControlPlane(options: RegisterBoundControlPlaneOpti
 				reply({ version: BOUND_CHANNEL_VERSION, requestId: request.requestId, method: "ping", success: true, data: ping() });
 				return;
 			}
-			const outcome = await service.preflight(request.params);
+			const outcome = request.method === "prepareMcp"
+				? await service.prepareMcp(request.params)
+				: request.method === "releaseMcp"
+					? await service.releaseMcp(request.params)
+					: await service.preflight(request.params);
 			// A foreign target belongs to another responder in this process.
 			if (!outcome || stopped) return;
 			reply(outcome.ok
-				? { version: BOUND_CHANNEL_VERSION, requestId: request.requestId, method: "preflight", success: true, data: outcome.data }
-				: { version: BOUND_CHANNEL_VERSION, requestId: request.requestId, method: "preflight", success: false, error: outcome.error });
+				? { version: BOUND_CHANNEL_VERSION, requestId: request.requestId, method: request.method, success: true, data: outcome.data }
+				: { version: BOUND_CHANNEL_VERSION, requestId: request.requestId, method: request.method, success: false, error: outcome.error });
 		})().catch(() => {});
 	});
 

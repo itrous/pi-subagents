@@ -27,6 +27,11 @@ export interface BoundExecutionPort {
 		launch: BoundAuthorizedLaunch;
 		signal: AbortSignal;
 		onUpdate: (update: Omit<BoundExecutionUpdate, keyof BoundAttemptTuple>) => void;
+		/**
+		 * The attempt's terminal/cancel latch (D3): true when the outcome may be
+		 * committed; false when a cancellation latched first.
+		 */
+		commit?: () => boolean;
 	}): Promise<{ status: string } & Record<string, unknown>>;
 }
 
@@ -67,8 +72,8 @@ export function registerBoundLaunchBridge(options: BoundLaunchBridgeOptions): Bo
 	// Тройки, терминал которых опубликован в обход координатора (ёмкость исчерпана,
 	// записи нет): повтор того же конверта не должен дать второй терминал.
 	const sunkByCapacity = new Set<string>();
-	const rejectWithTerminal = (tuple: BoundAttemptTuple, code: string): void => {
-		const value = terminal(tuple, code);
+	const rejectWithTerminal = (tuple: BoundAttemptTuple, code: string, extra: Record<string, unknown> = {}): void => {
+		const value = terminal(tuple, code, extra);
 		if (options.coordinator.commitRejected(tuple, options.runtimeId, value) !== "capacity") return;
 		const key = `${tuple.requestId}\u0000${tuple.ownerRunId}\u0000${tuple.nodeId}`;
 		if (sunkByCapacity.has(key)) return;
@@ -88,23 +93,59 @@ export function registerBoundLaunchBridge(options: BoundLaunchBridgeOptions): Bo
 			rejectWithTerminal(tuple, admitted.code === "invalid_request" ? "invalid_request" : "unavailable_context");
 			return;
 		}
+		// From here to `started` everything is synchronous: no cancel or release can
+		// interleave between the checks below and the admission they guard.
+		const launch = admitted.launch;
+		const closeMcp = (): void => { void launch.mcp?.close().catch(() => "failed" as const); };
 		// Тройка конверта должна совпадать с тройкой подписанного запроса: иначе
 		// отчётность и отмена шли бы по одной тройке, а доказательство — по другой,
 		// и попытка стала бы неотменяемой.
-		const signed = admitted.launch.request;
+		const signed = launch.request;
 		if (signed.requestId !== tuple.requestId || signed.ownerRunId !== tuple.ownerRunId || signed.nodeId !== tuple.nodeId) {
 			rejectWithTerminal(tuple, "invalid_request");
 			return;
 		}
-		const prospectiveRunId = admitted.launch.request.prospectiveRunId;
+		// D3: an authenticated cancel that arrived before admission wins here, before
+		// any identity, attempt or `started`. The tuple is tombstoned by its one
+		// terminal, so a delayed launch with the same tuple or ticket never starts.
+		const pendingProof = options.service.verifyPendingCancellation(tuple, envelope.binding);
+		if (pendingProof && pending.consume(tuple, pendingProof) === "cancelled") {
+			const elapsedMs = pending.elapsedSinceLastConsumed();
+			const repair = launch.contract.safety !== undefined;
+			rejectWithTerminal(tuple, "cancelled", {
+				launchContractDigest: launch.contract.digest,
+				...(repair ? {
+					cancellationProof: {
+						version: 1, phase: "notAdmitted",
+						requestId: tuple.requestId, ownerRunId: tuple.ownerRunId, nodeId: tuple.nodeId,
+						prospectiveRunId: launch.request.prospectiveRunId, serverInstanceId,
+						launchContractDigest: launch.contract.digest,
+						session: "notCreated", shutdown: "notStarted", execution: "notStarted",
+						revoked: true, collectorsSealed: false, elapsedMs,
+					},
+				} : { transportIncomplete: true }),
+			});
+			// The preparation was never owned by a run: its ticket stays with the
+			// consumer's release (or its TTL), which closes it.
+			return;
+		}
+		const prospectiveRunId = launch.request.prospectiveRunId;
 		const reservation = identities.reserve(serverInstanceId, prospectiveRunId);
 		if (reservation !== "reserved") {
 			rejectWithTerminal(tuple, reservation === "duplicate" ? "duplicate_node" : "unavailable_context");
 			return;
 		}
+		// D2: the ticket's ownership moves into this admission exactly once; a release,
+		// TTL or generation stop that won earlier refuses it.
+		if (!options.service.claimMcp(launch)) {
+			identities.release(serverInstanceId, prospectiveRunId);
+			rejectWithTerminal(tuple, "unavailable_context");
+			return;
+		}
 		const attempt = options.coordinator.admit(tuple, options.runtimeId, bindingKey);
 		if (!attempt.accepted) {
 			identities.release(serverInstanceId, prospectiveRunId);
+			closeMcp();
 			if (attempt.reason === "duplicate_node") {
 				rejectWithTerminal(tuple, "duplicate_node");
 			} else if (attempt.reason === "capacity") {
@@ -114,9 +155,6 @@ export function registerBoundLaunchBridge(options: BoundLaunchBridgeOptions): Bo
 			return;
 		}
 		identities.commit(serverInstanceId, prospectiveRunId);
-		// A cancel that arrived before admission is consumed exactly once.
-		const proof = options.service.verifyPendingCancellation(tuple, envelope.binding);
-		if (proof && pending.consume(tuple, proof) === "cancelled") options.coordinator.cancel(tuple.requestId, tuple.ownerRunId, tuple.nodeId, bindingKey);
 		options.events.emit(BOUND_STARTED_EVENT, { version: 2, ...tuple });
 		const onUpdate = (update: Record<string, unknown>): void => {
 			if (!attempt.isRunning()) return;
@@ -124,11 +162,12 @@ export function registerBoundLaunchBridge(options: BoundLaunchBridgeOptions): Bo
 		};
 		try {
 			const outcome = options.executionPort
-				? await options.executionPort.run({ launch: admitted.launch, signal: attempt.signal, onUpdate })
-				: { status: "unavailable_context" };
+				? await options.executionPort.run({ launch, signal: attempt.signal, onUpdate, commit: attempt.commit })
+				: (closeMcp(), { status: "unavailable_context" });
 			const reserved = new Set(["status", "requestId", "ownerRunId", "nodeId"]);
 			attempt.settle(terminal(tuple, outcome.status, Object.fromEntries(Object.entries(outcome).filter(([key]) => !reserved.has(key)))));
 		} catch {
+			closeMcp();
 			attempt.settle(terminal(tuple, "failed"));
 		}
 	};

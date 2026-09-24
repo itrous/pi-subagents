@@ -36,6 +36,11 @@ export interface BoundBarrierExpectation {
 export interface BoundStreamBarrier {
 	/** Every later call is refused, whatever its tools and model are. */
 	refuseAlways(refusal: BoundBarrierRefusal): void;
+	/**
+	 * Cancellation (D3): every later provider call is refused without recording a
+	 * registry failure; a revoked run's evidence is not rewritten by its own cut-off.
+	 */
+	revoke(): void;
 }
 
 interface BarrierAgent {
@@ -106,11 +111,13 @@ export function installBoundStreamBarrier(
 	const required = expectation.declarations ? new Map(expectation.declarations) : undefined;
 	let pinned: Map<string, string> | undefined;
 	let forced: BoundBarrierRefusal | undefined;
+	let revoked = false;
 	const refuse = (refusal: BoundBarrierRefusal): never => {
 		onRefusal({ reason: refusal.reason, missing: [...refusal.missing], extra: [...refusal.extra] });
 		throw new Error(BOUND_BARRIER_ERROR_TEXT);
 	};
 	const barrier: StreamFn = (model, context, options) => {
+		if (revoked) throw new Error(BOUND_BARRIER_ERROR_TEXT);
 		if (forced) return refuse(forced);
 		const declared = boundTranscriptTools(context, transcript);
 		if (!declared.ok) return refuse({ reason: "context_unsupported", missing: [], extra: [] });
@@ -132,6 +139,9 @@ export function installBoundStreamBarrier(
 	return {
 		refuseAlways(refusal) {
 			forced ??= { reason: refusal.reason, missing: [...refusal.missing], extra: [...refusal.extra] };
+		},
+		revoke() {
+			revoked = true;
 		},
 	};
 }

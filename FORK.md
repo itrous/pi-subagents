@@ -79,6 +79,50 @@ checklist: `LANDING-A1R-plan-review.md`. The published A1 pin
 `c32663ec7e9f4c3c35456552c1d262eeeb845a60` on `main` remains the only build
 OneCPI may install until stage A1R.7.
 
+## S3 P2 repair contract (opt-in)
+
+Plan: onecpi `docs/plans/bound-v2-s3-native-repair.md` @ `74dea4ef` (D1–D4, R1–R12);
+producer record: `LANDING-S3-P2-producer.md`. A request with
+`safety: { version: 1, cancellationProof: 1 }` negotiates the repair contract; a
+request without it keeps its legacy v2 request and contract bytes and gains no new
+guarantee; like every cancelled run, its cancelled terminal now keeps the measured
+evidence and is marked `transportIncomplete: true` instead of the bare four-field form.
+
+- **Cold MCP discovery.** `prepareMcp` (a method on the same request/reply bus;
+  ping `methods` is exactly `ping, preflight, prepareMcp, releaseMcp`) runs every
+  check that needs no connection, then a fresh bounded live discovery of the
+  selected servers only (10 s, 2 s close, 1 MiB, 1024 tools, 32 list pages, 32 live
+  preparations per generation) through exactly two private entries of the pinned
+  `pi-mcp-adapter` 2.26.1 (`server-manager.ts`, `direct-tools.ts`, exact bytes),
+  imported through the attested-roots importer. It never reads or writes the
+  adapter's `mcp-cache.json`, `process.cwd()`, argv or env. The reply is an
+  immutable snapshot, its digest and a random 30 s ticket; `releaseMcp` answers
+  `released`/`absent`/`admitted`. Preflight stays side-effect free: it rechecks the
+  ticket, the configuration bytes and the adapter evidence, and resolves MCP names
+  from the snapshot (`contract.mcpConfig.version = 2`). Admission moves the ticket's
+  ownership into the run exactly once; the child gets the measured direct tools
+  from the bridge (`bound/bound-mcp-direct-bridge.ts`) instead of the adapter's
+  default export, over the prepared connections; a replaced connection or
+  `tools/list_changed` invalidates the run instead of reconnecting.
+- **Cancellation proof.** The coordinator no longer rewrites an aborted attempt's
+  terminal to a bare `cancelled`; the port's terminal/cancel latch decides once. A
+  cancel revokes bindings, provider admission (barrier), tool admission and MCP
+  calls synchronously, then the port awaits the disposal of the one child session
+  (hard timer 3 s, shutdown 2 s) and publishes `terminal.cancellationProof`
+  (`phase`, `session`, `shutdown`, `execution`, `revoked`, `collectorsSealed`,
+  `elapsedMs`) beside the full measured evidence. A cancel that won before
+  admission yields a `notAdmitted` proof and no `started`. Anything unproven is
+  `transportIncomplete: true`. `shutdown: "deadline"` means the hooks did not
+  finish in time, never that they did; a signal-ignoring tool is not stopped.
+- **Globals.** The coordinator (marker 3), run registry (marker 2) and pending
+  cancellation registry (marker 4) refuse an older build's global in the same
+  process: switching P→P2 is a new process after drain.
+- **Seams.** `child-tool-plan.ts` takes a producer-issued snapshot handle for the
+  two bound tool-plan resolutions (a foreign handle throws); `child-launch.ts`
+  passes the handle of a live bound run; `child-session.ts` records the observed
+  disposal outcome; `mcp-direct-tool-allowlist.ts` exports `loadMcpConfig` so the
+  bound layer can compare discovered and attested definitions without the cache.
+
 ## Upstream bases
 
 - Original A1 delta base: upstream release `v0.46.0`, peeled commit
@@ -94,7 +138,7 @@ OneCPI may install until stage A1R.7.
 
 Every upstream file is taken from the A1R.1 base verbatim except three hook
 points: `git diff --name-only --diff-filter=MD <base> HEAD -- src` reports exactly
-seven paths —
+eleven paths (seven before S3 P2) —
 - T1 `src/extension/index.ts`: the import and the single
   `registerBoundControlPlane({...})` call right after the RPC bridge, which passes
   `executeDelegated`;
@@ -107,7 +151,10 @@ seven paths —
   `status`/`steer`/`interrupt`/`resume` answer a bound run exactly like an unknown
   id;
 - the four carries `src/agents/agent-memory.ts`, `src/runs/shared/long-running-guard.ts`,
-  `src/runs/shared/permissions.ts`, `src/shared/jsonl-writer.ts`.
+  `src/runs/shared/permissions.ts`, `src/shared/jsonl-writer.ts`;
+- the four S3 P2 seams `src/runs/shared/child-tool-plan.ts`,
+  `src/runs/shared/child-launch.ts`, `src/runs/shared/child-session.ts`,
+  `src/runs/shared/mcp-direct-tool-allowlist.ts` (see the repair section above).
 
 The accompanying upstream tests are the same four files as before; no upstream
 test is edited.
@@ -220,7 +267,7 @@ refined through `toolRegistryError`:
 | `shadowing_incomplete` | `native_tool_registry_mismatch` | the attested owner did not register every granted replacement |
 | `shadowing_mismatch` | `native_tool_registry_mismatch` | an active definition of a granted name is the builtin or not the owner's |
 | `shadowing_unverified` | `native_tool_registry_mismatch` | a run under a shadowing contract completed without replacement evidence |
-| `mcp_config_drift` | `unavailable_context` | the attested MCP configuration's path, bytes or effective config changed after preflight |
+| `mcp_config_drift` | `unavailable_context` | the attested MCP configuration's path, bytes or effective config changed after preflight; for v2 also the snapshot, ticket or adapter entries |
 
 A registry that differs from the contract gives `native_tool_registry_mismatch`
 with `toolsMissing`/`toolsExtra` and no `toolRegistryError`.
@@ -278,7 +325,7 @@ node --experimental-strip-types --test test/unit/source-identity.test.ts
 # their tests are skipped and prove nothing about the real Pi fields.
 PI_SUBAGENTS_NATIVE_SDK=<sdk> PI_SUBAGENTS_MCP_OWNER=<owner> LC_ALL=C npm run test:unit
 PI_SUBAGENTS_NATIVE_SDK=<sdk> PI_SUBAGENTS_MCP_OWNER=<owner> LC_ALL=C npm run test:integration -- --test-concurrency=2
-# Fork edit surface: exactly seven upstream src files (T1-T3 plus four carries),
+# Fork edit surface: exactly eleven upstream src files (T1-T3, four carries, four S3 P2 seams),
 # and every added src path lives in src/bound/.
 git diff --name-only --diff-filter=MD 8bd275bba0dc13273eff366e348378d41ad5535e -- src
 git diff --name-only --diff-filter=A 8bd275bba0dc13273eff366e348378d41ad5535e -- src

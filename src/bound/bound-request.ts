@@ -3,7 +3,7 @@ import { types as utilTypes } from "node:util";
 import { canonicalSha256 } from "../shared/canonical-json.ts";
 import { cloneJsonWithinByteLimit } from "./bound-json.ts";
 import { BOUND_BINDING_NAMES, parseBoundBindings, type BoundBindingsV1 } from "./bound-bindings.ts";
-import { parseBoundMcpConfigRequest, type BoundMcpConfigRequestV1 } from "./bound-mcp-config.ts";
+import { BOUND_MCP_BRIDGE_IMPLEMENTATION, BOUND_MCP_CONFIG_V2_VERSION, isBoundMcpConfigV2, parseBoundMcpConfigRequest, type BoundMcpConfigRequest, type BoundMcpConfigRequestMode } from "./bound-mcp-config.ts";
 import { parseBoundToolShadowingRequest, type BoundToolShadowingRequestV1 } from "./bound-tool-shadowing.ts";
 import type {
 	SubagentDelegationJsonSchemaObject,
@@ -22,6 +22,8 @@ const FIELDS = new Set([
 	"bindings", "artifacts", "result",
 	// Subplan A1R.6: optional, and unknown to a producer without these features.
 	"toolShadowing", "mcpConfig",
+	// S3 P2 repair contract (D1): opt-in; absent keeps the legacy v2 bytes.
+	"safety",
 ]);
 const MAX_SCHEMA_BYTES = 64 * 1024;
 const MAX_REQUEST_CLONE_BYTES = 8 * 1024 * 1024;
@@ -49,7 +51,24 @@ export interface BoundRequestV2 {
 	artifacts: boolean;
 	result: { kind: "text" } | { kind: "structured"; schema: SubagentDelegationJsonSchemaObject };
 	toolShadowing?: BoundToolShadowingRequestV1;
-	mcpConfig?: BoundMcpConfigRequestV1;
+	mcpConfig?: BoundMcpConfigRequest;
+	/** S3 P2 repair contract (D1): cold MCP discovery and the cancellation proof, or nothing new. */
+	safety?: BoundSafetyV1;
+}
+
+export const BOUND_SAFETY_VERSION = 1 as const;
+
+/** `safety` of D4: the negotiated repair contract. */
+export interface BoundSafetyV1 {
+	version: typeof BOUND_SAFETY_VERSION;
+	cancellationProof: 1;
+}
+
+function parseSafety(value: unknown): BoundSafetyV1 | undefined | null {
+	if (value === undefined) return undefined;
+	if (!plainRecord(value) || Object.keys(value).sort().join(",") !== "cancellationProof,version"
+		|| value.version !== BOUND_SAFETY_VERSION || value.cancellationProof !== 1) return null;
+	return { version: BOUND_SAFETY_VERSION, cancellationProof: 1 };
 }
 
 export type BoundRequestParseResult = { ok: true; request: BoundRequestV2 } | { ok: false; code: "invalid_request" };
@@ -125,8 +144,12 @@ function omitOptionalUndefined(value: unknown, allowed: ReadonlySet<string>): un
 	return output;
 }
 
-/** Closed descriptor-safe parser. It clones before inspecting any caller property. */
-export function parseBoundRequest(input: unknown): BoundRequestParseResult {
+/**
+ * Closed descriptor-safe parser. It clones before inspecting any caller property.
+ * `mcpConfigMode` picks the closed v2 MCP shape: the prepare request has no
+ * ticket, the final preflight/launch request must carry one (D4).
+ */
+export function parseBoundRequest(input: unknown, options: { mcpConfigMode?: BoundMcpConfigRequestMode } = {}): BoundRequestParseResult {
 	let cloneInput = input;
 	if (input && typeof input === "object" && !Array.isArray(input) && !utilTypes.isProxy(input)) {
 		const prototype = Object.getPrototypeOf(input);
@@ -173,8 +196,13 @@ export function parseBoundRequest(input: unknown): BoundRequestParseResult {
 	const parsedBindings = parseBoundBindings(value.bindings);
 	if (!parsedBindings.ok) return fail();
 	const toolShadowing = parseBoundToolShadowingRequest(value.toolShadowing);
-	const mcpConfig = parseBoundMcpConfigRequest(value.mcpConfig);
-	if (toolShadowing === null || mcpConfig === null) return fail();
+	const mcpConfigMode = options.mcpConfigMode ?? "final";
+	const mcpConfig = parseBoundMcpConfigRequest(value.mcpConfig, mcpConfigMode);
+	const safety = parseSafety(value.safety);
+	if (toolShadowing === null || mcpConfig === null || safety === null) return fail();
+	// The v2 MCP configuration exists only inside the repair contract, and a
+	// prepare request is always a repair request with a v2 configuration.
+	if ((isBoundMcpConfigV2(mcpConfig) && !safety) || (mcpConfigMode === "prepare" && (!safety || !isBoundMcpConfigV2(mcpConfig)))) return fail();
 	if (!plainRecord(value.result)) return fail();
 	let result: BoundRequestV2["result"];
 	if (value.result.kind === "text" && exactFields(value.result, new Set(["kind"]))) result = { kind: "text" };
@@ -195,6 +223,7 @@ export function parseBoundRequest(input: unknown): BoundRequestParseResult {
 		artifacts: value.artifacts as boolean, result,
 		...(toolShadowing ? { toolShadowing } : {}),
 		...(mcpConfig ? { mcpConfig } : {}),
+		...(safety ? { safety } : {}),
 	}) };
 }
 
@@ -212,9 +241,22 @@ export function projectBoundRequest(request: BoundRequestV2): Record<string, unk
 		artifacts: request.artifacts, result: request.result,
 		...(request.toolShadowing !== undefined ? { toolShadowing: request.toolShadowing } : {}),
 		...(request.mcpConfig !== undefined ? { mcpConfig: request.mcpConfig } : {}),
+		...(request.safety !== undefined ? { safety: request.safety } : {}),
 	};
 }
 
 export function boundRequestDigest(request: BoundRequestV2): string {
 	return canonicalSha256(projectBoundRequest(request));
+}
+
+/**
+ * The normalized request of the MCP snapshot (D2): the request without the
+ * ticket and the snapshot digest, so the snapshot never hashes itself.
+ */
+export function boundRequestBaseDigest(request: BoundRequestV2): string | undefined {
+	if (!isBoundMcpConfigV2(request.mcpConfig)) return undefined;
+	return canonicalSha256(projectBoundRequest({
+		...request,
+		mcpConfig: { version: BOUND_MCP_CONFIG_V2_VERSION, path: request.mcpConfig.path, implementation: BOUND_MCP_BRIDGE_IMPLEMENTATION },
+	}));
 }

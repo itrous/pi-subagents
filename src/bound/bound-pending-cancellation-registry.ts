@@ -2,10 +2,13 @@ import type { BoundBindingV2 } from "./channel.ts";
 
 // V3 deliberately starts empty across the A1.8 -> A1R.3 generation boundary:
 // pending cancellations are server-generation scoped and must not transfer.
+// S3 P2 bumps the marker to 4 (entries carry their acceptance time for the
+// not-admitted proof); a registry of an older build in this process refuses.
 export const BOUND_PENDING_CANCELLATION_GLOBAL_KEY = "__piSubagentBoundPendingCancellationRegistryV3";
+const PENDING_CONTRACT_VERSION = 4;
 const CAPACITY = 8192;
 
-interface Entry { key: string; tokenMac: string; requestDigest: string; prospectiveRunId: string; target: string; expiresAt: number }
+interface Entry { key: string; tokenMac: string; requestDigest: string; prospectiveRunId: string; target: string; expiresAt: number; acceptedAt: number }
 
 type Tuple = { requestId: string; ownerRunId: string; nodeId: string };
 
@@ -16,7 +19,9 @@ function key(tuple: Tuple, binding: BoundBindingV2): string {
 export type BoundPendingCancellationResult = false | "cancelled" | "consumed" | "saturated";
 
 export class BoundPendingCancellationRegistryV2 {
-	readonly contractVersion!: 3;
+	readonly contractVersion!: 4;
+	/** Monotonic time the last `cancelled` consume's cancellation was accepted. */
+	private lastAcceptedAt: number | undefined;
 	private entries = new Map<string, Entry>();
 	private consumed = new Map<string, { target: string; expiresAt: number }>();
 	private saturatedTargets = new Map<string, number>();
@@ -26,7 +31,7 @@ export class BoundPendingCancellationRegistryV2 {
 	constructor(clock: () => number = () => Number(process.hrtime.bigint() / 1_000_000n), capacity = CAPACITY) {
 		this.clock = clock;
 		this.capacity = capacity;
-		Object.defineProperty(this, "contractVersion", { value: 3, enumerable: false, configurable: false, writable: false });
+		Object.defineProperty(this, "contractVersion", { value: PENDING_CONTRACT_VERSION, enumerable: false, configurable: false, writable: false });
 	}
 
 	private prune(): void {
@@ -47,6 +52,7 @@ export class BoundPendingCancellationRegistryV2 {
 		this.entries.set(id, {
 			key: id, tokenMac: binding.cancellationToken.mac, requestDigest: binding.requestDigest,
 			prospectiveRunId: binding.prospectiveRunId, target, expiresAt: binding.cancellationToken.payload.expiresAt,
+			acceptedAt: this.clock(),
 		});
 		return true;
 	}
@@ -61,9 +67,15 @@ export class BoundPendingCancellationRegistryV2 {
 				|| entry.prospectiveRunId !== binding.prospectiveRunId || entry.target !== binding.targetServerInstanceId) return false;
 			this.entries.delete(id);
 			this.consumed.set(id, { target: entry.target, expiresAt: entry.expiresAt });
+			this.lastAcceptedAt = entry.acceptedAt;
 			return "cancelled";
 		}
 		return this.saturatedTargets.has(binding.targetServerInstanceId) ? "saturated" : false;
+	}
+
+	/** Milliseconds on this registry's clock since the cancellation the last `cancelled` consume returned was accepted. */
+	elapsedSinceLastConsumed(): number {
+		return this.lastAcceptedAt === undefined ? 0 : Math.max(0, this.clock() - this.lastAcceptedAt);
 	}
 
 	snapshot(): { pending: number; consumed: number; saturatedTargets: number } {
@@ -77,7 +89,7 @@ export function getBoundPendingCancellationRegistry(store: Record<string, unknow
 	if (existing !== undefined) {
 		if (!existing || typeof existing !== "object") throw new Error("Incompatible process-global pending cancellation registry.");
 		const marker = Object.getOwnPropertyDescriptor(existing, "contractVersion");
-		if (!marker || !("value" in marker) || marker.value !== 3 || marker.writable !== false || marker.configurable !== false
+		if (!marker || !("value" in marker) || marker.value !== PENDING_CONTRACT_VERSION || marker.writable !== false || marker.configurable !== false
 			|| typeof (existing as BoundPendingCancellationRegistryV2).remember !== "function"
 			|| typeof (existing as BoundPendingCancellationRegistryV2).consume !== "function") throw new Error("Incompatible process-global pending cancellation registry.");
 		return existing as BoundPendingCancellationRegistryV2;

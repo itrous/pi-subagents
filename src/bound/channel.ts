@@ -23,7 +23,8 @@ export const BOUND_CHANNEL_EVENTS = {
 	cancel: BOUND_CANCEL_EVENT,
 } as const;
 
-export const BOUND_METHODS = ["ping", "preflight"] as const;
+/** P2 (D4): exactly these four; `prepareMcp`/`releaseMcp` ride the same request/reply bus. */
+export const BOUND_METHODS = ["ping", "preflight", "prepareMcp", "releaseMcp"] as const;
 export type BoundMethod = typeof BOUND_METHODS[number];
 
 export function boundReplyEvent(requestId: string): string {

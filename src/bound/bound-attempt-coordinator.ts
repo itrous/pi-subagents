@@ -3,7 +3,10 @@ import { types as utilTypes } from "node:util";
 const DEFAULT_IDENTITY_CAPACITY = 8_192;
 // Generation-scoped key: A1 and A1R builds never coexist in one process, so an
 // incompatible global is an error at registration, not something to upgrade.
+// S3 P2 bumps the marker to 3 (terminal/cancel latch, no cancel projection): a
+// coordinator of an older build in this process refuses the load (D1).
 export const BOUND_ATTEMPT_COORDINATOR_GLOBAL_KEY = "__piSubagentBoundAttemptCoordinatorV2";
+const COORDINATOR_CONTRACT_VERSION = 3;
 
 export interface BoundAttemptIdentity {
 	requestId: string;
@@ -25,6 +28,8 @@ interface AttemptRecord {
 	request: BoundAttemptIdentity;
 	controller: AbortController;
 	stopped: boolean;
+	/** The terminal/cancel latch (D3): set by the port's commit before any cancel. */
+	committed: boolean;
 	settled: boolean;
 	settledPromise: Promise<void>;
 	resolveSettled: () => void;
@@ -32,7 +37,7 @@ interface AttemptRecord {
 }
 
 export type BoundAttemptAdmission =
-	| { accepted: true; signal: AbortSignal; isRunning: () => boolean; settle: (terminal: BoundTerminal) => void }
+	| { accepted: true; signal: AbortSignal; isRunning: () => boolean; commit: () => boolean; settle: (terminal: BoundTerminal) => void }
 	| { accepted: false; reason: "duplicate_tuple" | "duplicate_node" | "capacity" };
 
 /** Cancellation authority is always bound in v2: there is no unbound legacy branch. */
@@ -52,13 +57,23 @@ export function boundCancellationBindingKey(binding: unknown): string {
 	} catch { return "invalid-bound-cancellation-key"; }
 }
 
+/**
+ * The coordinator orders and delivers; it does not fabricate evidence (D3). A
+ * committed outcome, or any outcome of an attempt nobody cancelled, is
+ * published as the port produced it. A cancellation that latched before the
+ * commit forbids completed/result: an outcome that is not the port's own
+ * cancelled terminal keeps its evidence, loses its result and any proof, and is
+ * marked incomplete — never a confirmed cancellation.
+ */
 function effectiveTerminal(record: AttemptRecord, terminal: BoundTerminal): BoundTerminal {
-	if (!record.stopped && !record.controller.signal.aborted) return terminal;
-	return { requestId: record.request.requestId, ownerRunId: record.request.ownerRunId, nodeId: record.request.nodeId, status: "cancelled" };
+	if (record.committed || (!record.stopped && !record.controller.signal.aborted)) return terminal;
+	if (terminal.status === "cancelled" && terminal.result === undefined) return terminal;
+	const { result: _result, cancellationProof: _proof, ...evidence } = terminal;
+	return { ...evidence, requestId: record.request.requestId, ownerRunId: record.request.ownerRunId, nodeId: record.request.nodeId, status: "cancelled", transportIncomplete: true };
 }
 
 export class BoundAttemptCoordinator {
-	readonly contractVersion!: 2;
+	readonly contractVersion!: 3;
 	private readonly attemptsByTuple = new Map<string, AttemptRecord>();
 	private readonly nodeOwners = new Map<string, AttemptRecord>();
 	private readonly terminalOutbox: Array<{ record: AttemptRecord; terminal: BoundTerminal }> = [];
@@ -70,7 +85,7 @@ export class BoundAttemptCoordinator {
 
 	constructor(identityCapacity = DEFAULT_IDENTITY_CAPACITY) {
 		this.identityCapacity = identityCapacity;
-		Object.defineProperty(this, "contractVersion", { value: 2, enumerable: false, configurable: false, writable: false });
+		Object.defineProperty(this, "contractVersion", { value: COORDINATOR_CONTRACT_VERSION, enumerable: false, configurable: false, writable: false });
 	}
 
 	static tupleKey(requestId: string, ownerRunId: string, nodeId: string): string {
@@ -95,7 +110,7 @@ export class BoundAttemptCoordinator {
 		const record: AttemptRecord = {
 			tupleKey, nodeKey, ownerRuntimeId,
 			request: { requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId },
-			controller: new AbortController(), stopped: false, settled: false, settledPromise, resolveSettled,
+			controller: new AbortController(), stopped: false, committed: false, settled: false, settledPromise, resolveSettled,
 			cancellationBindingKey,
 		};
 		this.attemptsByTuple.set(tupleKey, record);
@@ -103,7 +118,12 @@ export class BoundAttemptCoordinator {
 		return {
 			accepted: true,
 			signal: record.controller.signal,
-			isRunning: () => !record.settled && this.attemptsByTuple.get(record.tupleKey) === record,
+			isRunning: () => !record.settled && !record.controller.signal.aborted && this.attemptsByTuple.get(record.tupleKey) === record,
+			commit: () => {
+				if (record.settled || record.stopped || record.controller.signal.aborted) return false;
+				record.committed = true;
+				return true;
+			},
 			settle: (terminal) => this.settle(record, terminal),
 		};
 	}
@@ -122,7 +142,7 @@ export class BoundAttemptCoordinator {
 			nodeKey: BoundAttemptCoordinator.nodeKey(request.ownerRunId, request.nodeId),
 			ownerRuntimeId,
 			request: { requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId },
-			controller: new AbortController(), stopped: false, settled: false,
+			controller: new AbortController(), stopped: false, committed: true, settled: false,
 			settledPromise: new Promise<void>((resolve) => { resolveSettled = resolve; }),
 			resolveSettled: () => resolveSettled(),
 			cancellationBindingKey: "invalid-bound-cancellation-key",
@@ -134,7 +154,7 @@ export class BoundAttemptCoordinator {
 
 	cancel(requestId: string, ownerRunId: string, nodeId: string, cancellationBindingKey: string): boolean {
 		const record = this.attemptsByTuple.get(BoundAttemptCoordinator.tupleKey(requestId, ownerRunId, nodeId));
-		if (!record || record.settled || record.cancellationBindingKey !== cancellationBindingKey) return false;
+		if (!record || record.settled || record.committed || record.cancellationBindingKey !== cancellationBindingKey) return false;
 		record.controller.abort();
 		return true;
 	}
@@ -148,14 +168,16 @@ export class BoundAttemptCoordinator {
 		let draining = this.drainingByRuntime.get(ownerRuntimeId);
 		for (const record of this.attemptsByTuple.values()) {
 			if (record.ownerRuntimeId !== ownerRuntimeId || record.settled) continue;
-			record.stopped = true;
-			record.controller.abort();
 			draining ??= new Set<Promise<void>>();
 			draining.add(record.settledPromise);
 			void record.settledPromise.finally(() => {
 				draining?.delete(record.settledPromise);
 				if (draining?.size === 0) this.drainingByRuntime.delete(ownerRuntimeId);
 			});
+			// A committed outcome is already decided; stopping must not rewrite it.
+			if (record.committed) continue;
+			record.stopped = true;
+			record.controller.abort();
 		}
 		if (draining?.size) this.drainingByRuntime.set(ownerRuntimeId, draining);
 	}
@@ -218,7 +240,7 @@ function compatible(value: unknown): value is BoundAttemptCoordinator {
 	if (!value || typeof value !== "object" || utilTypes.isProxy(value)) return false;
 	let marker: PropertyDescriptor | undefined;
 	try { marker = Object.getOwnPropertyDescriptor(value, "contractVersion"); } catch { return false; }
-	if (!marker || !("value" in marker) || marker.value !== 2 || marker.writable !== false || marker.configurable !== false) return false;
+	if (!marker || !("value" in marker) || marker.value !== COORDINATOR_CONTRACT_VERSION || marker.writable !== false || marker.configurable !== false) return false;
 	const candidate = value as Partial<BoundAttemptCoordinator>;
 	return typeof candidate.admit === "function" && typeof candidate.cancel === "function"
 		&& typeof candidate.activateSink === "function" && typeof candidate.canRememberCancellation === "function";

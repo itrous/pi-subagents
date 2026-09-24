@@ -51,16 +51,25 @@ export class BoundRegistryCollector {
 	failure: BoundRunFailure | undefined;
 	/** Q3 evidence: the verified replacements, only when the contract grants shadowing. */
 	shadowing: BoundToolShadowingEvidenceV1 | undefined;
+	/** Set when the run's inputs are revoked (D3): the published evidence no longer changes. */
+	sealed = false;
 
 	recordProjection(projection: ToolRegistryProjectionV1): void {
+		if (this.sealed) return;
 		this.projection ??= projection;
 	}
 
 	recordShadowing(evidence: BoundToolShadowingEvidenceV1): void {
+		if (this.sealed) return;
 		this.shadowing ??= { version: evidence.version, tools: [...evidence.tools], declarations: { ...evidence.declarations } };
 	}
 
+	seal(): void {
+		this.sealed = true;
+	}
+
 	fail(failure: BoundRunFailure): void {
+		if (this.sealed) return;
 		this.failure ??= {
 			status: failure.status,
 			...(failure.toolRegistryError ? { toolRegistryError: failure.toolRegistryError } : {}),
@@ -85,7 +94,15 @@ export class BoundDenialCollector {
 		this.capacity = capacity;
 	}
 
+	/** Set when the run's inputs are revoked (D3); a sealed list is never appended to. */
+	sealed = false;
+
+	seal(): void {
+		this.sealed = true;
+	}
+
 	record(name: string): void {
+		if (this.sealed) return;
 		if (this.calls.length >= this.capacity) {
 			this.overflow = true;
 			return;
@@ -93,6 +110,9 @@ export class BoundDenialCollector {
 		this.calls.push({ name, reason: "not_in_contract" });
 	}
 }
+
+/** Where the run's one child session is (D3): the disposal handle exists from the start of creation. */
+export type BoundChildCreation = "none" | "creating" | "attached" | "late" | "failed";
 
 export interface BoundRunRecord {
 	readonly runId: string;
@@ -109,10 +129,21 @@ export interface BoundRunRecord {
 	 * disposes it.
 	 */
 	settled: boolean;
+	creation: BoundChildCreation;
+	/**
+	 * Set by a cancellation (D3): session bindings are withdrawn, the stream
+	 * barrier refuses every later provider call, tool calls are blocked and the
+	 * MCP bridge refuses; the owner signal aborts in-flight MCP calls.
+	 */
+	revoked: boolean;
+	readonly revocation: AbortController;
+	/** The barrier's revocation hook, once the child factory installed the barrier. */
+	revokeBarrier: (() => void) | undefined;
 }
 
 export class BoundRunRegistryV1 {
-	readonly contractVersion!: 1;
+	/** 2 since S3 P2: revocation and the creation lifecycle; a version-1 registry of an older build refuses. */
+	readonly contractVersion!: 2;
 	private readonly runs = new Map<string, BoundRunRecord>();
 	private readonly sessionBindings = new Map<string, { runId: string; bindings: Readonly<BoundBindingsV1> }>();
 	/**
@@ -123,7 +154,7 @@ export class BoundRunRegistryV1 {
 	private readonly privateRunIds = new Set<string>();
 
 	constructor() {
-		Object.defineProperty(this, "contractVersion", { value: 1, enumerable: false, configurable: false, writable: false });
+		Object.defineProperty(this, "contractVersion", { value: 2, enumerable: false, configurable: false, writable: false });
 	}
 
 	/** Undefined when the run id is already live: two records must never share one key. */
@@ -139,6 +170,10 @@ export class BoundRunRegistryV1 {
 			private: true,
 			child: undefined,
 			settled: false,
+			creation: "none",
+			revoked: false,
+			revocation: new AbortController(),
+			revokeBarrier: undefined,
 		};
 		this.runs.set(runId, record);
 		this.privateRunIds.delete(runId);
@@ -173,10 +208,44 @@ export class BoundRunRegistryV1 {
 		return false;
 	}
 
+	/** The factory announces a creation before it starts one; a settled or revoked run gets none. */
+	beginCreate(runId: string): boolean {
+		const record = this.runs.get(runId);
+		if (!record || record.settled || record.revoked || record.creation !== "none") return false;
+		record.creation = "creating";
+		return true;
+	}
+
+	/** A creation that failed before a child existed. */
+	failCreate(runId: string): void {
+		const record = this.runs.get(runId);
+		if (record && record.creation === "creating") record.creation = "failed";
+	}
+
 	attachChild(runId: string, child: ChildSession): boolean {
 		const record = this.runs.get(runId);
-		if (!record || record.child || record.settled) return false;
+		if (!record || record.child || record.settled || record.revoked) {
+			if (record && record.creation === "creating") record.creation = "late";
+			return false;
+		}
 		record.child = child;
+		record.creation = "attached";
+		return true;
+	}
+
+	/**
+	 * D3 revocation, synchronous and idempotent: bindings of every session of the
+	 * run are unpublished, the barrier refuses from now on, and the owner signal of
+	 * the run's MCP calls aborts. True when the run is known (revoked now or before).
+	 */
+	revoke(runId: string): boolean {
+		const record = this.runs.get(runId);
+		if (!record) return false;
+		if (record.revoked) return true;
+		record.revoked = true;
+		for (const [sessionId, entry] of this.sessionBindings) if (entry.runId === runId) this.sessionBindings.delete(sessionId);
+		try { record.revokeBarrier?.(); } catch { /* the barrier also checks the flag itself */ }
+		record.revocation.abort();
 		return true;
 	}
 
@@ -188,7 +257,7 @@ export class BoundRunRegistryV1 {
 	/** Key is the CHILD session id (fact S4); a session already bound to another run is refused. */
 	publishSessionBindings(sessionId: string, runId: string): boolean {
 		const record = this.runs.get(runId);
-		if (!record || !sessionId) return false;
+		if (!record || !sessionId || record.revoked) return false;
 		const existing = this.sessionBindings.get(sessionId);
 		if (existing && existing.runId !== runId) return false;
 		this.sessionBindings.set(sessionId, { runId, bindings: record.bindings });
@@ -203,7 +272,7 @@ export class BoundRunRegistryV1 {
 	sessionBindingsForRun(sessionId: string, runId: string): BoundSessionBindingsEntry | undefined {
 		const entry = this.sessionBindings.get(sessionId);
 		const record = this.runs.get(runId);
-		if (!entry || entry.runId !== runId || !record) return undefined;
+		if (!entry || entry.runId !== runId || !record || record.revoked) return undefined;
 		return { cwd: record.launch.contract.canonicalCwd, bindings: entry.bindings, valuesDigest: record.launch.contract.bindings.valuesDigest };
 	}
 
@@ -222,7 +291,7 @@ export function getBoundRunRegistry(store: Record<string, unknown> = globalThis 
 	if (existing !== undefined) {
 		if (!existing || typeof existing !== "object") throw new Error("Incompatible process-global bound run registry.");
 		const marker = Object.getOwnPropertyDescriptor(existing, "contractVersion");
-		if (!marker || !("value" in marker) || marker.value !== 1 || marker.writable !== false || marker.configurable !== false
+		if (!marker || !("value" in marker) || marker.value !== 2 || marker.writable !== false || marker.configurable !== false
 			|| typeof (existing as BoundRunRegistryV1).open !== "function"
 			|| typeof (existing as BoundRunRegistryV1).close !== "function"
 			|| typeof (existing as BoundRunRegistryV1).isPrivate !== "function") throw new Error("Incompatible process-global bound run registry.");
@@ -231,6 +300,17 @@ export function getBoundRunRegistry(store: Record<string, unknown> = globalThis 
 	const registry = new BoundRunRegistryV1();
 	store[BOUND_RUN_REGISTRY_GLOBAL_KEY] = registry;
 	return registry;
+}
+
+/**
+ * Child-launch seam (S3 P2): the MCP selections handle of a live bound run, for
+ * the executor's recheck of the tool plan. Undefined for every other run id,
+ * and for a registry of an incompatible build (no bound run of this build exists then).
+ */
+export function boundMcpSelectionsForRun(runId: string, store?: Record<string, unknown>): unknown {
+	let registry: BoundRunRegistryV1;
+	try { registry = getBoundRunRegistry(store); } catch { return undefined; }
+	return registry.get(runId)?.launch.mcp?.selections;
 }
 
 /** T3 privacy check: a bound run answers like an unknown id on every public surface, for as long as it leaves traces. */

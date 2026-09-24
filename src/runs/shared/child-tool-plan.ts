@@ -14,6 +14,7 @@ import {
 	type McpRuntimeSnapshotHost,
 	type ResolvedMcpDirectToolSelection,
 } from "./mcp-direct-tool-allowlist.ts";
+import { resolveBoundMcpSelectionsHandle } from "../../bound/bound-mcp-selections.ts";
 import {
 	TEMP_ROOT_DIR,
 	type JsonSchemaObject,
@@ -152,6 +153,13 @@ export interface ResolvePiLaunchToolPlanInput {
 	agentName?: string;
 	permissionRules?: PermissionRules;
 	runtimeSnapshotHost?: McpRuntimeSnapshotHost;
+	/**
+	 * Bound layer only (S3 P2): a handle to the producer-owned MCP snapshot of one
+	 * bound run. When present, it replaces the metadata-cache resolution and must
+	 * match the selectors and cwd, or the plan throws; a handle the bound layer
+	 * did not issue is refused.
+	 */
+	boundMcpSelections?: unknown;
 }
 
 export interface PiLaunchToolPlan {
@@ -350,9 +358,13 @@ export function resolvePiLaunchToolPlan(
 					!requestedBuiltinTools.includes(tool) &&
 					(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")),
 			);
+	const boundMcpResolution = input.boundMcpSelections === undefined
+		? undefined
+		: resolveBoundMcpSelectionsHandle(input.boundMcpSelections, input.mcpDirectTools, input.cwd ?? "");
+	if (input.boundMcpSelections !== undefined && !boundMcpResolution) throw new Error("Bound MCP snapshot does not match this launch.");
 	const mcpResolution = capabilityCeiling?.denyExtensions
 		? { selections: [], unresolvedSelectors: [] }
-		: resolveMcpDirectToolResolution(input.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
+		: boundMcpResolution ?? resolveMcpDirectToolResolution(input.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
 	if (mcpResolution.runtimeServerNames?.length) {
 		throw new Error(formatRuntimeSnapshotMcpServersError(input.agentName, mcpResolution.runtimeServerNames));
 	}

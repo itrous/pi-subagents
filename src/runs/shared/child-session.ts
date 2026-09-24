@@ -108,6 +108,22 @@ export interface ChildSession {
 	detached?: boolean;
 	/** Set by `factory.dispose()` before it aborts the child, so the host can report the stop truthfully. */
 	shutDown?: boolean;
+	/**
+	 * Bound seam (S3 P2): what this child's disposal observably did, once
+	 * `dispose()` started it; undefined before. Local children only.
+	 */
+	disposalOutcome?(): Promise<ChildSessionDisposalOutcome> | undefined;
+}
+
+/**
+ * Observed disposal of a local child: whether the `session_shutdown` handlers
+ * returned within the bound, hit it, or threw on emit; and whether
+ * `session.dispose()` itself returned. A deadline does not mean the handlers
+ * finished.
+ */
+export interface ChildSessionDisposalOutcome {
+	shutdown: "completed" | "deadline" | "failed";
+	disposed: boolean;
 }
 
 export function childSessionHasQueuedMessages(session: ChildSession | undefined): boolean {
@@ -343,19 +359,34 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			loading = opened;
 			const session = await opened;
 			let pending: Promise<void> | undefined;
+			let outcome: Promise<ChildSessionDisposalOutcome> | undefined;
 			// pi's own hosts emit `session_shutdown` before disposing a session so the
 			// extensions loaded into it (ambient extensions included) release their
-			// watchers, servers, and timers. Do the same, then dispose.
-			const shutdown = async (): Promise<void> => {
+			// watchers, servers, and timers. Do the same, then dispose. The outcome
+			// records which of the two actually happened (bound seam, S3 P2).
+			const shutdown = async (): Promise<{ outcome: ChildSessionDisposalOutcome; error?: unknown }> => {
+				let observed: ChildSessionDisposalOutcome["shutdown"] = "completed";
+				// A throwing error reporter never skips `session.dispose()`; as before, its
+				// error still rejects `dispose()` after the session was disposed.
+				let reportError: { error: unknown } | undefined;
 				try {
 					const runner = session.extensionRunner;
 					if (runner.hasHandlers("session_shutdown")) {
-						await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
+						observed = await Promise.race([
+							runner.emit({ type: "session_shutdown", reason: "quit" }).then(() => "completed" as const),
+							new Promise<"deadline">((resolve) => setTimeout(() => resolve("deadline"), shutdownTimeoutMs).unref?.()),
+						]);
 					}
 				} catch (error) {
-					launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
-				} finally {
+					observed = "failed";
+					try { launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error }); }
+					catch (thrown) { reportError = { error: thrown }; }
+				}
+				try {
 					session.dispose();
+					return { outcome: { shutdown: observed, disposed: true }, ...(reportError ? { error: reportError.error } : {}) };
+				} catch (error) {
+					return { outcome: { shutdown: observed, disposed: false }, error };
 				}
 			};
 			const child: ChildSession = {
@@ -368,13 +399,17 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				dispose: () => {
 					if (!pending) {
 						live.delete(child);
-						const shutdownDone = shutdown();
+						const observed = shutdown();
+						outcome = observed.then((result) => result.outcome);
+						// Same contract as before: a throwing `session.dispose()` rejects.
+						const shutdownDone = observed.then((result) => { if ("error" in result) throw result.error; });
 						pending = shutdownDone;
 						shutdowns.add(shutdownDone);
-						void shutdownDone.finally(() => shutdowns.delete(shutdownDone));
+						void shutdownDone.finally(() => shutdowns.delete(shutdownDone)).catch(() => {});
 					}
 					return pending;
 				},
+				disposalOutcome: () => outcome,
 				get messages() { return session.messages; },
 				get sessionFile() { return session.sessionFile; },
 				get sessionId() { return session.sessionId; },

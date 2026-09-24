@@ -240,7 +240,8 @@ function getRuntimeMcpServerSnapshot(
 	return snapshot;
 }
 
-function loadMcpConfig(cwd: string): McpConfig {
+/** Exported for the bound layer (S3 P2): it compares discovered and attested definitions without the metadata cache. */
+export function loadMcpConfig(cwd: string): McpConfig {
 	const resolvedCwd = path.resolve(cwd);
 	const projectRoot = findConfiguredProjectRoot(resolvedCwd) ?? resolvedCwd;
 	let config: McpConfig = { mcpServers: {} };
