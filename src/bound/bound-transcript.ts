@@ -42,7 +42,14 @@ function exported(namespace: unknown, name: string): unknown {
 	if (!namespace || (typeof namespace !== "object" && typeof namespace !== "function")) return undefined;
 	try {
 		const descriptor = Object.getOwnPropertyDescriptor(namespace, name);
-		return descriptor && "value" in descriptor ? descriptor.value : undefined;
+		if (!descriptor) return undefined;
+		if ("value" in descriptor) return descriptor.value;
+		// Pi's `pi` command is an esbuild bundle: its VIRTUAL_MODULES expose each
+		// export as an enumerable getter without a setter (esbuild `__export`).
+		// Identity is still proven by the shared `uuidv7` binding below.
+		return typeof descriptor.get === "function" && descriptor.set === undefined && descriptor.enumerable
+			? descriptor.get.call(namespace)
+			: undefined;
 	} catch { return undefined; }
 }
 
