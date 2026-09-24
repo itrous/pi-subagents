@@ -56,7 +56,9 @@ test("only the exact binding key cancels, and a stopped attempt projects to canc
 	assert.equal(coordinator.cancel("r", "o", "n", bindingKey), true);
 	assert.equal(admission.signal.aborted, true);
 	admission.settle({ ...tuple, status: "completed", result: { kind: "text", text: "leaked" } });
-	assert.deepEqual(seen, [{ ...tuple, status: "cancelled" }]);
+	// S3 P2 (D3): a cancel that latched first forbids completed/result; the port's
+	// non-cancelled outcome keeps its evidence but is never a confirmed cancellation.
+	assert.deepEqual(seen, [{ ...tuple, status: "cancelled", transportIncomplete: true }]);
 });
 
 test("terminals stay in the outbox until a sink is active and survive a throwing listener", () => {
@@ -89,7 +91,7 @@ test("stopping a generation aborts its attempts and the new sink receives the si
 	assert.deepEqual(first.seen, []);
 	const second = collector();
 	coordinator.activateSink("gen-2", second.sink);
-	assert.deepEqual(second.seen, [{ ...tuple, status: "cancelled" }]);
+	assert.deepEqual(second.seen, [{ ...tuple, status: "cancelled", transportIncomplete: true }]);
 	assert.equal(coordinator.snapshot().pending, 0);
 });
 

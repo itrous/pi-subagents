@@ -58,6 +58,7 @@ async function capabilities(overrides: Partial<RegisterBoundControlPlaneOptions>
 const FULL = {
 	activeRuntimeIdentity: { version: 2 }, boundForegroundLeaf: { version: 2 },
 	boundSessionBindings: { version: 1 }, boundToolShadowing: { version: 1 }, boundMcpConfig: { version: 1 },
+	boundMcpDiscovery: { version: 1 }, boundCancellationProof: { version: 1 },
 };
 
 test("the full configuration announces boundForegroundLeaf v2 with its feature keys", async () => {
@@ -81,7 +82,7 @@ const REMOVALS: Array<[string, Partial<RegisterBoundControlPlaneOptions>]> = [
 for (const [label, override] of REMOVALS) {
 	test(`removing ${label} removes the capability`, async () => {
 		const announced = await capabilities(override);
-		for (const key of ["boundForegroundLeaf", "boundSessionBindings", "boundToolShadowing", "boundMcpConfig"]) assert.equal(Object.hasOwn(announced, key), false, key);
+		for (const key of ["boundForegroundLeaf", "boundSessionBindings", "boundToolShadowing", "boundMcpConfig", "boundMcpDiscovery", "boundCancellationProof"]) assert.equal(Object.hasOwn(announced, key), false, key);
 	});
 }
 
@@ -188,8 +189,11 @@ test("the self-check refuses a pre-0.87 stream context and a pi-ai copy the agen
 const sdkRoot = process.env.PI_SUBAGENTS_NATIVE_SDK;
 const resolveInSdk = (specifier: string): string => execFileSync(process.execPath, ["--input-type=module", "-e", `console.log(import.meta.resolve(${JSON.stringify(specifier)}))`], { cwd: sdkRoot, encoding: "utf8" }).trim();
 
-test("the self-check passes on the installed Pi without a provider call", { skip: !sdkRoot && "Set PI_SUBAGENTS_NATIVE_SDK to the isolated Pi SDK root" }, async () => {
-	const pi = await import(resolveInSdk("@earendil-works/pi-coding-agent")) as PiCodingAgentModule;
+test("the self-check passes on the installed Pi without a provider call", { skip: !sdkRoot && "Set PI_SUBAGENTS_NATIVE_SDK to the isolated Pi SDK root" }, async (t) => {
+	const pi = await import(resolveInSdk("@earendil-works/pi-coding-agent")) as PiCodingAgentModule & { VERSION?: string };
+	// The full upstream unit suite uses 0.85.1 for compaction. P2's native
+	// transcript context self-check is specifically a 0.87.1 contract.
+	if (pi.VERSION !== "0.87.1") { t.skip("P2 transcript context requires Pi 0.87.1"); return; }
 	const sdkModules = async (): Promise<BoundTranscriptModules> => ({
 		ai: await import(resolveInSdk("@earendil-works/pi-ai")),
 		core: await import(resolveInSdk("@earendil-works/pi-agent-core")),

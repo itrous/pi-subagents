@@ -73,7 +73,7 @@ test("ping answers exactly once with the declared key set", async () => {
 	assert.match(ping.serverInstanceId as string, RFC4122);
 	assert.equal(ping.serverInstanceId, plane.serverInstanceId);
 	assert.equal(ping.version, 2);
-	assert.deepEqual(ping.methods, ["ping", "preflight"]);
+	assert.deepEqual(ping.methods, ["ping", "preflight", "prepareMcp", "releaseMcp"]);
 	assert.deepEqual(ping.capabilities, { activeRuntimeIdentity: { version: 2 } });
 	assert.deepEqual(ping.events, { ...BOUND_CHANNEL_EVENTS });
 	assert.deepEqual(Object.keys(ping.events as object).sort(), ["cancel", "launch", "ready", "replyPrefix", "request", "started", "terminal", "update"]);

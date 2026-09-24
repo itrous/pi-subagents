@@ -241,8 +241,16 @@ for (const [label, timing] of [
 		const port = createBoundExecutionPort({ executeDelegated, getContext: () => fixture.context() as never, config: fixture.config, registry, hardTimerMs: HARD_TIMER_MS });
 		const controller = new AbortController();
 		const outcome = port.run({ launch, signal: controller.signal, onUpdate: () => {} });
+		// S3 P2: a run revoked before its creation began gets no session at all, so the
+		// "still loading" case cancels only once the factory announced the creation.
+		if (timing.sessions > 0) {
+			for (let attempt = 0; attempt < 400 && registry.get(launch.request.prospectiveRunId)?.creation !== "creating"; attempt++) await sleep(1);
+			assert.equal(registry.get(launch.request.prospectiveRunId)?.creation, "creating");
+		}
 		controller.abort();
-		assert.equal((await outcome).status, "cancelled");
+		const terminal = await outcome;
+		assert.equal(terminal.status, "cancelled");
+		assert.equal(terminal.transportIncomplete, true, "a creation still pending never confirms the cancellation");
 		await port.whenIdle();
 		for (let attempt = 0; attempt < 200 && !created; attempt++) await sleep(5);
 		await assert.rejects(created!, "the late child is refused, not handed to the executor");

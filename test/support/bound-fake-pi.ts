@@ -30,6 +30,8 @@ export interface FakePiOptions {
 	requiredError?: string;
 	childSessionId?: string;
 	hangShutdown?: boolean;
+	/** S3 P2: `session_shutdown` emission rejects, as a runner whose handler threw would. */
+	throwShutdown?: boolean;
 	/** Every prompt waits for this promise before its model call. */
 	promptGate?: Promise<void>;
 	/** Every prompt waits until `probe.release(index)`; an abort releases it too. */
@@ -113,6 +115,7 @@ export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; 
 		async emit(event: { type: string }) {
 			// A `session_shutdown` handler that never returns, as in the S5 measurement.
 			if (options.hangShutdown && event.type === "session_shutdown") return new Promise<void>(() => {});
+			if (options.throwShutdown && event.type === "session_shutdown") throw new Error("shutdown handler failed");
 			for (const handler of this.handlers.get(event.type) ?? []) await handler(event, this.ctx);
 		}
 	}
@@ -181,7 +184,7 @@ export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; 
 					if (options.fail === "bindExtensions") throw new Error("injected bindExtensions failure");
 					await loader.emit({ type: "session_start" });
 				},
-				extensionRunner: { hasHandlers: (event: string) => (options.hangShutdown === true && event === "session_shutdown") || loader.handlers.has(event), emit: (event: { type: string }) => loader.emit(event) },
+				extensionRunner: { hasHandlers: (event: string) => ((options.hangShutdown === true || options.throwShutdown === true) && event === "session_shutdown") || loader.handlers.has(event), emit: (event: { type: string }) => loader.emit(event) },
 				subscribe: (listener: Listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
 				async prompt() {
 					probe.prompts += 1;

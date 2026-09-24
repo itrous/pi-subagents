@@ -48,6 +48,8 @@ const EXPECTED_UPSTREAM_DEPENDENCIES = [
 	"runs/shared/child-session.ts",
 	"runs/shared/child-tool-plan.ts",
 	"runs/shared/mcp-direct-tool-allowlist.ts",
+	// S3 P2: the bridge and the snapshot selections reuse the fork's grant planner.
+	"runs/shared/mcp-direct-tool-grant.ts",
 	"runs/shared/model-scope.ts",
 	"runs/shared/permissions.ts",
 	"runs/shared/tool-budget.ts",
@@ -57,6 +59,8 @@ const EXPECTED_UPSTREAM_DEPENDENCIES = [
 	"shared/session-identity.ts",
 	"shared/types.ts",
 	"shared/utils.ts",
+	// S3 P2: the bridge registers the measured parameters as `Type.Unsafe`, like the adapter.
+	"typebox",
 ] as const;
 
 const IMPORT_SPECIFIER = /(?:^|[\s;{(])(?:import|export)\s*(?:type\s*)?(?:[^'"()]*?\bfrom\s*)?["']([^"']+)["']/gm;

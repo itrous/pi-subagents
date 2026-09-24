@@ -258,6 +258,38 @@ test("a cancel that arrives before admission is remembered and consumed exactly 
 		const terminals = h.bus.of(BOUND_TERMINAL_EVENT);
 		assert.equal(terminals.length, 1);
 		assert.equal(terminals[0]!.status, "cancelled");
+		// S3 P2 (D3): the pending cancel wins before admission — no `started`, and a
+		// legacy request without the repair contract gets no proof, only incomplete.
+		assert.equal(h.bus.of(BOUND_STARTED_EVENT).length, 0);
+		assert.equal(terminals[0]!.transportIncomplete, true);
+		assert.equal(terminals[0]!.cancellationProof, undefined);
+		// A delayed launch of the same tuple never starts and adds no terminal.
+		await h.bus.deliver(BOUND_LAUNCH_EVENT, launchEnvelope(request, binding));
+		assert.equal(h.bus.of(BOUND_STARTED_EVENT).length, 0);
+		assert.equal(h.bus.of(BOUND_TERMINAL_EVENT).length, 1);
+	} finally { h.dispose(); }
+});
+
+test("S3 P2: a repair request cancelled before admission gets exactly the notAdmitted proof", async () => {
+	const h = harness();
+	try {
+		const { request, binding, data } = await preflighted(h.service, { safety: { version: 1, cancellationProof: 1 } });
+		assert.deepEqual(data.launchContract.safety, { version: 1, cancellationProof: 1 });
+		await h.bus.deliver(BOUND_CANCEL_EVENT, { version: 2, requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1", targetServerInstanceId: FIXTURE_SERVER_INSTANCE_ID, binding });
+		await h.bus.deliver(BOUND_LAUNCH_EVENT, launchEnvelope(request, binding));
+		assert.equal(h.bus.of(BOUND_STARTED_EVENT).length, 0);
+		const terminals = h.bus.of(BOUND_TERMINAL_EVENT);
+		assert.equal(terminals.length, 1);
+		const terminal = terminals[0]! as Record<string, unknown>;
+		assert.deepEqual(Object.keys(terminal).sort(), ["cancellationProof", "launchContractDigest", "nodeId", "ownerRunId", "requestId", "status"]);
+		const proof = terminal.cancellationProof as Record<string, unknown>;
+		assert.deepEqual({ ...proof, elapsedMs: 0 }, {
+			version: 1, phase: "notAdmitted", requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1",
+			prospectiveRunId: data.launchContract.prospectiveRunId, serverInstanceId: FIXTURE_SERVER_INSTANCE_ID,
+			launchContractDigest: data.launchContractDigest, session: "notCreated", shutdown: "notStarted", execution: "notStarted",
+			revoked: true, collectorsSealed: false, elapsedMs: 0,
+		});
+		assert.equal(terminal.launchContractDigest, data.launchContractDigest);
 	} finally { h.dispose(); }
 });
 
@@ -287,7 +319,9 @@ test("a terminal from a stopped generation reaches the client once through the n
 		assert.equal(coordinator.snapshot().pending, 1);
 		const newBridge = registerBoundLaunchBridge({ events: newBus, service, coordinator, runtimeId: "gen-2", identityRegistry: identities, pendingCancellations: pending });
 		coordinator.activateSink("gen-2", newBridge.sink);
-		assert.deepEqual(newBus.of(BOUND_TERMINAL_EVENT), [{ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1", status: "cancelled" }]);
+		// S3 P2 (D3): the stopped attempt's completed outcome is not rewritten into a
+		// confirmed cancellation; it stays cancelled and incomplete.
+		assert.deepEqual(newBus.of(BOUND_TERMINAL_EVENT), [{ requestId: "request-1", ownerRunId: "owner-1", nodeId: "node-1", status: "cancelled", transportIncomplete: true }]);
 		assert.equal(oldBus.of(BOUND_TERMINAL_EVENT).length, 0);
 		newBridge.dispose();
 	} finally { service.dispose(); }

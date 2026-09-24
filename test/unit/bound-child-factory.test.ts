@@ -48,7 +48,7 @@ test("create() returns the base factory's child, with the run hook first and the
 	const child = await factoryFor(registry, record.runId, pi).create(launch);
 	assert.equal(envSnapshot(), before, "process.env is byte-equal after create()");
 	assert.equal(record.child, child, "the registry holds the returned child itself");
-	assert.deepEqual(Object.keys(child).sort(), ["abort", "dispose", "followUp", "hasQueuedMessages", "messages", "modelId", "prompt", "sessionFile", "sessionId", "steer", "subscribe"]);
+	assert.deepEqual(Object.keys(child).sort(), ["abort", "disposalOutcome", "dispose", "followUp", "hasQueuedMessages", "messages", "modelId", "prompt", "sessionFile", "sessionId", "steer", "subscribe"]);
 	assert.equal(probe.hookNames[0], BOUND_RUN_HOOK_NAME);
 	assert.deepEqual([probe.envAtReload, probe.envAtBind], [["__none__"], ["__none__"]]);
 	assert.deepEqual({ ...registry.sessionBindingsFor("child-session") }, { ONECPI_REVIEW_ROOT: "/review" });
