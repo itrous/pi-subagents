@@ -40,6 +40,8 @@ export interface FakePiOptions {
 	modelId?: string;
 	/** A prompt that passed the barrier calls the registered `structured_output` tool with this value. */
 	structuredValue?: unknown;
+	/** The final assistant text of every prompt that passed the barrier; defaults to `"done"`. */
+	assistantText?: string;
 	/** `reload()` takes this long, e.g. to let a cancel land while `create()` is still loading. */
 	reloadDelayMs?: number;
 	/** Stand-in for pi-mcp-adapter: register one `server_tool` per `server/tool` selector in the window. */
@@ -217,7 +219,7 @@ export function fakePi(options: FakePiOptions = {}): { pi: PiCodingAgentModule; 
 						type: "message_end",
 						message: refusal
 							? { role: "assistant", content: [], model: model.id, stopReason: "error", errorMessage: refusal, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } }
-							: { role: "assistant", content: [{ type: "text", text: "done" }], model: model.id, stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+							: { role: "assistant", content: [{ type: "text", text: options.assistantText ?? "done" }], model: model.id, stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
 					});
 					emitEvent({ type: "agent_end", messages: [...messages], willRetry: false });
 					emitEvent({ type: "agent_settled" });

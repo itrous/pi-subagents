@@ -363,3 +363,60 @@ test("the control plane builds its port from executeDelegated and silences it on
 		assert.equal(terminals[0]!.status, "cancelled");
 	} finally { plane.stop(); }
 });
+
+// pio192 S1: the final assistant text of a leaf that never called structured_output.
+const MISSING_STRUCTURED_OUTPUT = "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.";
+const UNSTRUCTURED_TEXT_MAX_BYTES = 1024 * 1024;
+const STRUCTURED_RESULT = { result: { kind: "structured", schema: { type: "object", properties: { findings: { type: "array" } }, required: ["findings"] } } };
+const T_OK = "Проверил дифф.\n\n```json\n{\"findings\":[{\"severity\":\"low\",\"claim\":\"x\"}]}\n```\n";
+
+async function runChild(overrides: Record<string, unknown>, launchExtra: Record<string, unknown> = STRUCTURED_RESULT, before?: (registry: BoundRunRegistryV1, params: unknown) => void) {
+	const launch = await admittedLaunch(launchExtra);
+	const { handle, registry } = port(async (_id, params) => {
+		recordEvidence(registry, params);
+		before?.(registry, params);
+		return childResult(overrides);
+	});
+	return handle.run({ launch, signal: new AbortController().signal, onUpdate: noUpdate });
+}
+
+test("I1: structured_output_failed carries the final text as unstructuredText, never as result", async () => {
+	const outcome = await runChild({ structuredOutputFailed: true, exitCode: 1, error: MISSING_STRUCTURED_OUTPUT, finalOutput: T_OK });
+	assert.equal(outcome.status, "structured_output_failed");
+	assert.equal(outcome.exitCode, 1);
+	assert.equal(outcome.error, MISSING_STRUCTURED_OUTPUT);
+	assert.deepEqual(outcome.unstructuredText, { text: T_OK, truncated: false });
+	assert.deepEqual(Object.keys(outcome.unstructuredText as object).sort(), ["text", "truncated"]);
+	assert.equal("result" in outcome, false);
+});
+
+test("I2: unstructuredText is cut to 1 MiB without a dangling high surrogate and flags the cut", async () => {
+	const input = `${"a".repeat(UNSTRUCTURED_TEXT_MAX_BYTES - 2)}\u{1D49C}${"ж".repeat(10)}`;
+	const cut = (await runChild({ structuredOutputFailed: true, exitCode: 1, error: MISSING_STRUCTURED_OUTPUT, finalOutput: input })).unstructuredText as { text: string; truncated: boolean };
+	assert.equal(cut.truncated, true);
+	assert.ok(Buffer.byteLength(cut.text, "utf8") <= UNSTRUCTURED_TEXT_MAX_BYTES);
+	assert.ok(input.startsWith(cut.text), "the text is a prefix of the input");
+	assert.equal(cut.text.length, UNSTRUCTURED_TEXT_MAX_BYTES - 2, "the longest prefix that fits");
+	const tail = cut.text.charCodeAt(cut.text.length - 1);
+	assert.ok(!(tail >= 0xd800 && tail <= 0xdbff), "no dangling high surrogate");
+	const exact = "a".repeat(UNSTRUCTURED_TEXT_MAX_BYTES);
+	assert.deepEqual((await runChild({ structuredOutputFailed: true, exitCode: 1, error: MISSING_STRUCTURED_OUTPUT, finalOutput: exact })).unstructuredText, { text: exact, truncated: false });
+});
+
+test("I3: no unstructuredText outside structured_output_failed or for a blank final text", async () => {
+	const completed = await runChild({ finalOutput: T_OK }, {});
+	assert.deepEqual([completed.status, completed.result, "unstructuredText" in completed], ["completed", { kind: "text", text: T_OK }, false]);
+	const failed = await runChild({ exitCode: 1, error: "boom", finalOutput: T_OK });
+	assert.deepEqual([failed.status, "unstructuredText" in failed], ["failed", false]);
+	const timedOut = await runChild({ timedOut: true, exitCode: 1, finalOutput: T_OK });
+	assert.deepEqual([timedOut.status, "unstructuredText" in timedOut], ["timed_out", false]);
+	const registryFailure = await runChild({ structuredOutputFailed: true, exitCode: 1, error: MISSING_STRUCTURED_OUTPUT, finalOutput: T_OK }, STRUCTURED_RESULT, (registry, params) => {
+		registry.get(boundRunIdOf(params)!)!.registry.fail({ status: "native_tool_registry_mismatch", toolsMissing: ["read"] });
+	});
+	assert.deepEqual([registryFailure.status, "unstructuredText" in registryFailure], ["native_tool_registry_mismatch", false]);
+	const blank = await runChild({ structuredOutputFailed: true, exitCode: 1, error: MISSING_STRUCTURED_OUTPUT, finalOutput: "  \n" });
+	assert.deepEqual([blank.status, "unstructuredText" in blank], ["structured_output_failed", false]);
+	// Positive control on the same stand: the non-blank text does travel.
+	const control = await runChild({ structuredOutputFailed: true, exitCode: 1, error: MISSING_STRUCTURED_OUTPUT, finalOutput: T_OK });
+	assert.equal("unstructuredText" in control, true);
+});

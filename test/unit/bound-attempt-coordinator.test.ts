@@ -134,3 +134,26 @@ test("the V2 global slot does not adopt an incompatible coordinator", () => {
 	// An A1 coordinator lives under its own key and never transfers into V2.
 	assert.equal(BOUND_ATTEMPT_COORDINATOR_GLOBAL_KEY, "__piSubagentBoundAttemptCoordinatorV2");
 });
+
+test("I4: a cancel latched before the commit drops unstructuredText as it drops result", () => {
+	const unstructuredText = { text: "```json\n{\"findings\":[]}\n```", truncated: false };
+	for (const status of ["structured_output_failed", "cancelled"]) {
+		const coordinator = new BoundAttemptCoordinator();
+		const { sink, seen } = collector();
+		coordinator.activateSink("gen-1", sink);
+		const admission = coordinator.admit(tuple, "gen-1", bindingKey);
+		assert.equal(admission.accepted, true);
+		if (!admission.accepted) return;
+		assert.equal(coordinator.cancel("r", "o", "n", bindingKey), true);
+		admission.settle({ ...tuple, status, exitCode: 1, launchContractDigest: "d", deniedToolCalls: [], unstructuredText });
+		assert.deepEqual(seen, [{ ...tuple, status: "cancelled", exitCode: 1, launchContractDigest: "d", deniedToolCalls: [], transportIncomplete: true }], status);
+	}
+	// Positive control: an attempt nobody cancelled publishes the port's outcome as it is.
+	const coordinator = new BoundAttemptCoordinator();
+	const { sink, seen } = collector();
+	coordinator.activateSink("gen-1", sink);
+	const admission = coordinator.admit(tuple, "gen-1", bindingKey);
+	if (!admission.accepted) return assert.fail("admission");
+	admission.settle({ ...tuple, status: "structured_output_failed", unstructuredText });
+	assert.deepEqual(seen, [{ ...tuple, status: "structured_output_failed", unstructuredText }]);
+});

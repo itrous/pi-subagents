@@ -62,13 +62,14 @@ export function boundCancellationBindingKey(binding: unknown): string {
  * committed outcome, or any outcome of an attempt nobody cancelled, is
  * published as the port produced it. A cancellation that latched before the
  * commit forbids completed/result: an outcome that is not the port's own
- * cancelled terminal keeps its evidence, loses its result and any proof, and is
- * marked incomplete — never a confirmed cancellation.
+ * cancelled terminal keeps its evidence, loses its result, its unstructured
+ * text and any proof, and is marked incomplete — never a confirmed
+ * cancellation.
  */
 function effectiveTerminal(record: AttemptRecord, terminal: BoundTerminal): BoundTerminal {
 	if (record.committed || (!record.stopped && !record.controller.signal.aborted)) return terminal;
-	if (terminal.status === "cancelled" && terminal.result === undefined) return terminal;
-	const { result: _result, cancellationProof: _proof, ...evidence } = terminal;
+	if (terminal.status === "cancelled" && terminal.result === undefined && terminal.unstructuredText === undefined) return terminal;
+	const { result: _result, unstructuredText: _text, cancellationProof: _proof, ...evidence } = terminal;
 	return { ...evidence, requestId: record.request.requestId, ownerRunId: record.request.ownerRunId, nodeId: record.request.nodeId, status: "cancelled", transportIncomplete: true };
 }
 

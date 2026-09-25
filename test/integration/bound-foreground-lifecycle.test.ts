@@ -227,6 +227,41 @@ describe("bound foreground leaves over the real executor (tier 1)", () => {
 		for (const leaf of [success, cancelled]) assert.equal(getBoundRunRegistry().get(leaf.runId), undefined);
 	});
 
+	it("I5: a structured leaf that never calls structured_output returns its final text as unstructuredText beside completed-level evidence", async () => {
+		const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
+		const completedHost = createLeafHost({ fake: { holdPrompts: false, structuredValue: { ok: true } } });
+		const completedLeaf = await completedHost.launch({ result: { kind: "structured", schema } });
+		await completedLeaf.settled;
+		const completed = completedHost.terminalsOf(completedLeaf.tuple)[0]!;
+		assertCompletedEvidence(completed, completedLeaf.digest);
+
+		const host = createLeafHost({ fake: { holdPrompts: false, assistantText: "done" } });
+		const leaf = await host.launch({ result: { kind: "structured", schema } });
+		await leaf.settled;
+		const terminals = host.terminalsOf(leaf.tuple);
+		assert.equal(terminals.length, 1);
+		const terminal = terminals[0]!;
+		assert.equal(terminal.status, "structured_output_failed", JSON.stringify(terminal));
+		assert.equal(terminal.exitCode, 1);
+		assert.equal(terminal.error, "Missing structured_output call; this step has outputSchema and must finish by calling structured_output.");
+		assert.deepEqual(terminal.unstructuredText, { text: "done", truncated: false });
+		assert.equal(terminal.launchContractDigest, leaf.digest);
+		assert.ok(terminal.toolRegistry, "the registry projection travels with the terminal");
+		assert.deepEqual(terminal.deniedToolCalls, []);
+		assert.equal("transportIncomplete" in terminal, false);
+		assert.equal("result" in terminal, false);
+		const expected = new Set(Object.keys(completed).filter((key) => key !== "result"));
+		expected.add("error");
+		expected.add("unstructuredText");
+		assert.deepEqual(Object.keys(terminal).sort(), [...expected].sort());
+
+		// The fake's text option reaches the terminal verbatim.
+		const other = createLeafHost({ fake: { holdPrompts: false, assistantText: "Итог: ```json\n{\"ok\":true}\n```" } });
+		const otherLeaf = await other.launch({ result: { kind: "structured", schema } });
+		await otherLeaf.settled;
+		assert.deepEqual(other.terminalsOf(otherLeaf.tuple)[0]!.unstructuredText, { text: "Итог: ```json\n{\"ok\":true}\n```", truncated: false });
+	});
+
 	it("scenario 4: reload aborts the old generation's attempts, delivers their terminal once through the new sink, and spares the new neighbour", async () => {
 		const bus = createBus();
 		const store: Record_ = {};

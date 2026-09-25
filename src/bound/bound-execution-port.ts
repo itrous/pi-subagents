@@ -30,13 +30,32 @@ const MAX_CURRENT_TOOL_BYTES = 128;
 /** The client accepts at most this many UTF-8 bytes of `error`. */
 const MAX_ERROR_BYTES = 4096;
 
-function boundedError(text: string): string {
-	if (Buffer.byteLength(text, "utf8") <= MAX_ERROR_BYTES) return text;
-	let end = MAX_ERROR_BYTES;
-	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > MAX_ERROR_BYTES) end--;
+/**
+ * pio192: the final assistant text of a `structured_output_failed` leaf travels
+ * as `unstructuredText` under the same bound as a completed result.
+ */
+const MAX_UNSTRUCTURED_TEXT_BYTES = MAX_RESULT_BYTES;
+
+/** The longest prefix of `text` within `maxBytes` UTF-8 bytes that does not end on a high surrogate. */
+function boundedUtf8(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	// The prefix's byte length grows with its end: search for the longest that fits
+	// (a linear walk is quadratic at 1 MiB).
+	let low = 0;
+	let high = Math.min(text.length, maxBytes);
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(text.slice(0, middle), "utf8") <= maxBytes) low = middle;
+		else high = middle - 1;
+	}
+	let end = low;
 	// Never end on a high surrogate, however many of them precede the cut.
 	while (end > 0 && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end--;
 	return text.slice(0, end);
+}
+
+function boundedError(text: string): string {
+	return boundedUtf8(text, MAX_ERROR_BYTES);
 }
 
 export const BOUND_EXECUTOR_FAILED_TEXT = "Bound leaf executor failed without an error message.";
@@ -229,6 +248,15 @@ export function projectBoundTerminal(record: BoundRunRecord, result: DelegatedRe
 			else projected = { kind: "structured", value: cloned.value };
 		}
 	}
+	// pio192: a session that ended cleanly without calling structured_output
+	// hands its final text to the client beside, never as, the result.
+	let unstructuredText: { text: string; truncated: boolean } | undefined;
+	if (status === "structured_output_failed" && typeof child?.finalOutput === "string" && child.finalOutput.trim() !== "") {
+		unstructuredText = {
+			text: boundedUtf8(child.finalOutput, MAX_UNSTRUCTURED_TEXT_BYTES),
+			truncated: Buffer.byteLength(child.finalOutput, "utf8") > MAX_UNSTRUCTURED_TEXT_BYTES,
+		};
+	}
 	const denials = record.denials;
 	const usage = child?.usage;
 	return {
@@ -249,6 +277,7 @@ export function projectBoundTerminal(record: BoundRunRecord, result: DelegatedRe
 		...(denials.overflow ? { deniedToolCallsOverflow: true } : {}),
 		...(denials.calls.length > 0 || denials.overflow ? { transportIncomplete: true } : {}),
 		...(projected ? { result: projected } : {}),
+		...(unstructuredText ? { unstructuredText } : {}),
 		...(usage ? {
 			usage: {
 				input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite,
